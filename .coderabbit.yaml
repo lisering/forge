@@ -1,0 +1,36 @@
+# CodeRabbit AI 代码审查配置
+# https://coderabbit.ai/docs/configuration
+
+reviews:
+  # 审查语言
+  language: zh-CN
+  
+  # 审查范围
+  path_filters:
+    - "!target/**"
+    - "!Cargo.lock"
+  
+  # 自动审查
+  auto_review:
+    enabled: true
+    # PR 创建时自动审查
+    drafts: false
+  
+  # 审查深度
+  high_level_summary: true
+  poem: false
+  
+  # 审查内容
+  review_status: true
+  walkthrough: true
+  
+  # 检查项
+  checks:
+    - description
+    - title
+    - docstring_coverage
+    - linked_issues
+    - out_of_scope_changes
+
+chat:
+  auto_reply: true
