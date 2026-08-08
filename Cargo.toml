@@ -5,7 +5,7 @@ edition = "2021"
 description = "Autonomous software development agent that drives web-based AI chat via CDP"
 license = "MIT"
 repository = "https://github.com/lisering/forge"
-documentation = "https://github.com/lisering/forge/blob/main/README.md"
+documentation = "https://docs.rs/forge"
 keywords = ["ai", "agent", "cdp", "automation", "development"]
 categories = ["command-line-utilities", "development-tools"]
 authors = ["john"]
@@ -36,3 +36,32 @@ tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread"] }
 proptest = "1"
 mockall = "0.12"
+
+# ── docs.rs 官方文档配置 ──────────────────────────────────
+# https://docs.rs/about/metadata
+[package.metadata.docs.rs]
+# 编译所有 features，确保文档包含所有 API
+all-features = true
+# 编译时设置环境变量，用于 cfg(condition) 文档
+rustdoc-args = ["--cfg", "docsrs"]
+# 目标平台
+targets = ["x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+# ── cargo 编译优化 ────────────────────────────────────────
+[profile.release]
+# LTO (Link Time Optimization) — 减小二进制体积，提升性能
+lto = true
+# 只保留必要的调试信息
+debug = false
+# 优化等级
+opt-level = 3
+# 单代码单元 (更好的优化)
+codegen-units = 1
+# 裁剪符号表
+strip = true
+
+[profile.dev]
+# 开发模式快速编译
+opt-level = 0
+debug = true
+incremental = true

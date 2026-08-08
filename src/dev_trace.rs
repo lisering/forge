@@ -442,7 +442,7 @@ impl DevTraceSummary {
 /// 使用追加模式写入, 支持 24 小时不间断运行。
 /// `write_entry` 接受 `&self` (非 `&mut self`), 避免与 Orchestrator 的借用冲突。
 pub struct DevTraceWriter {
-    /// trace 文件路径 (<workspace>/.forge/devtrace.jsonl)
+    /// trace 文件路径 (`workspace`/.forge/devtrace.jsonl)
     pub trace_path: PathBuf,
 }
 
