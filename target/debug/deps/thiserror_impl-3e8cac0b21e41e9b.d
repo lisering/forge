@@ -1,0 +1,17 @@
+/Users/john/freesoft/forge/github/target/debug/deps/thiserror_impl-3e8cac0b21e41e9b.d: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/ast.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/attr.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/expand.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fallback.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fmt.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/generics.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/prop.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/scan_expr.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/unraw.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/valid.rs
+
+/Users/john/freesoft/forge/github/target/debug/deps/libthiserror_impl-3e8cac0b21e41e9b.dylib: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/ast.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/attr.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/expand.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fallback.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fmt.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/generics.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/prop.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/scan_expr.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/unraw.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/valid.rs
+
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/lib.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/ast.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/attr.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/expand.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fallback.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/fmt.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/generics.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/prop.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/scan_expr.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/unraw.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.19/src/valid.rs:
+
+# env-dep:CARGO_PKG_VERSION_PATCH=19

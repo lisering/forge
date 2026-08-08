@@ -1,0 +1,11 @@
+/Users/john/freesoft/forge/github/target/debug/deps/writeable-f56283ef25f9b740.d: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/cmp.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/concat.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/impls.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/ops.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/parts_write_adapter.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/try_writeable.rs
+
+/Users/john/freesoft/forge/github/target/debug/deps/libwriteable-f56283ef25f9b740.rmeta: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/cmp.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/concat.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/impls.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/ops.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/parts_write_adapter.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/try_writeable.rs
+
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/lib.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/cmp.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/concat.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/impls.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/ops.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/parts_write_adapter.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/writeable-0.6.3/src/try_writeable.rs:

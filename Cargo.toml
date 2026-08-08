@@ -1,0 +1,38 @@
+[package]
+name = "forge"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous software development agent that drives web-based AI chat via CDP"
+license = "MIT"
+repository = "https://github.com/lisering/forge"
+documentation = "https://github.com/lisering/forge/blob/main/README.md"
+keywords = ["ai", "agent", "cdp", "automation", "development"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["john"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+regex = "1"
+zip = "2"
+walkdir = "2"
+sha2 = "0.10"
+async-trait = "0.1"
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread"] }
+proptest = "1"
+mockall = "0.12"

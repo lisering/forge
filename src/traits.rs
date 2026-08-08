@@ -1,0 +1,415 @@
+//! Trait 抽象层 — DIP 依赖倒置
+//!
+//! Orchestrator 依赖这些 trait 而非具体类型,使核心编排逻辑可在无 Chrome 环境下测试。
+//!
+//! - `ChatClient`: 抽象 AI 对话能力 (ChatTab / MockChatClient)
+//! - `TestRunner`: 抽象编译/测试能力 (CargoTestRunner / MockTestRunner)
+//! - `FileExtractor`: 抽象文件提取能力 (DefaultExtractor / MockExtractor)
+//! - `HumanInteraction`: 抽象人工干预能力 (AutoApprove / CliInteraction / MockInteraction)
+//! - `LanguageAdapter`: 抽象多语言构建/测试能力 (RustAdapter / PythonAdapter / ...)
+
+use crate::browser::SiteType;
+use crate::dev_trace::DevTraceWriter;
+use crate::extract::ExtractedFile;
+use crate::site_health::HealthCheckResult;
+use crate::testrunner::{E2ETestCase, E2ETestResult, TestResult};
+use anyhow::Result;
+use async_trait::async_trait;
+use std::path::Path;
+
+/// 聊天结果 (与浏览器实现的 ResponseResult 解耦)
+#[derive(Debug, Clone)]
+pub struct ChatResult {
+    /// AI 回复的文本内容
+    pub text: String,
+    /// 是否超时 (可能未完成)
+    pub timed_out: bool,
+}
+
+/// 聊天客户端 trait — 抽象 AI 对话能力
+///
+/// 实现者:
+/// - `ChatTab` (浏览器版,需 Chrome)
+/// - `MockChatClient` (测试版,预编程回复)
+///
+/// **上下文衔接 (借鉴方向 1)**:
+/// - `start_new_conversation()` — 新开对话 (导航到 chat.z.ai/ 或点击"新聊天")
+/// - `conversation_turn_count()` — 当前对话轮数 (用于判断是否需要交接)
+#[async_trait]
+pub trait ChatClient: Send + Sync {
+    /// 发送消息并等待 AI 回复
+    async fn send_message(&self, msg: &str, timeout: u64) -> Result<ChatResult>;
+
+    /// 新开对话 — 上下文衔接 (借鉴方向 1)
+    ///
+    /// 通过 CDP 导航到 `https://chat.z.ai/` (或点击"新聊天"/"新任务"按钮),
+    /// 等待页面加载完成, 重置对话轮数。
+    ///
+    /// 默认实现返回 Ok(()) (不做任何事), 向后兼容。
+    /// `ChatTab` 覆盖此方法, 实际导航浏览器。
+    async fn start_new_conversation(&self) -> Result<()> {
+        // 默认: 不支持新开对话 (向后兼容, Mock 可不实现)
+        Ok(())
+    }
+
+    /// 当前对话轮数 — 用于判断是否需要上下文衔接
+    ///
+    /// 每次 `send_message` 后轮数 +1。
+    /// `start_new_conversation` 后轮数清零。
+    ///
+    /// 默认实现返回 0 (不支持轮次跟踪)。
+    fn conversation_turn_count(&self) -> usize {
+        0
+    }
+
+    /// 设置 DevTrace 写入器 — 用于记录健康检查/网站切换等事件
+    ///
+    /// 默认实现为空操作。`FailoverChatClient` 覆盖此方法以接收 DevTraceWriter,
+    /// 在健康检查和网站切换时写入 trace 条目到 `.forge/devtrace.jsonl`。
+    ///
+    /// 此方法在 Orchestrator 创建后、运行开始前调用。
+    fn set_dev_trace(&self, _writer: DevTraceWriter) {}
+
+    /// 上传文件到聊天页面 — 用于向 AI 提供上下文文件
+    ///
+    /// 通过 CDP `DOM.setFileInputFiles` 将本地文件上传到网页的文件输入元素。
+    /// Z.ai 支持 "最多上传 10 个文件", DeepSeek 等网站也有类似功能。
+    ///
+    /// # 参数
+    /// - `file_paths`: 文件绝对路径列表
+    ///
+    /// 默认实现返回 `Ok(())` (不支持上传, 向后兼容)。
+    /// `ChatTab` 覆盖此方法, 通过 CDP 操作浏览器上传文件。
+    async fn upload_files(&self, _file_paths: &[&str]) -> Result<()> {
+        // 默认: 不支持文件上传 (向后兼容, Mock 可不实现)
+        Ok(())
+    }
+
+    /// 写入最终统计信息到 DevTrace — 运行结束后调用
+    ///
+    /// 默认实现为空操作。`FailoverChatClient` 覆盖此方法以写入各网站性能统计
+    /// (SitePerformanceStats) 到 trace 文件。
+    async fn write_final_trace(&self) {}
+}
+
+// ============================================================================
+//  Failoverable trait — 可故障切换的聊天客户端
+// ============================================================================
+
+/// 可故障切换的聊天客户端 — 扩展 ChatClient, 增加网站类型和健康检查能力
+///
+/// `FailoverChatClient` 依赖此 trait 而非具体 `ChatTab`,
+/// 使多网站自动切换逻辑可在无 Chrome 环境下测试。
+///
+/// 实现者:
+/// - `ChatTab` (浏览器版, 需 Chrome)
+/// - `MockFailoverClient` (测试版, 预编程健康检查结果)
+#[async_trait]
+pub trait Failoverable: ChatClient {
+    /// 返回网站类型 (Z.ai / DeepSeek / Kimi / 通义千问 / Claude / Unknown)
+    ///
+    /// 用于日志输出、性能统计、DevTrace 记录。
+    fn site_type(&self) -> SiteType;
+
+    /// 执行健康检查 — 检测网站是否可用 (登录/限流/维护/网络)
+    ///
+    /// 在 `FailoverChatClient::send_message` 中, 每隔 N 轮对话调用此方法,
+    /// 不健康时自动切换到备用标签页。
+    ///
+    /// `ChatTab` 实现通过 `SiteHealthChecker::check(&self.session, self.site_type)` 执行;
+    /// `MockFailoverClient` 实现返回预编程结果, 用于测试。
+    async fn health_check(&self) -> Result<HealthCheckResult>;
+}
+
+/// 测试运行器 trait — 抽象编译/测试能力
+///
+/// 实现者:
+/// - `CargoTestRunner` (真实 cargo)
+/// - `MockTestRunner` (测试版,预编程结果)
+pub trait TestRunner: Send + Sync {
+    /// 快速编译检查 (不生成二进制)
+    fn check(&self, dir: &Path) -> Result<TestResult>;
+    /// 运行测试
+    fn test(&self, dir: &Path) -> Result<TestResult>;
+    /// E2E 测试 — 运行编译后的程序并验证输出
+    ///
+    /// 默认实现返回空结果 (不支持 E2E 测试)。
+    /// `CargoTestRunner` 覆盖此方法,实际构建并运行二进制。
+    fn run_binary(&self, _dir: &Path, _test_cases: &[E2ETestCase]) -> Result<Vec<E2ETestResult>> {
+        // 默认: 不支持 E2E 测试
+        Ok(vec![])
+    }
+}
+
+/// 文件提取器 trait — 抽象从 AI 回复提取代码文件的能力
+///
+/// 实现者:
+/// - `DefaultExtractor` (正则提取)
+/// - `MockExtractor` (测试版,预编程文件)
+pub trait FileExtractor: Send + Sync {
+    /// 从文本中提取所有代码文件
+    fn extract(&self, text: &str) -> Vec<ExtractedFile>;
+}
+
+// ============================================================================
+//  自主提问能力 (ClarificationChecker) — 核心中的核心
+// ============================================================================
+
+/// 澄清检查结果
+///
+/// 当 `needs_clarification` 为 true 时, `question` 包含要发送给 AI 的追问消息,
+/// `reason` 记录为什么需要追问 (用于决策日志)。
+#[derive(Debug, Clone)]
+pub struct ClarificationResult {
+    /// 是否需要追问
+    pub needs_clarification: bool,
+    /// 要发送给 AI 的追问消息 (当 needs_clarification=true 时有效)
+    pub question: String,
+    /// 追问原因 (用于决策日志)
+    pub reason: String,
+}
+
+impl ClarificationResult {
+    /// 不需要追问
+    pub fn no() -> Self {
+        Self {
+            needs_clarification: false,
+            question: String::new(),
+            reason: String::new(),
+        }
+    }
+
+    /// 需要追问
+    pub fn yes(question: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            needs_clarification: true,
+            question: question.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// 澄清上下文 — 提供给 ClarificationChecker 的判断依据
+#[derive(Debug, Clone)]
+pub struct ClarificationContext {
+    /// 当前任务的原始 prompt
+    pub task_prompt: String,
+    /// AI 回复是否超时 (可能未完成)
+    pub timed_out: bool,
+    /// 当前任务已追问次数
+    pub questions_asked: u32,
+    /// 每个任务最大追问次数
+    pub max_questions: u32,
+    /// 之前已问过的问题列表 (用于去重)
+    pub previous_questions: Vec<String>,
+}
+
+impl ClarificationContext {
+    /// 是否还能继续追问
+    pub fn can_ask_more(&self) -> bool {
+        self.questions_asked < self.max_questions
+    }
+}
+
+/// 澄清检查器 trait — DIP: 判断 AI 回复是否需要追问
+///
+/// **核心中的核心** — Agent 自主判断 AI 回复是否需要澄清,
+/// 并生成合适的追问消息。
+///
+/// trait 方法为 `async` — 支持本地 LLM 增强判断 (如 Ollama),
+/// 启发式实现可同步返回, LLM 实现可异步调用模型。
+///
+/// 实现者:
+/// - `HeuristicClarificationChecker` (启发式规则版,同步返回)
+/// - `LlmClarificationChecker` (本地 LLM 版,异步调用 Ollama)
+/// - `HybridClarificationChecker` (混合版,启发式优先 + LLM 兜底)
+/// - `MockClarificationChecker` (测试版,预编程结果)
+#[async_trait]
+pub trait ClarificationChecker: Send + Sync {
+    /// 检查 AI 回复是否需要追问
+    ///
+    /// 返回 `ClarificationResult`:
+    /// - `needs_clarification=true` 时, `question` 是要发送的追问消息
+    /// - `needs_clarification=false` 时, 表示无需追问,可继续处理
+    async fn check(&self, response: &str, context: &ClarificationContext) -> ClarificationResult;
+}
+
+// ============================================================================
+//  人工干预接口 (HumanInteraction) — 方向 A
+// ============================================================================
+
+/// 计划信息 — 给人类查看的开发计划摘要
+///
+/// 在 AI 完成规划后, 将计划呈现给人类确认。
+#[derive(Debug, Clone)]
+pub struct PlanInfo {
+    /// 终极目标
+    pub goal: String,
+    /// 阶段列表
+    pub phases: Vec<PhaseInfo>,
+}
+
+/// 阶段信息 — 给人类查看的阶段摘要
+#[derive(Debug, Clone)]
+pub struct PhaseInfo {
+    /// 阶段名称
+    pub name: String,
+    /// 阶段描述
+    pub description: String,
+    /// 任务列表
+    pub tasks: Vec<TaskInfo>,
+}
+
+/// 任务信息 — 给人类查看的任务摘要
+#[derive(Debug, Clone)]
+pub struct TaskInfo {
+    /// 任务 ID (如 "0-1")
+    pub id: String,
+    /// 任务名称
+    pub name: String,
+    /// 任务 prompt (给 AI 的指令)
+    pub prompt: String,
+}
+
+/// 任务执行动作 — 人类对任务执行的决策
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskAction {
+    /// 执行任务
+    Execute,
+    /// 跳过任务
+    Skip,
+    /// 终止整个开发流程
+    Abort,
+}
+
+/// 修复上下文 — 给人类查看的修复信息
+///
+/// 在修复重试前, 将失败信息呈现给人类确认。
+#[derive(Debug, Clone)]
+pub struct FixContext {
+    /// 当前阶段索引
+    pub phase_idx: usize,
+    /// 当前任务索引
+    pub task_idx: usize,
+    /// 当前修复轮次 (从 1 开始)
+    pub attempt: u32,
+    /// 最大修复轮次
+    pub max_attempts: u32,
+    /// 上一次失败的反馈 (编译/测试错误信息)
+    pub feedback: String,
+}
+
+/// 人工干预 trait — DIP: 在关键决策点暂停, 等待人类确认
+///
+/// **方向 A: 人工干预接口**
+///
+/// 在自主开发流程的关键节点, 将决策权交给人类:
+/// - 计划确认: AI 完成规划后, 让人类确认或拒绝
+/// - 任务确认: 每个任务执行前, 让人类决定执行/跳过/中止
+/// - 修复确认: 修复重试前, 让人类决定是否继续
+/// - 需求变更确认: 需求变更时, 让人类确认是否处理
+///
+/// 实现者:
+/// - `AutoApprove` (自动批准, 默认, 全自主模式)
+/// - `CliInteraction` (CLI 交互式确认)
+/// - `MockInteraction` (测试版, 预编程响应)
+#[async_trait]
+pub trait HumanInteraction: Send + Sync {
+    /// 确认 AI 的开发计划
+    ///
+    /// 返回 true 继续执行, false 中止开发。
+    async fn confirm_planning(&self, plan: &PlanInfo) -> Result<bool>;
+
+    /// 确认执行单个任务
+    ///
+    /// 返回 `TaskAction`:
+    /// - `Execute` — 执行该任务
+    /// - `Skip` — 跳过该任务
+    /// - `Abort` — 终止整个开发流程
+    async fn confirm_task(&self, task: &TaskInfo) -> Result<TaskAction>;
+
+    /// 确认修复重试
+    ///
+    /// 在修复轮次 > 1 时调用, 让人类决定是否继续修复。
+    /// 返回 true 继续修复, false 跳过修复。
+    async fn confirm_fix(&self, context: &FixContext) -> Result<bool>;
+
+    /// 确认需求变更处理
+    ///
+    /// 返回 true 处理变更, false 跳过变更。
+    async fn confirm_requirement_change(&self, changes_summary: &str) -> Result<bool>;
+}
+
+// ============================================================================
+//  多语言项目支持 (LanguageAdapter) — 方向 B
+// ============================================================================
+
+/// 支持的编程语言
+///
+/// 通过检测项目文件自动识别:
+/// - `Cargo.toml` → Rust
+/// - `pyproject.toml` / `setup.py` / `requirements.txt` → Python
+/// - `go.mod` → Go
+/// - `package.json` → Node
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Language {
+    Rust,
+    Python,
+    Go,
+    Node,
+    /// 无法识别的语言
+    Unknown,
+}
+
+impl Language {
+    /// 语言的显示名称
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Language::Rust => "Rust",
+            Language::Python => "Python",
+            Language::Go => "Go",
+            Language::Node => "Node.js",
+            Language::Unknown => "Unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display_name())
+    }
+}
+
+/// 语言适配器 trait — DIP: 抽象不同语言的构建/测试/运行能力
+///
+/// **方向 B: 多语言项目支持**
+///
+/// 每种语言有自己的构建工具链:
+/// - Rust: cargo check / cargo test / cargo build
+/// - Python: python -m py_compile / python -m pytest / python main.py
+/// - Go: go build / go test / go build -o binary
+/// - Node: npx tsc --noEmit / npm test / node index.js
+///
+/// 实现者:
+/// - `RustAdapter` (cargo)
+/// - `PythonAdapter` (python/pytest)
+/// - `GoAdapter` (go)
+/// - `NodeAdapter` (npm/node)
+/// - `MockLanguageAdapter` (测试版)
+pub trait LanguageAdapter: Send + Sync {
+    /// 返回此适配器支持的语言
+    fn language(&self) -> Language;
+
+    /// 快速编译检查 (语法/类型检查, 不生成二进制)
+    fn check(&self, dir: &Path) -> Result<TestResult>;
+
+    /// 运行测试
+    fn test(&self, dir: &Path) -> Result<TestResult>;
+
+    /// 运行编译后的程序并验证输出 (E2E 测试)
+    ///
+    /// 默认实现返回空结果 (不支持 E2E 测试)。
+    fn run_binary(&self, _dir: &Path, _test_cases: &[E2ETestCase]) -> Result<Vec<E2ETestResult>> {
+        Ok(vec![])
+    }
+}

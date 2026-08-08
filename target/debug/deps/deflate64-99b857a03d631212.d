@@ -1,0 +1,11 @@
+/Users/john/freesoft/forge/github/target/debug/deps/deflate64-99b857a03d631212.d: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/buffer.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/huffman_tree.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/inflater_managed.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/input_buffer.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/output_window.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/stream.rs
+
+/Users/john/freesoft/forge/github/target/debug/deps/libdeflate64-99b857a03d631212.rmeta: /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/lib.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/buffer.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/huffman_tree.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/inflater_managed.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/input_buffer.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/output_window.rs /Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/stream.rs
+
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/lib.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/buffer.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/huffman_tree.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/inflater_managed.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/input_buffer.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/output_window.rs:
+/Users/john/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/deflate64-0.1.12/src/stream.rs:
