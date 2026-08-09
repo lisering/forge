@@ -77,9 +77,7 @@ impl SitePerformanceStats {
         self.total_sends += 1;
         self.success_count += 1;
         self.total_response_ms += duration_ms;
-        if self.min_response_ms == 0 || duration_ms < self.min_response_ms {
-            self.min_response_ms = duration_ms;
-        }
+        self.min_response_ms = update_min_response_time(self.min_response_ms, duration_ms);
         if duration_ms > self.max_response_ms {
             self.max_response_ms = duration_ms;
         }
@@ -150,6 +148,181 @@ impl SitePerformanceStats {
             self.failover_to_count,
         )
     }
+}
+
+// ============================================================================
+//  Pure Logic Functions — 纯逻辑函数 (可独立测试, 无异步/外部依赖)
+// ============================================================================
+
+/// 判断健康检查结果是否应该触发故障切换
+///
+/// 当且仅当: 不健康 **且** 应该切换 时返回 `true`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::site_health::{HealthCheckResult, SiteHealthStatus};
+/// # use forge::failover_chat::should_failover_decision;
+/// let healthy = HealthCheckResult::new(SiteHealthStatus::Healthy);
+/// assert!(!should_failover_decision(&healthy));
+///
+/// let rate_limited = HealthCheckResult::new(SiteHealthStatus::RateLimited);
+/// assert!(should_failover_decision(&rate_limited));
+/// ```
+pub fn should_failover_decision(health: &HealthCheckResult) -> bool {
+    !health.is_healthy() && health.should_failover()
+}
+
+/// 从错误字符串构建 `NetworkError` 健康检查结果
+///
+/// 用于健康检查本身失败 (如 CDP 连接断开) 时, 创建一个表示网络错误的
+/// `HealthCheckResult`。时间戳使用当前系统时间。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::build_error_health_result;
+/// # use forge::site_health::SiteHealthStatus;
+/// let result = build_error_health_result("connection refused".to_string());
+/// assert_eq!(result.status, SiteHealthStatus::NetworkError);
+/// assert_eq!(result.message.as_deref(), Some("connection refused"));
+/// ```
+pub fn build_error_health_result(error_msg: String) -> HealthCheckResult {
+    HealthCheckResult {
+        status: SiteHealthStatus::NetworkError,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        message: Some(error_msg),
+        current_url: None,
+        check_duration_ms: 0,
+    }
+}
+
+/// 分类故障切换失败的原因
+///
+/// 根据切换策略状态返回人类可读的原因描述, 用于日志和 DevTrace。
+///
+/// - `all_tried == true` → "所有标签页都已尝试"
+/// - `consecutive_failures >= max_failures` → "超过最大连续失败次数"
+/// - 否则 → "无可用标签页"
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::classify_failover_failure_reason;
+/// assert_eq!(classify_failover_failure_reason(true, 0, 3), "所有标签页都已尝试");
+/// assert_eq!(classify_failover_failure_reason(false, 3, 3), "超过最大连续失败次数");
+/// assert_eq!(classify_failover_failure_reason(false, 0, 3), "无可用标签页");
+/// ```
+pub fn classify_failover_failure_reason(
+    all_tried: bool,
+    consecutive_failures: usize,
+    max_failures: usize,
+) -> &'static str {
+    if all_tried {
+        "所有标签页都已尝试"
+    } else if consecutive_failures >= max_failures {
+        "超过最大连续失败次数"
+    } else {
+        "无可用标签页"
+    }
+}
+
+/// 计算健康检查间隔是否已到
+///
+/// - `interval == 0` → 每次都检查 (返回 `true`)
+/// - `current_turn - last_check_turn >= interval` → 应检查 (返回 `true`)
+///
+/// 使用 `saturating_sub` 防止下溢。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::calculate_health_check_interval_elapsed;
+/// // interval=0 → 每次都检查
+/// assert!(calculate_health_check_interval_elapsed(0, 0, 0));
+/// assert!(calculate_health_check_interval_elapsed(5, 3, 0));
+///
+/// // interval=3, 当前=5, 上次=0 → 5-0=5 >= 3 → 检查
+/// assert!(calculate_health_check_interval_elapsed(5, 0, 3));
+///
+/// // interval=3, 当前=2, 上次=0 → 2-0=2 < 3 → 跳过
+/// assert!(!calculate_health_check_interval_elapsed(2, 0, 3));
+/// ```
+pub fn calculate_health_check_interval_elapsed(
+    current_turn: usize,
+    last_check_turn: usize,
+    interval: usize,
+) -> bool {
+    if interval == 0 {
+        return true;
+    }
+    current_turn.saturating_sub(last_check_turn) >= interval
+}
+
+/// 更新最小响应时间
+///
+/// 当 `current_min` 为 `0` (初始值) 或 `new_duration` 更小时, 返回 `new_duration`。
+/// 否则返回 `current_min` 不变。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::update_min_response_time;
+/// assert_eq!(update_min_response_time(0, 150), 150);   // 初始 → 更新
+/// assert_eq!(update_min_response_time(150, 100), 100);  // 更小 → 更新
+/// assert_eq!(update_min_response_time(100, 200), 100);  // 更大 → 不变
+/// ```
+pub fn update_min_response_time(current_min: u64, new_duration: u64) -> u64 {
+    if current_min == 0 || new_duration < current_min {
+        new_duration
+    } else {
+        current_min
+    }
+}
+
+/// 格式化切换成功的 trace 消息
+///
+/// 生成如 `"切换 [0] Z.ai → [1] DeepSeek"` 的格式, 用于日志和 DevTrace。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::format_switch_trace;
+/// # use forge::browser::SiteType;
+/// let msg = format_switch_trace(0, SiteType::Zai, 1, SiteType::DeepSeek);
+/// assert!(msg.contains("Z.ai"));
+/// assert!(msg.contains("DeepSeek"));
+/// ```
+pub fn format_switch_trace(
+    old_idx: usize,
+    old_site: SiteType,
+    new_idx: usize,
+    new_site: SiteType,
+) -> String {
+    format!(
+        "切换 [{}] {} → [{}] {}",
+        old_idx, old_site, new_idx, new_site
+    )
+}
+
+/// 格式化切换失败的 trace 消息
+///
+/// 生成如 `"尝试从 [0] Z.ai 切换"` 的格式, 用于日志和 DevTrace。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::failover_chat::format_failover_failure_trace;
+/// # use forge::browser::SiteType;
+/// let msg = format_failover_failure_trace(0, SiteType::Zai);
+/// assert!(msg.contains("Z.ai"));
+/// assert!(msg.contains("尝试从"));
+/// ```
+pub fn format_failover_failure_trace(old_idx: usize, old_site: SiteType) -> String {
+    format!("尝试从 [{}] {} 切换", old_idx, old_site)
 }
 
 // ============================================================================
@@ -248,14 +421,13 @@ impl<'a, C: Failoverable> FailoverChatClient<'a, C> {
 
     /// 是否到了健康检查的时候
     fn should_check_health(&self) -> bool {
-        if self.health_check_interval == 0 {
-            return true; // 每次都检查
-        }
-
         let current_turn = self.current_tab().conversation_turn_count();
         let last_check = self.last_check_turn.load(Ordering::Relaxed);
-
-        current_turn.saturating_sub(last_check) >= self.health_check_interval
+        calculate_health_check_interval_elapsed(
+            current_turn,
+            last_check,
+            self.health_check_interval,
+        )
     }
 
     /// 执行健康检查 (如果到了检查的时候)
@@ -275,16 +447,7 @@ impl<'a, C: Failoverable> FailoverChatClient<'a, C> {
             Ok(r) => r,
             Err(e) => {
                 warn!("健康检查失败 [{}]: {}", site_type, e);
-                HealthCheckResult {
-                    status: SiteHealthStatus::NetworkError,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                    message: Some(e.to_string()),
-                    current_url: None,
-                    check_duration_ms: 0,
-                }
+                build_error_health_result(e.to_string())
             }
         };
 
@@ -365,10 +528,7 @@ impl<'a, C: Failoverable> FailoverChatClient<'a, C> {
                     None,
                     None,
                     None,
-                    &format!(
-                        "切换 [{}] {} → [{}] {}",
-                        old_idx, old_site_type, new_idx, new_site_type
-                    ),
+                    &format_switch_trace(old_idx, old_site_type, new_idx, new_site_type),
                     "成功",
                     0,
                     true,
@@ -389,17 +549,17 @@ impl<'a, C: Failoverable> FailoverChatClient<'a, C> {
                 }
 
                 // 写入 DevTrace (切换失败)
-                let failover_reason = if failover.all_tried() {
-                    "所有标签页都已尝试"
-                } else {
-                    "超过最大连续失败次数"
-                };
+                let failover_reason = classify_failover_failure_reason(
+                    failover.all_tried(),
+                    failover.consecutive_failures,
+                    failover.max_consecutive_failures,
+                );
                 self.write_trace(
                     TraceAction::SiteFailover,
                     None,
                     None,
                     None,
-                    &format!("尝试从 [{}] {} 切换", old_idx, old_site_type),
+                    &format_failover_failure_trace(old_idx, old_site_type),
                     "无法切换",
                     0,
                     false,
@@ -478,7 +638,7 @@ impl<'a, C: Failoverable> ChatClient for FailoverChatClient<'a, C> {
 
         // 1. 健康检查 (如果到了检查的时候)
         if let Some(health) = self.maybe_check_health().await {
-            if !health.is_healthy() && health.should_failover() {
+            if should_failover_decision(&health) {
                 // 尝试切换
                 self.try_switch(&health).await;
             }
@@ -1552,5 +1712,357 @@ mod tests {
             stats[1].2.failover_to_count, 1,
             "DeepSeek 应有 1 次切入记录"
         );
+    }
+
+    // ===== 纯逻辑函数测试 (第 54 项) =====
+
+    // --- should_failover_decision 测试 ---
+
+    #[test]
+    fn test_should_failover_decision_healthy() {
+        let health = HealthCheckResult::new(SiteHealthStatus::Healthy);
+        assert!(!should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_not_logged_in() {
+        let health = HealthCheckResult::new(SiteHealthStatus::NotLoggedIn);
+        assert!(should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_rate_limited() {
+        let health = HealthCheckResult::new(SiteHealthStatus::RateLimited);
+        assert!(should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_under_maintenance() {
+        let health = HealthCheckResult::new(SiteHealthStatus::UnderMaintenance);
+        assert!(should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_network_error() {
+        let health = HealthCheckResult::new(SiteHealthStatus::NetworkError);
+        assert!(should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_unknown() {
+        // Unknown: 不健康但不触发 failover → false
+        let health = HealthCheckResult::new(SiteHealthStatus::Unknown);
+        assert!(!should_failover_decision(&health));
+    }
+
+    #[test]
+    fn test_should_failover_decision_with_message() {
+        // 带有消息的结果不影响决策
+        let health = HealthCheckResult {
+            status: SiteHealthStatus::RateLimited,
+            timestamp: 12345,
+            message: Some("请求过于频繁".to_string()),
+            current_url: Some("https://chat.z.ai".to_string()),
+            check_duration_ms: 50,
+        };
+        assert!(should_failover_decision(&health));
+    }
+
+    // --- build_error_health_result 测试 ---
+
+    #[test]
+    fn test_build_error_health_result_basic() {
+        let result = build_error_health_result("connection refused".to_string());
+        assert_eq!(result.status, SiteHealthStatus::NetworkError);
+        assert_eq!(result.message.as_deref(), Some("connection refused"));
+        assert!(result.current_url.is_none());
+        assert_eq!(result.check_duration_ms, 0);
+    }
+
+    #[test]
+    fn test_build_error_health_result_empty_message() {
+        let result = build_error_health_result(String::new());
+        assert_eq!(result.status, SiteHealthStatus::NetworkError);
+        assert_eq!(result.message.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_build_error_health_result_long_message() {
+        let long_msg = "x".repeat(1000);
+        let result = build_error_health_result(long_msg.clone());
+        assert_eq!(result.message.as_deref(), Some(long_msg.as_str()));
+    }
+
+    #[test]
+    fn test_build_error_health_result_unicode() {
+        let result = build_error_health_result("连接被拒绝".to_string());
+        assert_eq!(result.message.as_deref(), Some("连接被拒绝"));
+    }
+
+    #[test]
+    fn test_build_error_health_result_timestamp_positive() {
+        // 时间戳应该是合理的 (非零, 在当前时间附近)
+        let result = build_error_health_result("error".to_string());
+        assert!(result.timestamp > 0);
+    }
+
+    // --- classify_failover_failure_reason 测试 ---
+
+    #[test]
+    fn test_classify_failover_reason_all_tried() {
+        assert_eq!(
+            classify_failover_failure_reason(true, 0, 3),
+            "所有标签页都已尝试"
+        );
+    }
+
+    #[test]
+    fn test_classify_failover_reason_max_failures() {
+        assert_eq!(
+            classify_failover_failure_reason(false, 3, 3),
+            "超过最大连续失败次数"
+        );
+    }
+
+    #[test]
+    fn test_classify_failover_reason_exceeds_max_failures() {
+        assert_eq!(
+            classify_failover_failure_reason(false, 5, 3),
+            "超过最大连续失败次数"
+        );
+    }
+
+    #[test]
+    fn test_classify_failover_reason_no_available() {
+        assert_eq!(
+            classify_failover_failure_reason(false, 0, 3),
+            "无可用标签页"
+        );
+    }
+
+    #[test]
+    fn test_classify_failover_reason_below_max() {
+        assert_eq!(
+            classify_failover_failure_reason(false, 1, 3),
+            "无可用标签页"
+        );
+    }
+
+    #[test]
+    fn test_classify_failover_reason_all_tried_takes_priority() {
+        // all_tried 优先于 max_failures
+        assert_eq!(
+            classify_failover_failure_reason(true, 5, 3),
+            "所有标签页都已尝试"
+        );
+    }
+
+    // --- calculate_health_check_interval_elapsed 测试 ---
+
+    #[test]
+    fn test_health_check_interval_elapsed_zero_always_checks() {
+        assert!(calculate_health_check_interval_elapsed(0, 0, 0));
+        assert!(calculate_health_check_interval_elapsed(1, 0, 0));
+        assert!(calculate_health_check_interval_elapsed(100, 50, 0));
+    }
+
+    #[test]
+    fn test_health_check_interval_exact_match() {
+        // current - last == interval → 检查
+        assert!(calculate_health_check_interval_elapsed(5, 0, 5));
+        assert!(calculate_health_check_interval_elapsed(10, 7, 3));
+    }
+
+    #[test]
+    fn test_health_check_interval_above_threshold() {
+        // current - last > interval → 检查
+        assert!(calculate_health_check_interval_elapsed(10, 0, 5));
+        assert!(calculate_health_check_interval_elapsed(100, 0, 10));
+    }
+
+    #[test]
+    fn test_health_check_interval_below_threshold() {
+        // current - last < interval → 跳过
+        assert!(!calculate_health_check_interval_elapsed(1, 0, 5));
+        assert!(!calculate_health_check_interval_elapsed(4, 0, 5));
+    }
+
+    #[test]
+    fn test_health_check_interval_same_turn() {
+        // current == last → 0 < interval (interval > 0) → 跳过
+        assert!(!calculate_health_check_interval_elapsed(5, 5, 3));
+    }
+
+    #[test]
+    fn test_health_check_interval_last_greater_than_current() {
+        // last > current (不会在正常流程中出现, 但不应 panic)
+        // saturating_sub 防止下溢 → 0 < interval → 跳过
+        assert!(!calculate_health_check_interval_elapsed(3, 5, 2));
+    }
+
+    #[test]
+    fn test_health_check_interval_large_interval() {
+        assert!(!calculate_health_check_interval_elapsed(1, 0, 1000));
+        assert!(calculate_health_check_interval_elapsed(1000, 0, 1000));
+    }
+
+    // --- update_min_response_time 测试 ---
+
+    #[test]
+    fn test_update_min_response_time_initial() {
+        // current_min=0 (初始值) → 返回 new_duration
+        assert_eq!(update_min_response_time(0, 150), 150);
+    }
+
+    #[test]
+    fn test_update_min_response_time_smaller() {
+        // new < current → 返回 new
+        assert_eq!(update_min_response_time(150, 100), 100);
+    }
+
+    #[test]
+    fn test_update_min_response_time_larger() {
+        // new > current → 返回 current
+        assert_eq!(update_min_response_time(100, 200), 100);
+    }
+
+    #[test]
+    fn test_update_min_response_time_equal() {
+        // new == current → 返回 current (不变)
+        assert_eq!(update_min_response_time(100, 100), 100);
+    }
+
+    #[test]
+    fn test_update_min_response_time_both_zero() {
+        assert_eq!(update_min_response_time(0, 0), 0);
+    }
+
+    #[test]
+    fn test_update_min_response_time_zero_current_zero_new() {
+        // 0 初始值 + 0 duration → 0
+        assert_eq!(update_min_response_time(0, 0), 0);
+    }
+
+    #[test]
+    fn test_update_min_response_time_sequence() {
+        // 模拟连续调用: 初始 → 200 → 150 → 100 → 120 (不变)
+        let mut min = 0u64;
+        min = update_min_response_time(min, 200);
+        assert_eq!(min, 200);
+        min = update_min_response_time(min, 150);
+        assert_eq!(min, 150);
+        min = update_min_response_time(min, 100);
+        assert_eq!(min, 100);
+        min = update_min_response_time(min, 120);
+        assert_eq!(min, 100);
+    }
+
+    // --- format_switch_trace 测试 ---
+
+    #[test]
+    fn test_format_switch_trace_basic() {
+        let msg = format_switch_trace(0, SiteType::Zai, 1, SiteType::DeepSeek);
+        assert!(msg.contains("[0]"));
+        assert!(msg.contains("Z.ai"));
+        assert!(msg.contains("[1]"));
+        assert!(msg.contains("DeepSeek"));
+        assert!(msg.contains("→"));
+    }
+
+    #[test]
+    fn test_format_switch_trace_same_site_type() {
+        let msg = format_switch_trace(0, SiteType::Zai, 2, SiteType::Zai);
+        assert!(msg.contains("[0]"));
+        assert!(msg.contains("[2]"));
+        // 同类型 → 两次 Z.ai
+        assert_eq!(msg.matches("Z.ai").count(), 2);
+    }
+
+    #[test]
+    fn test_format_switch_trace_kimi_to_tongyi() {
+        let msg = format_switch_trace(1, SiteType::Kimi, 3, SiteType::Tongyi);
+        assert!(msg.contains("Kimi"));
+        assert!(msg.contains("通义千问"));
+    }
+
+    #[test]
+    fn test_format_switch_trace_large_indices() {
+        let msg = format_switch_trace(999, SiteType::Zai, 1000, SiteType::DeepSeek);
+        assert!(msg.contains("[999]"));
+        assert!(msg.contains("[1000]"));
+    }
+
+    #[test]
+    fn test_format_switch_trace_unknown_site() {
+        let msg = format_switch_trace(0, SiteType::Unknown, 1, SiteType::Unknown);
+        assert!(msg.contains("未知网站"));
+    }
+
+    // --- format_failover_failure_trace 测试 ---
+
+    #[test]
+    fn test_format_failover_failure_trace_basic() {
+        let msg = format_failover_failure_trace(0, SiteType::Zai);
+        assert!(msg.contains("[0]"));
+        assert!(msg.contains("Z.ai"));
+        assert!(msg.contains("尝试从"));
+    }
+
+    #[test]
+    fn test_format_failover_failure_trace_deepseek() {
+        let msg = format_failover_failure_trace(1, SiteType::DeepSeek);
+        assert!(msg.contains("[1]"));
+        assert!(msg.contains("DeepSeek"));
+    }
+
+    #[test]
+    fn test_format_failover_failure_trace_large_index() {
+        let msg = format_failover_failure_trace(999, SiteType::Kimi);
+        assert!(msg.contains("[999]"));
+        assert!(msg.contains("Kimi"));
+    }
+
+    #[test]
+    fn test_format_failover_failure_trace_unknown_site() {
+        let msg = format_failover_failure_trace(0, SiteType::Unknown);
+        assert!(msg.contains("未知网站"));
+    }
+
+    // --- 纯逻辑函数与 SitePerformanceStats 集成测试 ---
+
+    #[test]
+    fn test_update_min_response_time_with_stats() {
+        // 验证纯函数与 SitePerformanceStats::record_success 的一致性
+        let mut stats = SitePerformanceStats::default();
+
+        // 第一次成功: 150ms
+        stats.record_success(150);
+        assert_eq!(stats.min_response_ms, update_min_response_time(0, 150));
+
+        // 第二次成功: 100ms (更小)
+        stats.record_success(100);
+        assert_eq!(stats.min_response_ms, update_min_response_time(150, 100));
+
+        // 第三次成功: 200ms (更大, 不变)
+        stats.record_success(200);
+        assert_eq!(stats.min_response_ms, update_min_response_time(100, 200));
+    }
+
+    #[test]
+    fn test_classify_failover_reason_matches_try_switch_logic() {
+        // 验证纯函数与 try_switch 中实际的失败分类逻辑一致
+        let all_tried = true;
+        let consecutive_failures = 0;
+        let max_failures = 3;
+
+        let reason =
+            classify_failover_failure_reason(all_tried, consecutive_failures, max_failures);
+
+        // all_tried=true → "所有标签页都已尝试"
+        assert_eq!(reason, "所有标签页都已尝试");
+
+        // all_tried=false, consecutive >= max → "超过最大连续失败次数"
+        let reason2 = classify_failover_failure_reason(false, 3, 3);
+        assert_eq!(reason2, "超过最大连续失败次数");
     }
 }

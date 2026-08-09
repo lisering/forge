@@ -261,9 +261,9 @@ fn is_meaningful_content(text: &str) -> bool {
 /// - 文本 500-5000 字符: 5 次稳定 (中等回复)  
 /// - 文本 > 5000 字符: 6 次稳定 (长回复, 如 JSON 规划)
 fn calculate_stability_target(text_length: usize) -> u32 {
-    if text_length > 5000 {
+    if text_length >= 5000 {
         6
-    } else if text_length > 500 {
+    } else if text_length >= 500 {
         5
     } else {
         3
@@ -334,15 +334,14 @@ fn check_stuck_detection(
     last_hash: u64,
     now: tokio::time::Instant,
 ) -> (bool, tokio::time::Instant) {
-    let stuck_duration = last_change_time.elapsed();
-    let is_stuck = stuck_duration > tokio::time::Duration::from_secs(stuck_threshold);
+    let has_change = current_count != last_count || current_hash != last_hash;
 
     // 如果有任何变化，更新最后变化时间
-    let new_change_time = if current_count != last_count || current_hash != last_hash {
-        now
-    } else {
-        last_change_time
-    };
+    let new_change_time = if has_change { now } else { last_change_time };
+
+    // 有变化 → 不卡死; 无变化 → 检查是否超过阈值
+    let is_stuck = !has_change
+        && last_change_time.elapsed() > tokio::time::Duration::from_secs(stuck_threshold);
 
     (is_stuck, new_change_time)
 }
@@ -3142,8 +3141,8 @@ mod tests {
         assert!(is_meaningful_content("深度思考\nHello world!".trim()));
         assert!(is_meaningful_content("复制\n这是一个实际的回复".trim()));
 
-        // 测试短内容
-        assert!(is_meaningful_content("A"));
+        // 测试短内容 (单字符不算有意义, 需 >1 字符)
+        assert!(!is_meaningful_content("A"));
         assert!(is_meaningful_content("OK"));
         assert!(!is_meaningful_content("跳过")); // UI文本
 
