@@ -876,17 +876,23 @@ impl ChatTab {
 
             let check_js = format!(
                 r#"
-                (() => {{
-                    // 检查所有可能的发送按钮选择器
-                    let btn = document.querySelector('#send-message-button') ||
-                              document.querySelector('.sendMessageButton') ||
-                              document.querySelector('button[type="submit"]');
-                    if (btn) return true;
-                    // 也检查探测到的选择器
-                    let btns = document.querySelectorAll('{}');
-                    return btns.length > 0;
-                }})()
-                "#,
+    (() => {{
+    // 检查所有可能的发送按钮选择器
+    let btn = document.querySelector('#send-message-button') ||
+              document.querySelector('.sendMessageButton') ||
+              document.querySelector('button[type="submit"]');
+    if (btn) return true;
+    // DeepSeek 新版: div.ds-button--primary (非 disabled)
+    let dsBtn = document.querySelector('div.ds-button--primary:not(.ds-button--disabled)');
+    if (dsBtn) {{
+        let r = dsBtn.getBoundingClientRect();
+        if (r.width >= 10 && r.height >= 10) return true;
+    }}
+    // 也检查探测到的选择器
+    let btns = document.querySelectorAll('{}');
+    return btns.length > 0;
+    }})()
+    "#,
                 selector.replace('\'', "\\'")
             );
 
@@ -938,6 +944,20 @@ impl ChatTab {
                             btn = b;
                             break;
                         }}
+                    }}
+                }}
+                // 优先级 3.5: DeepSeek 新版发送按钮 (div.ds-button--primary)
+                // DeepSeek 更新 UI 后, 发送按钮是 div 而非 button[type="submit"],
+                // 使用 ds-button--primary 类名标识, disabled 时添加 ds-button--disabled
+                if (!btn) {{
+                    let dsBtns = document.querySelectorAll('div.ds-button--primary');
+                    for (let b of dsBtns) {{
+                        let cls = (b.className || '').toLowerCase();
+                        if (cls.includes('ds-button--disabled') || cls.includes('disabled')) continue;
+                        let r = b.getBoundingClientRect();
+                        if (r.width < 10 || r.height < 10) continue;
+                        btn = b;
+                        break;
                     }}
                 }}
                 // 优先级 4: 探测到的选择器
@@ -1149,7 +1169,8 @@ impl ChatTab {
     /// - z.ai: `.chat-assistant`
     /// - Kimi: `.chat-content-item` / `[class*="agent"]`
     /// - 通义千问: `[class*="message-content"]` / `[class*="bubble"]`
-    /// - DeepSeek: `[class*="markdown"]` 容器
+    /// - DeepSeek 新版: `.ds-assistant-message-main-content` (精确匹配)
+    /// - DeepSeek 旧版: `[class*="markdown"]` 容器 (回退)
     pub async fn get_assistant_count(&self) -> Result<usize> {
         let count = self.session.evaluate(
             r#"
@@ -1173,6 +1194,10 @@ impl ChatTab {
                     if (rect.height > 20) claudeCount++;
                 }
                 if (claudeCount > 0) return claudeCount;
+                // DeepSeek 新版: .ds-assistant-message-main-content (精确匹配 AI 回复)
+                // DeepSeek 更新 UI 后, AI 回复在 div.ds-markdown.ds-assistant-message-main-content 中
+                let dsAssistantEls = document.querySelectorAll('.ds-assistant-message-main-content');
+                if (dsAssistantEls.length > 0) return dsAssistantEls.length;
                 // DeepSeek / 通用: 找包含 markdown 内容的 div (排除用户消息)
                 // DeepSeek 的 AI 回复通常在带有 markdown class 的 div 中
                 let markdownEls = document.querySelectorAll('[class*="markdown"]');
@@ -1834,6 +1859,26 @@ impl ChatTab {
                         'style, script, ' +
                         '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], ' +
                         'button, [class*="feedback"]'
+                    ).forEach(e => e.remove());
+                    let text = extractTextPreservingNewlines(clone).trim();
+                    if (text) return text;
+                }
+
+                // ================================================================
+                //  策略 1e: DeepSeek 新版 — .ds-assistant-message-main-content
+                // ================================================================
+                // DeepSeek 更新 UI 后, AI 回复在 div.ds-markdown.ds-assistant-message-main-content 中,
+                // 思考过程在 div.ds-markdown (不含 ds-assistant-message-main-content) 中。
+                // 优先使用此精确选择器, 避免误提取思考过程。
+                let dsAssistantEls = document.querySelectorAll('.ds-assistant-message-main-content');
+                if (dsAssistantEls.length > 0) {
+                    const last = dsAssistantEls[dsAssistantEls.length - 1];
+                    let clone = last.cloneNode(true);
+                    // 移除 style/script + 思考过程 + 操作按钮
+                    clone.querySelectorAll(
+                        'style, script, ' +
+                        '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
+                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
                     ).forEach(e => e.remove());
                     let text = extractTextPreservingNewlines(clone).trim();
                     if (text) return text;
@@ -2759,6 +2804,130 @@ mod tests {
         assert!(js.contains("tagName"));
         assert!(js.contains("MouseEvent"));
         assert!(js.contains("dispatchEvent"));
+    }
+
+    // ===== 多网站适配 — 思考过程检测 JS 逻辑验证 =====
+
+    // ===== Session 70: DeepSeek 新版 UI 适配测试 =====
+
+    #[test]
+    fn test_try_click_send_includes_deepseek_ds_button() {
+        // try_click_send 应包含 DeepSeek 新版 div.ds-button--primary 选择器
+        let js = r#"
+            let dsBtns = document.querySelectorAll('div.ds-button--primary');
+            for (let b of dsBtns) {
+                let cls = (b.className || '').toLowerCase();
+                if (cls.includes('ds-button--disabled') || cls.includes('disabled')) continue;
+                let r = b.getBoundingClientRect();
+                if (r.width < 10 || r.height < 10) continue;
+                btn = b;
+                break;
+            }
+        "#;
+        assert!(
+            js.contains("ds-button--primary"),
+            "JS 应包含 div.ds-button--primary 选择器 (DeepSeek 新版)"
+        );
+        assert!(
+            js.contains("ds-button--disabled"),
+            "JS 应排除 ds-button--disabled (DeepSeek 禁用状态)"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_send_button_includes_deepseek_ds_button() {
+        // wait_for_send_button 应检查 div.ds-button--primary:not(.ds-button--disabled)
+        let js = r#"
+            let dsBtn = document.querySelector('div.ds-button--primary:not(.ds-button--disabled)');
+            if (dsBtn) {
+                let r = dsBtn.getBoundingClientRect();
+                if (r.width >= 10 && r.height >= 10) return true;
+            }
+        "#;
+        assert!(
+            js.contains("ds-button--primary"),
+            "wait_for_send_button 应包含 DeepSeek ds-button--primary 检查"
+        );
+        assert!(
+            js.contains("not(.ds-button--disabled)"),
+            "wait_for_send_button 应排除 disabled 状态"
+        );
+    }
+
+    #[test]
+    fn test_get_assistant_count_includes_deepseek_new_selector() {
+        // get_assistant_count 应包含 .ds-assistant-message-main-content (DeepSeek 新版)
+        let js = r#"
+            let dsAssistantEls = document.querySelectorAll('.ds-assistant-message-main-content');
+            if (dsAssistantEls.length > 0) return dsAssistantEls.length;
+        "#;
+        assert!(
+            js.contains("ds-assistant-message-main-content"),
+            "get_assistant_count 应包含 .ds-assistant-message-main-content (DeepSeek 新版)"
+        );
+    }
+
+    #[test]
+    fn test_extract_last_response_includes_deepseek_new_strategy() {
+        // extract_last_response 应包含 .ds-assistant-message-main-content 策略
+        let js = r#"
+            let dsAssistantEls = document.querySelectorAll('.ds-assistant-message-main-content');
+            if (dsAssistantEls.length > 0) {
+                const last = dsAssistantEls[dsAssistantEls.length - 1];
+                let clone = last.cloneNode(true);
+                clone.querySelectorAll(
+                    'style, script, ' +
+                    '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
+                    '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
+                ).forEach(e => e.remove());
+                let text = extractTextPreservingNewlines(clone).trim();
+                if (text) return text;
+            }
+        "#;
+        assert!(
+            js.contains("ds-assistant-message-main-content"),
+            "extract_last_response 应包含 .ds-assistant-message-main-content 策略 (DeepSeek 新版)"
+        );
+        assert!(js.contains("cloneNode"), "策略应使用 cloneNode 克隆元素");
+        assert!(js.contains("[class*=\"think\"]"), "策略应过滤思考过程");
+    }
+
+    #[test]
+    fn test_try_click_send_deepseek_disabled_check() {
+        // try_click_send 应检查 ds-button--disabled 类名
+        let js = r#"
+            let cls = (btn.className || '').toLowerCase();
+            if (cls.includes('ds-button--disabled') || cls.includes('disabled')) return false;
+        "#;
+        assert!(
+            js.contains("ds-button--disabled"),
+            "try_click_send 应检查 ds-button--disabled (DeepSeek 禁用状态)"
+        );
+    }
+
+    #[test]
+    fn test_try_click_send_deepseek_div_click() {
+        // try_click_send 对 DeepSeek 的 div 按钮应模拟鼠标事件
+        let js = r#"
+            if (btn.tagName.toLowerCase() !== 'button') {
+                let rect = btn.getBoundingClientRect();
+                let x = rect.left + rect.width / 2;
+                let y = rect.top + rect.height / 2;
+                for (let type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    let evt = new MouseEvent(type, {
+                        bubbles: true, cancelable: true, view: window,
+                        clientX: x, clientY: y,
+                    });
+                    btn.dispatchEvent(evt);
+                }
+                return true;
+            }
+        "#;
+        assert!(js.contains("tagName"));
+        assert!(js.contains("MouseEvent"));
+        assert!(js.contains("dispatchEvent"));
+        assert!(js.contains("pointerdown"));
+        assert!(js.contains("clientX"));
     }
 
     // ===== 多网站适配 — 思考过程检测 JS 逻辑验证 =====
