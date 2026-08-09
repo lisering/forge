@@ -80,7 +80,13 @@ pub mod testrunner;
 pub mod traits;
 pub mod workspace;
 
-pub use auto_recovery::{AutoRecovery, BackoffStrategy, RecoveryConfig, RecoveryResult};
+pub use auto_recovery::{
+    assess_recovery_urgency, compute_backoff_schedule, compute_recovery_success_rate,
+    decide_recovery_action, estimate_max_recovery_secs, format_recovery_rate, make_failed_result,
+    make_success_result, recovery_efficiency, result_error, select_recovery_strategy,
+    should_continue_retrying, AutoRecovery, AutoRecoverySummary, BackoffStrategy, RecoveryAction,
+    RecoveryConfig, RecoveryResult, RecoveryStrategy, RecoveryUrgency,
+};
 pub use browser::{BrowserManager, ChatTab, SiteType};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
 pub use clarify::HeuristicClarificationChecker;
