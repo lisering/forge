@@ -27,7 +27,234 @@
 //! - **Slash Commands (本模块)**: AI 主动发出指令, Forge 解析执行
 //! - 两者互补: 追问是 Forge → AI, Slash Commands 是 AI → Forge
 
+use std::collections::HashSet;
 use std::fmt;
+
+// ============================================================================
+//  纯逻辑函数 — 可独立测试, 不依赖 SlashCommand 状态
+// ============================================================================
+
+/// 判断一行文本是否为代码块边界 (以 ``` 开头)
+///
+/// 用于 `parse_from_response` 和 `strip_commands` 中跟踪代码块状态。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::is_code_block_boundary;
+/// assert!(is_code_block_boundary("```rust"));
+/// assert!(is_code_block_boundary("  ```"));
+/// assert!(!is_code_block_boundary("code"));
+/// ```
+pub fn is_code_block_boundary(line: &str) -> bool {
+    line.trim().starts_with("```")
+}
+
+/// 判断关键字是否为已知指令 (大小写不敏感)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::is_known_keyword;
+/// assert!(is_known_keyword("compact"));
+/// assert!(is_known_keyword("SKIP"));
+/// assert!(!is_known_keyword("foobar"));
+/// ```
+pub fn is_known_keyword(keyword: &str) -> bool {
+    let lower = keyword.to_lowercase();
+    KNOWN_KEYWORDS.contains(&lower.as_str())
+}
+
+/// 判断字符是否为指令边界字符 (非字母字符)
+///
+/// 与 `is_keyword_char` 互补: 字母是关键字字符, 非字母是边界。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::is_boundary_char;
+/// assert!(is_boundary_char(' '));
+/// assert!(is_boundary_char('.'));
+/// assert!(is_boundary_char('\n'));
+/// assert!(!is_boundary_char('a'));
+/// ```
+pub fn is_boundary_char(c: char) -> bool {
+    !is_keyword_char(c)
+}
+
+/// 判断 `/` 在字符数组中是否处于前边界 (行首或前面是空白)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::is_prefix_boundary;
+/// let chars: Vec<char> = " /skip".chars().collect();
+/// assert!(is_prefix_boundary(&chars, 1)); // 前面是空格
+/// let chars2: Vec<char> = "/skip".chars().collect();
+/// assert!(is_prefix_boundary(&chars2, 0)); // 行首
+/// let chars3: Vec<char> = "a/skip".chars().collect();
+/// assert!(!is_prefix_boundary(&chars3, 1)); // 前面是字母
+/// ```
+pub fn is_prefix_boundary(chars: &[char], idx: usize) -> bool {
+    idx == 0 || chars[idx - 1].is_whitespace() || chars[idx - 1] == '\n'
+}
+
+/// 从文本中提取 `/` 后的关键字
+///
+/// 在 `slash_idx` 位置必须是 `/`, 提取其后的连续字母序列。
+/// 如果 `slash_idx` 不是 `/` 或后面无字母, 返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::extract_keyword_at;
+/// assert_eq!(extract_keyword_at("/skip", 0), Some("skip".to_string()));
+/// assert_eq!(extract_keyword_at("text /compact more", 5), Some("compact".to_string()));
+/// assert_eq!(extract_keyword_at("/", 0), None);
+/// ```
+pub fn extract_keyword_at(line: &str, slash_idx: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if slash_idx >= chars.len() || chars[slash_idx] != '/' {
+        return None;
+    }
+    let mut end = slash_idx + 1;
+    while end < chars.len() && is_keyword_char(chars[end]) {
+        end += 1;
+    }
+    if end > slash_idx + 1 {
+        Some(chars[slash_idx + 1..end].iter().collect())
+    } else {
+        None
+    }
+}
+
+/// 去重指令列表 (按关键字大小写不敏感)
+///
+/// 保留首次出现的指令, 后续重复的 (含大小写变体) 被移除。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::{deduplicate_commands, SlashCommand};
+/// let cmds = vec![SlashCommand::Skip, SlashCommand::Skip, SlashCommand::Compact];
+/// let deduped = deduplicate_commands(cmds);
+/// assert_eq!(deduped.len(), 2);
+/// ```
+pub fn deduplicate_commands(commands: Vec<SlashCommand>) -> Vec<SlashCommand> {
+    let mut result = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cmd in commands {
+        let key = cmd.keyword().to_lowercase();
+        if seen.insert(key) {
+            result.push(cmd);
+        }
+    }
+    result
+}
+
+/// 计算指令执行率 (0.0 ~ 1.0)
+///
+/// `total_detected == 0` 时返回 0.0。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::compute_execution_rate;
+/// assert_eq!(compute_execution_rate(0, 0), 0.0);
+/// assert_eq!(compute_execution_rate(10, 8), 0.8);
+/// assert!((compute_execution_rate(3, 1) - 0.3333).abs() < 0.01);
+/// ```
+pub fn compute_execution_rate(total_detected: usize, executed: usize) -> f64 {
+    if total_detected == 0 {
+        0.0
+    } else {
+        executed as f64 / total_detected as f64
+    }
+}
+
+/// 格式化 Slash Command 统计报告文本
+///
+/// `total_detected == 0` 时返回空字符串。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::format_summary_report;
+/// let report = format_summary_report(5, 4, 2, 1, 1, 0, 0);
+/// assert!(report.contains("Slash Commands"));
+/// assert!(report.contains("检测到: 5"));
+/// assert!(report.contains("/skip: 2"));
+/// ```
+pub fn format_summary_report(
+    total_detected: usize,
+    executed: usize,
+    tasks_skipped: usize,
+    compacts: usize,
+    refocuses: usize,
+    retries: usize,
+    escalations: usize,
+) -> String {
+    if total_detected == 0 {
+        return String::new();
+    }
+    let mut report = String::new();
+    report.push_str("  ── Slash Commands 统计 ──\n");
+    report.push_str(&format!(
+        "  检测到: {}  执行: {}  ({:.0}%)\n",
+        total_detected,
+        executed,
+        compute_execution_rate(total_detected, executed) * 100.0
+    ));
+    report.push_str(&format!(
+        "  /skip: {}  /compact: {}  /refocus: {}  /retry: {}  /escalate: {}\n",
+        tasks_skipped, compacts, refocuses, retries, escalations
+    ));
+    report
+}
+
+/// 将指令映射为执行动作
+///
+/// `Skip` → `SkipTask`, 其他指令 → `Continue`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::{classify_command_action, SlashCommand, SlashCommandAction};
+/// assert_eq!(classify_command_action(&SlashCommand::Skip), SlashCommandAction::SkipTask);
+/// assert_eq!(classify_command_action(&SlashCommand::Compact), SlashCommandAction::Continue);
+/// ```
+pub fn classify_command_action(command: &SlashCommand) -> SlashCommandAction {
+    match command {
+        SlashCommand::Skip => SlashCommandAction::SkipTask,
+        _ => SlashCommandAction::Continue,
+    }
+}
+
+/// 从文本中移除单个指令标记
+///
+/// 大小写不敏感地查找并移除 `full_command` (如 `/skip`),
+/// 确保移除位置是完整匹配 (后面是边界字符)。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::slash_command::strip_command_from_text;
+/// assert_eq!(strip_command_from_text("/skip", "/skip"), "");
+/// let result = strip_command_from_text("text /skip more", "/skip");
+/// assert!(!result.contains("/skip"));
+/// assert!(result.contains("text"));
+/// ```
+pub fn strip_command_from_text(text: &str, full_command: &str) -> String {
+    let full_lower = full_command.to_lowercase();
+    if let Some(pos) = text.to_lowercase().find(&full_lower) {
+        let end_pos = pos + full_command.len();
+        if end_pos >= text.len() || !is_keyword_char(text[end_pos..].chars().next().unwrap_or(' '))
+        {
+            return format!("{}{}", &text[..pos], &text[end_pos..]);
+        }
+    }
+    text.to_string()
+}
 
 // ============================================================================
 //  SlashCommand — 指令类型
@@ -184,35 +411,21 @@ const KNOWN_KEYWORDS: &[&str] = &["compact", "skip", "refocus", "retry", "escala
 /// assert!(cmds.contains(&SlashCommand::Compact));
 /// ```
 pub fn parse_from_response(text: &str) -> Vec<SlashCommand> {
-    let mut commands = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // 跟踪是否在代码块内
+    let mut all_commands = Vec::new();
     let mut in_code_block = false;
 
     for line in text.lines() {
-        // 检测代码块边界
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
+        if is_code_block_boundary(line) {
             in_code_block = !in_code_block;
             continue;
         }
-
-        // 代码块内不检测
         if in_code_block {
             continue;
         }
-
-        // 在行中查找 /command 模式
-        for cmd in find_commands_in_line(line) {
-            let key = cmd.keyword().to_lowercase();
-            if seen.insert(key) {
-                commands.push(cmd);
-            }
-        }
+        all_commands.extend(find_commands_in_line(line));
     }
 
-    commands
+    deduplicate_commands(all_commands)
 }
 
 /// 在单行文本中查找所有 slash commands
@@ -225,29 +438,12 @@ fn find_commands_in_line(line: &str) -> Vec<SlashCommand> {
     let mut i = 0;
 
     while i < chars.len() {
-        // 查找 '/' 字符
-        if chars[i] == '/' {
-            // 检查前面是否为空白或行首 (避免匹配文件路径中间的 /)
-            let prev_is_boundary = i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == '\n';
-
-            if prev_is_boundary {
-                // 提取 '/' 后面的关键字
-                let mut end = i + 1;
-                while end < chars.len() && is_keyword_char(chars[end]) {
-                    end += 1;
-                }
-
-                if end > i + 1 {
-                    let keyword: String = chars[i + 1..end].iter().collect();
-                    let lower = keyword.to_lowercase();
-
-                    // 检查后面是否为边界 (空白/标点/行尾)
-                    let next_is_boundary = end >= chars.len() || !is_keyword_char(chars[end]);
-
-                    // 只匹配已知指令, 避免文件路径误报
-                    if next_is_boundary && KNOWN_KEYWORDS.contains(&lower.as_str()) {
-                        commands.push(SlashCommand::from_keyword(&keyword));
-                    }
+        if chars[i] == '/' && is_prefix_boundary(&chars, i) {
+            if let Some(keyword) = extract_keyword_at(line, i) {
+                let end = i + 1 + keyword.chars().count();
+                let next_is_boundary = end >= chars.len() || is_boundary_char(chars[end]);
+                if next_is_boundary && is_known_keyword(&keyword) {
+                    commands.push(SlashCommand::from_keyword(&keyword));
                 }
             }
         }
@@ -283,19 +479,15 @@ pub fn strip_commands(text: &str) -> String {
     let mut in_code_block = false;
 
     for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
+        if is_code_block_boundary(line) {
             in_code_block = !in_code_block;
             result.push(line.to_string());
             continue;
         }
-
         if in_code_block {
             result.push(line.to_string());
             continue;
         }
-
-        // 移除行中的指令标记
         let cleaned = strip_commands_from_line(line);
         result.push(cleaned);
     }
@@ -312,22 +504,9 @@ fn strip_commands_from_line(line: &str) -> String {
 
     let mut result = line.to_string();
     for cmd in &commands {
-        // 移除指令标记 (大小写不敏感)
-        let full = cmd.full_command();
-        let full_lower = full.to_lowercase();
-        // 查找并移除
-        if let Some(pos) = result.to_lowercase().find(&full_lower) {
-            // 确保是完整匹配 (边界检查)
-            let end_pos = pos + full.len();
-            if end_pos >= result.len()
-                || !is_keyword_char(result.chars().nth(end_pos).unwrap_or(' '))
-            {
-                result = format!("{}{}", &result[..pos], &result[end_pos..]);
-            }
-        }
+        result = strip_command_from_text(&result, &cmd.full_command());
     }
 
-    // 清理多余的空格
     result.trim_end().to_string()
 }
 
@@ -362,31 +541,20 @@ impl SlashCommandSummary {
 
     /// 记算已知指令执行率 (0.0 ~ 1.0)
     pub fn execution_rate(&self) -> f64 {
-        if self.total_detected == 0 {
-            return 0.0;
-        }
-        self.executed as f64 / self.total_detected as f64
+        compute_execution_rate(self.total_detected, self.executed)
     }
 
     /// 生成可读的报告文本
     pub fn to_report(&self) -> String {
-        if self.total_detected == 0 {
-            return String::new();
-        }
-
-        let mut report = String::new();
-        report.push_str("  ── Slash Commands 统计 ──\n");
-        report.push_str(&format!(
-            "  检测到: {}  执行: {}  ({:.0}%)\n",
+        format_summary_report(
             self.total_detected,
             self.executed,
-            self.execution_rate() * 100.0
-        ));
-        report.push_str(&format!(
-            "  /skip: {}  /compact: {}  /refocus: {}  /retry: {}  /escalate: {}\n",
-            self.tasks_skipped, self.compacts, self.refocuses, self.retries, self.escalations
-        ));
-        report
+            self.tasks_skipped,
+            self.compacts,
+            self.refocuses,
+            self.retries,
+            self.escalations,
+        )
     }
 }
 
@@ -787,6 +955,401 @@ mod tests {
         assert!(!is_keyword_char('/'));
         assert!(!is_keyword_char(' '));
         assert!(!is_keyword_char('-'));
+    }
+
+    // ===== 纯逻辑函数测试 =====
+
+    // --- is_code_block_boundary ---
+
+    #[test]
+    fn test_is_code_block_boundary_rust() {
+        assert!(is_code_block_boundary("```rust"));
+    }
+
+    #[test]
+    fn test_is_code_block_boundary_plain() {
+        assert!(is_code_block_boundary("```"));
+    }
+
+    #[test]
+    fn test_is_code_block_boundary_with_whitespace() {
+        assert!(is_code_block_boundary("  ```"));
+        assert!(is_code_block_boundary("\t```"));
+    }
+
+    #[test]
+    fn test_is_code_block_boundary_not_code() {
+        assert!(!is_code_block_boundary("code"));
+        assert!(!is_code_block_boundary("``"));
+        assert!(!is_code_block_boundary(""));
+    }
+
+    #[test]
+    fn test_is_code_block_boundary_with_content() {
+        assert!(is_code_block_boundary("```python"));
+        assert!(is_code_block_boundary("```file:src/main.rs"));
+    }
+
+    // --- is_known_keyword ---
+
+    #[test]
+    fn test_is_known_keyword_all_known() {
+        assert!(is_known_keyword("compact"));
+        assert!(is_known_keyword("skip"));
+        assert!(is_known_keyword("refocus"));
+        assert!(is_known_keyword("retry"));
+        assert!(is_known_keyword("escalate"));
+    }
+
+    #[test]
+    fn test_is_known_keyword_case_insensitive() {
+        assert!(is_known_keyword("COMPACT"));
+        assert!(is_known_keyword("Skip"));
+        assert!(is_known_keyword("REFOCUS"));
+    }
+
+    #[test]
+    fn test_is_known_keyword_unknown() {
+        assert!(!is_known_keyword("foobar"));
+        assert!(!is_known_keyword(""));
+        assert!(!is_known_keyword("skipp"));
+    }
+
+    // --- is_boundary_char ---
+
+    #[test]
+    fn test_is_boundary_char_whitespace() {
+        assert!(is_boundary_char(' '));
+        assert!(is_boundary_char('\t'));
+        assert!(is_boundary_char('\n'));
+    }
+
+    #[test]
+    fn test_is_boundary_char_punctuation() {
+        assert!(is_boundary_char('.'));
+        assert!(is_boundary_char(','));
+        assert!(is_boundary_char('!'));
+        assert!(is_boundary_char(':'));
+    }
+
+    #[test]
+    fn test_is_boundary_char_not_boundary() {
+        assert!(!is_boundary_char('a'));
+        assert!(!is_boundary_char('Z'));
+        assert!(!is_boundary_char('x'));
+    }
+
+    #[test]
+    fn test_is_boundary_char_digits_are_boundary() {
+        assert!(is_boundary_char('1'));
+        assert!(is_boundary_char('0'));
+    }
+
+    // --- is_prefix_boundary ---
+
+    #[test]
+    fn test_is_prefix_boundary_line_start() {
+        let chars: Vec<char> = "/skip".chars().collect();
+        assert!(is_prefix_boundary(&chars, 0));
+    }
+
+    #[test]
+    fn test_is_prefix_boundary_after_whitespace() {
+        let chars: Vec<char> = "  /skip".chars().collect();
+        assert!(is_prefix_boundary(&chars, 2));
+    }
+
+    #[test]
+    fn test_is_prefix_boundary_after_newline() {
+        let chars: Vec<char> = "\n/skip".chars().collect();
+        assert!(is_prefix_boundary(&chars, 1));
+    }
+
+    #[test]
+    fn test_is_prefix_boundary_not_after_letter() {
+        let chars: Vec<char> = "a/skip".chars().collect();
+        assert!(!is_prefix_boundary(&chars, 1));
+    }
+
+    #[test]
+    fn test_is_prefix_boundary_not_after_digit() {
+        let chars: Vec<char> = "1/skip".chars().collect();
+        assert!(!is_prefix_boundary(&chars, 1));
+    }
+
+    // --- extract_keyword_at ---
+
+    #[test]
+    fn test_extract_keyword_at_simple() {
+        assert_eq!(extract_keyword_at("/skip", 0), Some("skip".to_string()));
+    }
+
+    #[test]
+    fn test_extract_keyword_at_in_text() {
+        assert_eq!(
+            extract_keyword_at("text /compact more", 5),
+            Some("compact".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_keyword_at_slash_only() {
+        assert_eq!(extract_keyword_at("/", 0), None);
+    }
+
+    #[test]
+    fn test_extract_keyword_at_no_slash() {
+        assert_eq!(extract_keyword_at("text", 0), None);
+    }
+
+    #[test]
+    fn test_extract_keyword_at_out_of_bounds() {
+        assert_eq!(extract_keyword_at("text", 10), None);
+    }
+
+    #[test]
+    fn test_extract_keyword_at_case_preserved() {
+        assert_eq!(extract_keyword_at("/SKIP", 0), Some("SKIP".to_string()));
+    }
+
+    #[test]
+    fn test_extract_keyword_at_mixed_case() {
+        assert_eq!(
+            extract_keyword_at("/compAcT", 0),
+            Some("compAcT".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_keyword_at_stops_at_non_alpha() {
+        assert_eq!(extract_keyword_at("/skip.", 0), Some("skip".to_string()));
+        assert_eq!(
+            extract_keyword_at("/skip text", 0),
+            Some("skip".to_string())
+        );
+    }
+
+    // --- deduplicate_commands ---
+
+    #[test]
+    fn test_deduplicate_commands_empty() {
+        assert!(deduplicate_commands(vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_commands_no_dups() {
+        let cmds = vec![SlashCommand::Skip, SlashCommand::Compact];
+        assert_eq!(deduplicate_commands(cmds).len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_commands_exact_dups() {
+        let cmds = vec![SlashCommand::Skip, SlashCommand::Skip, SlashCommand::Skip];
+        assert_eq!(deduplicate_commands(cmds).len(), 1);
+    }
+
+    #[test]
+    fn test_deduplicate_commands_case_insensitive_dups() {
+        // Skip, Skip (same keyword), Compact
+        let cmds = vec![
+            SlashCommand::Skip,
+            SlashCommand::Skip,
+            SlashCommand::Compact,
+        ];
+        let deduped = deduplicate_commands(cmds);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplicate_commands_preserves_order() {
+        let cmds = vec![SlashCommand::Compact, SlashCommand::Skip];
+        let deduped = deduplicate_commands(cmds);
+        assert_eq!(deduped[0], SlashCommand::Compact);
+        assert_eq!(deduped[1], SlashCommand::Skip);
+    }
+
+    #[test]
+    fn test_deduplicate_commands_all_five() {
+        let cmds = vec![
+            SlashCommand::Compact,
+            SlashCommand::Skip,
+            SlashCommand::Refocus,
+            SlashCommand::Retry,
+            SlashCommand::Escalate,
+        ];
+        assert_eq!(deduplicate_commands(cmds).len(), 5);
+    }
+
+    // --- compute_execution_rate ---
+
+    #[test]
+    fn test_compute_execution_rate_zero_total() {
+        assert_eq!(compute_execution_rate(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_compute_execution_rate_half() {
+        assert_eq!(compute_execution_rate(10, 5), 0.5);
+    }
+
+    #[test]
+    fn test_compute_execution_rate_full() {
+        assert_eq!(compute_execution_rate(10, 10), 1.0);
+    }
+
+    #[test]
+    fn test_compute_execution_rate_none_executed() {
+        assert_eq!(compute_execution_rate(5, 0), 0.0);
+    }
+
+    #[test]
+    fn test_compute_execution_rate_fractional() {
+        let rate = compute_execution_rate(3, 1);
+        assert!((rate - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    // --- format_summary_report ---
+
+    #[test]
+    fn test_format_summary_report_empty() {
+        assert_eq!(format_summary_report(0, 0, 0, 0, 0, 0, 0), "");
+    }
+
+    #[test]
+    fn test_format_summary_report_basic() {
+        let report = format_summary_report(5, 4, 2, 1, 1, 0, 0);
+        assert!(report.contains("Slash Commands"));
+        assert!(report.contains("检测到: 5"));
+        assert!(report.contains("执行: 4"));
+        assert!(report.contains("80%")); // 4/5 = 80%
+    }
+
+    #[test]
+    fn test_format_summary_report_all_fields() {
+        let report = format_summary_report(10, 8, 3, 2, 1, 1, 1);
+        assert!(report.contains("/skip: 3"));
+        assert!(report.contains("/compact: 2"));
+        assert!(report.contains("/refocus: 1"));
+        assert!(report.contains("/retry: 1"));
+        assert!(report.contains("/escalate: 1"));
+    }
+
+    #[test]
+    fn test_format_summary_report_zero_executed() {
+        let report = format_summary_report(5, 0, 0, 0, 0, 0, 0);
+        assert!(report.contains("0%"));
+    }
+
+    #[test]
+    fn test_format_summary_report_full_execution() {
+        let report = format_summary_report(5, 5, 5, 0, 0, 0, 0);
+        assert!(report.contains("100%"));
+    }
+
+    // --- classify_command_action ---
+
+    #[test]
+    fn test_classify_command_action_skip() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Skip),
+            SlashCommandAction::SkipTask
+        );
+    }
+
+    #[test]
+    fn test_classify_command_action_compact() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Compact),
+            SlashCommandAction::Continue
+        );
+    }
+
+    #[test]
+    fn test_classify_command_action_refocus() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Refocus),
+            SlashCommandAction::Continue
+        );
+    }
+
+    #[test]
+    fn test_classify_command_action_retry() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Retry),
+            SlashCommandAction::Continue
+        );
+    }
+
+    #[test]
+    fn test_classify_command_action_escalate() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Escalate),
+            SlashCommandAction::Continue
+        );
+    }
+
+    #[test]
+    fn test_classify_command_action_unknown() {
+        assert_eq!(
+            classify_command_action(&SlashCommand::Unknown("foo".to_string())),
+            SlashCommandAction::Continue
+        );
+    }
+
+    // --- strip_command_from_text ---
+
+    #[test]
+    fn test_strip_command_from_text_simple() {
+        assert_eq!(strip_command_from_text("/skip", "/skip"), "");
+    }
+
+    #[test]
+    fn test_strip_command_from_text_with_surrounding_text() {
+        let result = strip_command_from_text("text /skip more", "/skip");
+        assert!(!result.contains("/skip"));
+        assert!(result.contains("text"));
+        assert!(result.contains("more"));
+    }
+
+    #[test]
+    fn test_strip_command_from_text_case_insensitive() {
+        let result = strip_command_from_text("/SKIP text", "/skip");
+        assert!(!result.contains("/SKIP"));
+        assert!(!result.contains("/skip"));
+    }
+
+    #[test]
+    fn test_strip_command_from_text_not_found() {
+        let result = strip_command_from_text("no command here", "/skip");
+        assert_eq!(result, "no command here");
+    }
+
+    #[test]
+    fn test_strip_command_from_text_partial_no_match() {
+        // /skipx should not match /skip (boundary check)
+        let result = strip_command_from_text("/skipx", "/skip");
+        assert!(result.contains("/skipx")); // should not strip
+    }
+
+    #[test]
+    fn test_strip_command_from_text_at_end() {
+        let result = strip_command_from_text("text /skip", "/skip");
+        assert!(!result.contains("/skip"));
+        assert!(result.contains("text"));
+    }
+
+    #[test]
+    fn test_strip_command_from_text_at_start() {
+        let result = strip_command_from_text("/skip text", "/skip");
+        assert!(!result.contains("/skip"));
+        assert!(result.contains("text"));
+    }
+
+    #[test]
+    fn test_strip_command_from_text_multiple_occurrences() {
+        // Only first occurrence is stripped
+        let result = strip_command_from_text("/skip /skip", "/skip");
+        assert!(result.contains("/skip")); // second one still there
     }
 
     // ===== 集成场景测试 =====

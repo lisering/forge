@@ -125,7 +125,12 @@ pub use site_health::{
     check_all_tabs, check_and_log, HealthCheckResult, SiteFailover, SiteHealthChecker,
     SiteHealthStatus,
 };
-pub use slash_command::{SlashCommand, SlashCommandAction, SlashCommandSummary};
+pub use slash_command::{
+    classify_command_action, compute_execution_rate, deduplicate_commands, extract_keyword_at,
+    format_summary_report, is_boundary_char, is_code_block_boundary, is_known_keyword,
+    is_prefix_boundary, strip_command_from_text, SlashCommand, SlashCommandAction,
+    SlashCommandSummary,
+};
 pub use steer_reminder::SteerReminder;
 pub use task_graph::{TaskGraph, TaskGraphError};
 pub use testrunner::{CargoTestRunner, E2ETestCase, E2ETestResult, E2ETestSummary};
