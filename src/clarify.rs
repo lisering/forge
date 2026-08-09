@@ -570,4 +570,177 @@ mod tests {
         // 只产生一条追问消息
         assert!(!result.question.is_empty());
     }
+
+    // ===== 额外 edge case 测试 =====
+
+    #[tokio::test]
+    async fn test_detect_question_what_to_use() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "用什么框架比较好？";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_detect_question_how_to_handle() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "如何处理并发请求？请告诉我。";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_detect_question_cannot_determine() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "无法确定使用哪个版本。";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_detect_uncertainty_either_option() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "We could use either option A or option B for this task.";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_detect_uncertainty_multiple_approaches() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "There are multiple approaches to solve this. Let me think.";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_detect_uncertainty_or_you_can() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "或者你可以选择另一种方案。";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_custom_min_response_len() {
+        let checker = HeuristicClarificationChecker::new().with_min_response_len(5);
+        // 3 字符 < 5 阈值
+        let result = checker.check("abc", &ctx()).await;
+        assert!(result.needs_clarification);
+        assert!(result.reason.contains("过短"));
+    }
+
+    #[tokio::test]
+    async fn test_custom_min_response_len_high() {
+        let checker = HeuristicClarificationChecker::new().with_min_response_len(1000);
+        // 20 字符 < 1000 阈值
+        let result = checker.check("这是一段普通长度的回复。", &ctx()).await;
+        assert!(result.needs_clarification);
+        assert!(result.reason.contains("过短"));
+    }
+
+    #[tokio::test]
+    async fn test_timed_out_with_empty_response() {
+        let checker = HeuristicClarificationChecker::new();
+        let mut context = ctx();
+        context.timed_out = true;
+        let result = checker.check("", &context).await;
+        // 超时优先于过短检测
+        assert!(result.needs_clarification);
+        assert!(result.reason.contains("超时"));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_timed_out_question() {
+        let checker = HeuristicClarificationChecker::new();
+        let mut context = ctx();
+        context.timed_out = true;
+        // 先问一次
+        let result1 = checker.check("some response", &context).await;
+        assert!(result1.needs_clarification);
+
+        // 设置 previous_questions 包含之前的追问
+        let context2 = ClarificationContext {
+            task_prompt: "test".to_string(),
+            timed_out: true,
+            questions_asked: 1,
+            max_questions: 3,
+            previous_questions: vec![result1.question.clone()],
+        };
+        let result2 = checker.check("some response", &context2).await;
+        // 重复的追问不应再触发
+        assert!(!result2.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_question_mark_in_inline_code() {
+        let checker = HeuristicClarificationChecker::new();
+        // 行内代码中的 ? 不在 ``` 代码块内
+        // 但行内 `code?` 不被代码块检测过滤
+        let response = "Here is the code:\n```file:src/main.rs\nfn main() {}\n```\nDo you want `Option<T>?` handling?";
+        let result = checker.check(response, &ctx()).await;
+        // 代码块外有问号 → 应触发
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_english_it_depends() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "It depends on your use case. If you need performance, use approach A. If you need simplicity, use approach B.";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification);
+    }
+
+    #[tokio::test]
+    async fn test_follow_up_contains_self_decision_instruction() {
+        let checker = HeuristicClarificationChecker::new();
+        let response = "你希望用哪种框架？";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            result.question.contains("自行选择") || result.question.contains("最佳决策"),
+            "追问消息应要求 AI 自主决策"
+        );
+        assert!(
+            result.question.contains("不要再提问"),
+            "追问消息应明确要求不要再提问"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checker_with_default() {
+        let checker = HeuristicClarificationChecker::default();
+        // Default 和 new() 行为一致
+        let result = checker.check("ok", &ctx()).await;
+        assert!(result.needs_clarification, "过短回复应触发追问");
+    }
+
+    #[tokio::test]
+    async fn test_max_questions_boundary() {
+        let checker = HeuristicClarificationChecker::new();
+        // questions_asked == max_questions → 不能再问
+        let context = ClarificationContext {
+            task_prompt: "test".to_string(),
+            timed_out: false,
+            questions_asked: 5,
+            max_questions: 5,
+            previous_questions: vec![],
+        };
+        let result = checker.check("你希望用什么？", &context).await;
+        assert!(!result.needs_clarification, "达到上限不应再追问");
+    }
+
+    #[tokio::test]
+    async fn test_one_question_below_max() {
+        let checker = HeuristicClarificationChecker::new();
+        // questions_asked = max - 1 → 还能问一次
+        let context = ClarificationContext {
+            task_prompt: "test".to_string(),
+            timed_out: false,
+            questions_asked: 4,
+            max_questions: 5,
+            previous_questions: vec!["previous question text".to_string()],
+        };
+        let result = checker.check("你希望用什么框架？", &context).await;
+        assert!(result.needs_clarification, "未达上限应可追问");
+    }
 }

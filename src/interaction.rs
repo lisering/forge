@@ -522,4 +522,201 @@ mod tests {
         assert!(!mock.confirm_fix(&make_fix_context()).await.unwrap());
         assert!(!mock.confirm_requirement_change("变更").await.unwrap());
     }
+
+    // ===== MockInteraction::with_task_responses (序列) =====
+
+    #[tokio::test]
+    async fn test_mock_task_responses_sequence() {
+        let mock = MockInteraction::new().with_task_responses(vec![
+            TaskAction::Execute,
+            TaskAction::Skip,
+            TaskAction::Abort,
+        ]);
+
+        // 按顺序弹出
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Skip
+        );
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Abort
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_task_responses_queue_empties_to_default() {
+        let mock = MockInteraction::new()
+            .with_task_responses(vec![TaskAction::Skip])
+            .with_task_response(TaskAction::Execute);
+
+        // 第一项从队列弹出 Skip
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Skip
+        );
+        // 队列空了，回退到默认 Execute
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+        // 继续回退
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_task_responses_empty_queue_uses_default() {
+        let mock = MockInteraction::new()
+            .with_task_responses(vec![])
+            .with_task_response(TaskAction::Abort);
+
+        let result = mock.confirm_task(&make_task()).await.unwrap();
+        assert_eq!(result, TaskAction::Abort);
+    }
+
+    #[tokio::test]
+    async fn test_mock_default_uses_all_defaults() {
+        let mock = MockInteraction::default();
+        assert!(mock.confirm_planning(&make_plan()).await.unwrap());
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+        assert!(mock.confirm_fix(&make_fix_context()).await.unwrap());
+        assert!(mock.confirm_requirement_change("变更").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_mock_call_counts_multiple_calls() {
+        let mock = MockInteraction::new();
+        // 调用 confirm_task 3 次
+        for _ in 0..3 {
+            let _ = mock.confirm_task(&make_task()).await;
+        }
+        assert_eq!(
+            mock.call_counts
+                .confirm_task
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        // 其他方法未调用
+        assert_eq!(
+            mock.call_counts
+                .confirm_planning
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            mock.call_counts
+                .confirm_fix
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_task_responses_mixed_sequence_and_default() {
+        let mock = MockInteraction::new()
+            .with_task_responses(vec![TaskAction::Skip, TaskAction::Execute])
+            .with_task_response(TaskAction::Abort);
+
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Skip
+        );
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+        // 队列空，回退到默认 Abort
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Abort
+        );
+        assert_eq!(
+            mock.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Abort
+        );
+        assert_eq!(
+            mock.call_counts
+                .confirm_task
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auto_approve_default_trait_object() {
+        // 测试通过 trait object 使用 AutoApprove
+        let auto: Box<dyn HumanInteraction> = Box::new(AutoApprove);
+        assert!(auto.confirm_planning(&make_plan()).await.unwrap());
+        assert_eq!(
+            auto.confirm_task(&make_task()).await.unwrap(),
+            TaskAction::Execute
+        );
+        assert!(auto.confirm_fix(&make_fix_context()).await.unwrap());
+        assert!(auto.confirm_requirement_change("变更").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_mock_as_trait_object() {
+        let mock: Box<dyn HumanInteraction> =
+            Box::new(MockInteraction::new().with_plan_response(false));
+        assert!(!mock.confirm_planning(&make_plan()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_mock_fix_multiple_calls() {
+        let mock = MockInteraction::new().with_fix_response(false);
+        // 多次调用返回相同值
+        assert!(!mock.confirm_fix(&make_fix_context()).await.unwrap());
+        assert!(!mock.confirm_fix(&make_fix_context()).await.unwrap());
+        assert!(!mock.confirm_fix(&make_fix_context()).await.unwrap());
+        assert_eq!(
+            mock.call_counts
+                .confirm_fix
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_change_multiple_calls() {
+        let mock = MockInteraction::new().with_change_response(true);
+        for _ in 0..5 {
+            assert!(mock.confirm_requirement_change("变更").await.unwrap());
+        }
+        assert_eq!(
+            mock.call_counts
+                .confirm_requirement_change
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_plan_only_called_once() {
+        let mock = MockInteraction::new();
+        let _ = mock.confirm_planning(&make_plan()).await;
+        let _ = mock.confirm_planning(&make_plan()).await;
+        assert_eq!(
+            mock.call_counts
+                .confirm_planning
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cli_creation() {
+        // 验证 CliInteraction 对象创建不 panic
+        let _cli = CliInteraction::new();
+    }
 }

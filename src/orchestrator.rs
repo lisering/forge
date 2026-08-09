@@ -3245,4 +3245,212 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&repaired).unwrap();
         assert_eq!(parsed.len(), 5);
     }
+
+    // ===== 额外 edge case 测试 =====
+
+    #[test]
+    fn test_normalize_path_with_backslash() {
+        let (_dir, ws) = make_ws();
+        // 反斜杠开头的路径 → 视为绝对路径 → 不匹配 workspace → None
+        let result = FixPromptBuilder::normalize_error_path(&ws, "\\src\\main.rs");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_normalize_path_just_slash() {
+        let (_dir, ws) = make_ws();
+        let result = FixPromptBuilder::normalize_error_path(&ws, "/");
+        // "/" starts_with "/" → 尝试匹配 workspace root
+        // 不匹配 → None
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_normalize_path_relative_with_dot() {
+        let (_dir, ws) = make_ws();
+        let result = FixPromptBuilder::normalize_error_path(&ws, "./src/main.rs");
+        // "./src/main.rs" 不以 / 开头 → 相对路径
+        assert_eq!(result, Some("./src/main.rs".to_string()));
+    }
+
+    #[test]
+    fn test_get_files_full_content_multiple_files() {
+        let (_dir, ws) = make_ws_with_files();
+        let content = FixPromptBuilder::get_files_full_content(
+            &ws,
+            &["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        );
+        assert!(content.contains("--- src/main.rs"));
+        assert!(content.contains("--- src/lib.rs"));
+        assert!(content.contains("fn main()"));
+        assert!(content.contains("pub fn hello()"));
+    }
+
+    #[test]
+    fn test_get_files_full_content_mixed_existing_and_nonexistent() {
+        let (_dir, ws) = make_ws_with_files();
+        let content = FixPromptBuilder::get_files_full_content(
+            &ws,
+            &["src/main.rs".to_string(), "nope.rs".to_string()],
+        );
+        assert!(content.contains("--- src/main.rs"));
+        assert!(content.contains("--- nope.rs"));
+        assert!(content.contains("文件不存在"));
+    }
+
+    #[test]
+    fn test_context_summary_limits_to_10_files() {
+        let (_dir, ws) = make_ws();
+        // 写 15 个文件
+        for i in 0..15 {
+            ws.write_file(&format!("file{}.rs", i), "fn main() {}")
+                .unwrap();
+        }
+        let summary = ContextBuilder::get_current_code_summary(&ws);
+        // get_current_code_summary 取前 10 个文件
+        let file_count = summary.lines().filter(|l| l.contains("行")).count();
+        assert!(file_count <= 10, "只显示前 10 个文件, 实际 {} 个", file_count);
+    }
+
+    #[test]
+    fn test_context_summary_excludes_cargo_lock() {
+        let (_dir, ws) = make_ws_with_files();
+        ws.write_file("Cargo.lock", "# lock file").unwrap();
+        let summary = ContextBuilder::get_current_code_summary(&ws);
+        assert!(!summary.contains("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_project_file_list_multiple_files() {
+        let mut memory = Memory::new("test");
+        memory.workspace_files = vec![
+            "src/main.rs".to_string(),
+            "Cargo.toml".to_string(),
+            "README.md".to_string(),
+        ];
+        let list = ContextBuilder::get_project_file_list(&memory);
+        assert!(list.contains("src/main.rs"));
+        assert!(list.contains("Cargo.toml"));
+        assert!(list.contains("README.md"));
+    }
+
+    #[test]
+    fn test_version_manager_save_and_rollback_multiple() {
+        let (_dir, ws) = make_ws_with_files();
+        // 保存 v1
+        let v1 = VersionManager::save_known_good(&ws).unwrap();
+        // 修改文件
+        ws.write_file("src/main.rs", "fn v2() {}").unwrap();
+        // 保存 v2
+        let v2 = VersionManager::save_known_good(&ws).unwrap();
+        assert_ne!(v1, v2);
+        // 回滚到 v2
+        VersionManager::rollback_to_known_good(&ws).unwrap();
+        assert_eq!(ws.read_file("src/main.rs").unwrap(), "fn v2() {}");
+    }
+
+    #[test]
+    fn test_repair_truncated_json_single_object() {
+        // 单个完整对象
+        let json = r#"{"name":"阶段1"}"#;
+        let repaired = repair_truncated_json(json);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(parsed["name"], "阶段1");
+    }
+
+    #[test]
+    fn test_repair_truncated_json_only_opening() {
+        // 只有 [
+        let repaired = repair_truncated_json("[");
+        assert_eq!(repaired, "[]");
+    }
+
+    #[test]
+    fn test_repair_truncated_json_nested_arrays() {
+        // 嵌套数组
+        let json = r#"[{"name":"阶段1","tasks":["a","b"]},{"name":"阶段2","tasks":["c"#;
+        let repaired = repair_truncated_json(json);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], "阶段1");
+        let tasks = parsed[0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+    }
+
+    #[test]
+    fn test_repair_truncated_json_with_newlines() {
+        // 多行 JSON (实际 AI 回复常见格式)
+        let json = r#"[
+  {
+    "name": "阶段1",
+    "tasks": [
+      {"name": "任务1"}
+    ]
+  },
+  {
+    "name": "阶段2",
+    "tasks": [
+      {"name": "任务2"
+    ]
+  }
+]"#;
+        let repaired = repair_truncated_json(json);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], "阶段1");
+    }
+
+    #[test]
+    fn test_build_fix_prompt_with_multiple_error_files() {
+        let (_dir, ws) = make_ws_with_files();
+        ws.write_file("src/lib.rs", "pub fn hello() {}").unwrap();
+        let memory = Memory::new("test");
+        let errors = vec![
+            CompileError {
+                file: "src/main.rs".to_string(),
+                line: Some(10),
+                column: Some(5),
+                message: "error 1".to_string(),
+                error_code: Some("E0308".to_string()),
+            },
+            CompileError {
+                file: "src/lib.rs".to_string(),
+                line: Some(1),
+                column: None,
+                message: "error 2".to_string(),
+                error_code: None,
+            },
+        ];
+        let prompt = FixPromptBuilder::build_fix_prompt(&ws, &memory, &errors, "编译错误", 0, 0);
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("src/lib.rs"));
+        assert!(prompt.contains("fn main()"));
+        assert!(prompt.contains("pub fn hello()"));
+    }
+
+    #[test]
+    fn test_build_fix_prompt_deduplicates_error_files() {
+        let (_dir, ws) = make_ws_with_files();
+        let memory = Memory::new("test");
+        let errors = vec![
+            CompileError {
+                file: "src/main.rs".to_string(),
+                line: Some(10),
+                column: Some(5),
+                message: "error 1".to_string(),
+                error_code: Some("E0308".to_string()),
+            },
+            CompileError {
+                file: "src/main.rs".to_string(),
+                line: Some(20),
+                column: Some(1),
+                message: "error 2".to_string(),
+                error_code: Some("E0277".to_string()),
+            },
+        ];
+        let prompt = FixPromptBuilder::build_fix_prompt(&ws, &memory, &errors, "编译错误", 0, 0);
+        // 只出现一次
+        let count = prompt.matches("--- src/main.rs").count();
+        assert_eq!(count, 1);
+    }
 }

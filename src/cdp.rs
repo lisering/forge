@@ -482,6 +482,182 @@ impl CdpSession {
     }
 }
 
+// ============================================================================
+//  纯逻辑函数 — 从 CdpSession 提取的可测试函数
+// ============================================================================
+
+/// 将 CDP 响应中的 `Value` 转换为布尔值 (用于 `wait_for_condition` 轮询)
+///
+/// 转换规则:
+/// - `Bool(b)` → b
+/// - `String(s)` → !s.is_empty()
+/// - `Number(n)` → n != 0.0
+/// - `Null` → false
+/// - 其他 (Array/Object) → true (非空容器视为真)
+pub fn value_as_bool(result: &Value) -> bool {
+    match result {
+        Value::Bool(b) => *b,
+        Value::String(s) => !s.is_empty(),
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+/// 判断按键是否为可打印字符 (决定 `press_key` 是否发送 char 事件)
+///
+/// CDP `Input.dispatchKeyEvent` 的 `char` 事件仅对单字节可打印字符发送。
+/// 多字节键名 (如 "Enter", "Tab", "Escape") 不需要 char 事件。
+pub fn is_printable_key(key: &str) -> bool {
+    key.len() == 1
+}
+
+/// 判断 `evaluate_string_long` 是否需要对结果进行分块提取
+///
+/// 当首次 `evaluate_string` 返回的长度 >= CHUNK_SIZE 时, 可能被截断, 需要分块。
+pub fn needs_chunking(first_result_len: usize, chunk_size: usize) -> bool {
+    first_result_len >= chunk_size
+}
+
+/// 判断首次结果是否完整 (真实长度 <= 首次返回长度, 说明没截断)
+pub fn is_result_complete(total_len: usize, first_result_len: usize) -> bool {
+    total_len == 0 || total_len <= first_result_len
+}
+
+/// 构建 JS 表达式: 获取表达式的结果长度
+pub fn build_length_js(expression: &str) -> String {
+    format!(
+        "(() => {{ let r = ({}); return r ? r.length : 0; }})()",
+        expression
+    )
+}
+
+/// 构建 JS 表达式: 分块提取 substring
+pub fn build_chunk_js(expression: &str, offset: usize, end: usize) -> String {
+    format!(
+        "(() => {{ let r = ({}); return r ? r.substring({}, {}) : ''; }})()",
+        expression, offset, end
+    )
+}
+
+/// 构建轮询条件 JS (try-catch 包装)
+pub fn build_condition_js(condition_js: &str) -> String {
+    format!(
+        "(() => {{ try {{ return {}; }} catch(e) {{ return false; }} }})()",
+        condition_js
+    )
+}
+
+/// 构建聚焦元素 JS
+pub fn build_focus_js(selector: &str) -> String {
+    format!(
+        "document.querySelector('{}')?.focus()",
+        selector.replace('\'', "\\'")
+    )
+}
+
+/// 从 CDP 响应中提取结果 (检查错误)
+pub fn extract_result(response: &Value, method: &str) -> Result<Value> {
+    if let Some(error) = response.get("error") {
+        bail!("CDP 命令失败: {} - {}", method, error);
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// 从 `Runtime.evaluate` 结果中提取值
+pub fn extract_evaluate_value(result: &Value) -> Result<Value> {
+    if let Some(exception) = result.get("exceptionDetails") {
+        bail!("JS 执行异常: {}", exception);
+    }
+    Ok(result
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+/// 将 `Value` 转换为字符串 (用于 `evaluate_string`)
+pub fn value_to_string(value: Value) -> String {
+    match value {
+        Value::String(s) => s,
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// 从 DOM 响应中提取 nodeId
+pub fn extract_node_id(response: &Value, error_msg: &str) -> Result<i64> {
+    response
+        .get("nodeId")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| anyhow!("{}", error_msg))?
+        .try_into()
+        .map_err(|_| anyhow!("nodeId 超出 i64 范围: {}", error_msg))
+}
+
+/// 从文档响应中提取根节点 nodeId
+pub fn extract_root_node_id(response: &Value) -> Result<i64> {
+    response
+        .get("root")
+        .and_then(|r| r.get("nodeId"))
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| anyhow!("无法获取文档根节点 nodeId"))?
+        .try_into()
+        .map_err(|_| anyhow!("root nodeId 超出 i64 范围"))
+}
+
+/// 构建 CDP 命令 JSON
+pub fn build_command(id: u32, method: &str, params: Value) -> Value {
+    json!({
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+/// 从 WebSocket 文本消息中提取 CDP 响应 ID
+///
+/// 如果消息是 CDP 响应 (包含 `id` 字段), 返回对应的 id。
+/// 如果是事件 (无 `id`), 返回 None。
+pub fn extract_response_id(text: &str) -> Option<u32> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value.get("id").and_then(|v| v.as_u64()).map(|id| id as u32)
+}
+
+/// 构建文件上传 change 事件触发 JS
+pub fn build_file_change_js(selector: &str) -> String {
+    let escaped = selector.replace('\'', "\\'");
+    format!(
+        r#"
+        (() => {{
+            let input = document.querySelector('{}');
+            if (input) {{
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            }}
+        }})()
+        "#,
+        escaped
+    )
+}
+
+/// 从 browser version 响应中提取 webSocketDebuggerUrl
+pub fn extract_browser_ws_url(version_response: &Value) -> Result<&str> {
+    version_response
+        .get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("无法获取 browser WebSocket URL"))
+}
+
+/// 从 Target.createTarget 响应中提取 targetId
+pub fn extract_target_id(response: &Value) -> Result<&str> {
+    response
+        .get("result")
+        .and_then(|r| r.get("targetId"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("无法获取 targetId"))
+}
+
 /// 通过 browser-level CDP 创建新标签页
 pub async fn create_tab(port: u16, url: &str) -> Result<TabInfo> {
     // 先获取 browser 的 ws url
@@ -526,4 +702,478 @@ pub async fn create_tab(port: u16, url: &str) -> Result<TabInfo> {
         }
     }
     anyhow::bail!("创建标签页失败: 无响应")
+}
+
+// ============================================================================
+//  单元测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ===== TabInfo 反序列化 =====
+
+    #[test]
+    fn test_tab_info_deserialize() {
+        let json_str = r#"{
+            "id": "ABC123",
+            "type": "page",
+            "title": "Chat",
+            "url": "https://chat.z.ai",
+            "webSocketDebuggerUrl": "ws://localhost:9222/devtools/page/ABC123"
+        }"#;
+        let tab: TabInfo = serde_json::from_str(json_str).unwrap();
+        assert_eq!(tab.id, "ABC123");
+        assert_eq!(tab.tab_type, "page");
+        assert_eq!(tab.title, "Chat");
+        assert_eq!(tab.url, "https://chat.z.ai");
+        assert_eq!(tab.ws_url, "ws://localhost:9222/devtools/page/ABC123");
+    }
+
+    #[test]
+    fn test_tab_info_type_filter() {
+        let tabs_json = r#"[
+            {"id":"1","type":"page","title":"A","url":"http://a","webSocketDebuggerUrl":"ws://1"},
+            {"id":"2","type":"background_page","title":"B","url":"http://b","webSocketDebuggerUrl":"ws://2"},
+            {"id":"3","type":"page","title":"C","url":"http://c","webSocketDebuggerUrl":"ws://3"}
+        ]"#;
+        let tabs: Vec<TabInfo> = serde_json::from_str(tabs_json).unwrap();
+        let pages: Vec<_> = tabs.into_iter().filter(|t| t.tab_type == "page").collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].id, "1");
+        assert_eq!(pages[1].id, "3");
+    }
+
+    #[test]
+    fn test_tab_info_missing_fields() {
+        // TabInfo 需要 id 字段，缺少时报错
+        let json_str = r#"{"type":"page"}"#;
+        let result: Result<TabInfo, _> = serde_json::from_str(json_str);
+        assert!(result.is_err());
+    }
+
+    // ===== value_as_bool =====
+
+    #[test]
+    fn test_value_as_bool_true() {
+        assert!(value_as_bool(&json!(true)));
+    }
+
+    #[test]
+    fn test_value_as_bool_false() {
+        assert!(!value_as_bool(&json!(false)));
+    }
+
+    #[test]
+    fn test_value_as_bool_non_empty_string() {
+        assert!(value_as_bool(&json!("hello")));
+    }
+
+    #[test]
+    fn test_value_as_bool_empty_string() {
+        assert!(!value_as_bool(&json!("")));
+    }
+
+    #[test]
+    fn test_value_as_bool_nonzero_number() {
+        assert!(value_as_bool(&json!(42)));
+        assert!(value_as_bool(&json!(-1)));
+    }
+
+    #[test]
+    fn test_value_as_bool_zero() {
+        assert!(!value_as_bool(&json!(0)));
+        assert!(!value_as_bool(&json!(0.0)));
+    }
+
+    #[test]
+    fn test_value_as_bool_null() {
+        assert!(!value_as_bool(&Value::Null));
+    }
+
+    #[test]
+    fn test_value_as_bool_array() {
+        assert!(value_as_bool(&json!([])));
+        assert!(value_as_bool(&json!([1, 2])));
+    }
+
+    #[test]
+    fn test_value_as_bool_object() {
+        assert!(value_as_bool(&json!({})));
+        assert!(value_as_bool(&json!({"key": "val"})));
+    }
+
+    // ===== is_printable_key =====
+
+    #[test]
+    fn test_is_printable_key_single_char() {
+        assert!(is_printable_key("a"));
+        assert!(is_printable_key("Z"));
+        assert!(is_printable_key("1"));
+    }
+
+    #[test]
+    fn test_is_printable_key_multi_char() {
+        assert!(!is_printable_key("Enter"));
+        assert!(!is_printable_key("Tab"));
+        assert!(!is_printable_key("Escape"));
+        assert!(!is_printable_key("Shift"));
+    }
+
+    // ===== needs_chunking =====
+
+    #[test]
+    fn test_needs_chunking_short_result() {
+        assert!(!needs_chunking(100, 50000));
+    }
+
+    #[test]
+    fn test_needs_chunking_exact_boundary() {
+        assert!(needs_chunking(50000, 50000));
+    }
+
+    #[test]
+    fn test_needs_chunking_long_result() {
+        assert!(needs_chunking(100000, 50000));
+    }
+
+    #[test]
+    fn test_needs_chunking_zero_length() {
+        assert!(!needs_chunking(0, 50000));
+    }
+
+    // ===== is_result_complete =====
+
+    #[test]
+    fn test_is_result_complete_zero_total() {
+        assert!(is_result_complete(0, 100));
+    }
+
+    #[test]
+    fn test_is_result_complete_equal() {
+        assert!(is_result_complete(100, 100));
+    }
+
+    #[test]
+    fn test_is_result_complete_shorter() {
+        assert!(is_result_complete(50, 100));
+    }
+
+    #[test]
+    fn test_is_result_complete_longer() {
+        assert!(!is_result_complete(200, 100));
+    }
+
+    // ===== build_length_js =====
+
+    #[test]
+    fn test_build_length_js() {
+        let js = build_length_js("document.body.innerText");
+        assert!(js.contains("document.body.innerText"));
+        assert!(js.contains("r.length"));
+    }
+
+    #[test]
+    fn test_build_length_js_returns_zero_on_null() {
+        let js = build_length_js("null");
+        assert!(js.contains("r ? r.length : 0"));
+    }
+
+    // ===== build_chunk_js =====
+
+    #[test]
+    fn test_build_chunk_js() {
+        let js = build_chunk_js("document.body.innerText", 0, 50000);
+        assert!(js.contains("substring(0, 50000)"));
+    }
+
+    #[test]
+    fn test_build_chunk_js_with_offset() {
+        let js = build_chunk_js("getResult()", 50000, 100000);
+        assert!(js.contains("substring(50000, 100000)"));
+    }
+
+    // ===== build_condition_js =====
+
+    #[test]
+    fn test_build_condition_js() {
+        let js = build_condition_js("document.querySelector('#btn')");
+        assert!(js.contains("try"));
+        assert!(js.contains("catch"));
+        assert!(js.contains("document.querySelector('#btn')"));
+    }
+
+    // ===== build_focus_js =====
+
+    #[test]
+    fn test_build_focus_js() {
+        let js = build_focus_js("#input");
+        assert!(js.contains("document.querySelector"));
+        assert!(js.contains("#input"));
+        assert!(js.contains("focus()"));
+    }
+
+    #[test]
+    fn test_build_focus_js_escapes_quotes() {
+        let js = build_focus_js("input[name='test']");
+        assert!(js.contains("input[name=\\'test\\']"));
+    }
+
+    // ===== extract_result =====
+
+    #[test]
+    fn test_extract_result_success() {
+        let response = json!({
+            "id": 1,
+            "result": {"value": 42}
+        });
+        let result = extract_result(&response, "Runtime.evaluate").unwrap();
+        assert_eq!(result["value"], json!(42));
+    }
+
+    #[test]
+    fn test_extract_result_null_result() {
+        let response = json!({"id": 1});
+        let result = extract_result(&response, "Test").unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_extract_result_error() {
+        let response = json!({
+            "id": 1,
+            "error": {"message": "Method not found"}
+        });
+        let result = extract_result(&response, "Unknown.method");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown.method"));
+    }
+
+    // ===== extract_evaluate_value =====
+
+    #[test]
+    fn test_extract_evaluate_value_success() {
+        let result = json!({
+            "result": {"value": "hello"}
+        });
+        let value = extract_evaluate_value(&result).unwrap();
+        assert_eq!(value, json!("hello"));
+    }
+
+    #[test]
+    fn test_extract_evaluate_value_exception() {
+        let result = json!({
+            "result": {"value": null},
+            "exceptionDetails": {"text": "SyntaxError"}
+        });
+        let value = extract_evaluate_value(&result);
+        assert!(value.is_err());
+        assert!(value.unwrap_err().to_string().contains("JS 执行异常"));
+    }
+
+    #[test]
+    fn test_extract_evaluate_value_missing_value() {
+        let result = json!({"result": {}});
+        let value = extract_evaluate_value(&result).unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    #[test]
+    fn test_extract_evaluate_value_missing_result() {
+        let result = json!({});
+        let value = extract_evaluate_value(&result).unwrap();
+        assert_eq!(value, Value::Null);
+    }
+
+    // ===== value_to_string =====
+
+    #[test]
+    fn test_value_to_string_string() {
+        assert_eq!(value_to_string(json!("hello")), "hello");
+    }
+
+    #[test]
+    fn test_value_to_string_null() {
+        assert_eq!(value_to_string(Value::Null), "");
+    }
+
+    #[test]
+    fn test_value_to_string_number() {
+        assert_eq!(value_to_string(json!(42)), "42");
+    }
+
+    #[test]
+    fn test_value_to_string_bool() {
+        assert_eq!(value_to_string(json!(true)), "true");
+    }
+
+    #[test]
+    fn test_value_to_string_array() {
+        let result = value_to_string(json!([1, 2, 3]));
+        assert!(result.contains("1"));
+        assert!(result.contains("2"));
+        assert!(result.contains("3"));
+    }
+
+    // ===== extract_node_id =====
+
+    #[test]
+    fn test_extract_node_id_success() {
+        let response = json!({"nodeId": 42});
+        let id = extract_node_id(&response, "not found").unwrap();
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn test_extract_node_id_missing() {
+        let response = json!({});
+        let result = extract_node_id(&response, "element not found");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("element not found"));
+    }
+
+    #[test]
+    fn test_extract_node_id_zero() {
+        let response = json!({"nodeId": 0});
+        let id = extract_node_id(&response, "err").unwrap();
+        assert_eq!(id, 0);
+    }
+
+    // ===== extract_root_node_id =====
+
+    #[test]
+    fn test_extract_root_node_id_success() {
+        let response = json!({"root": {"nodeId": 1}});
+        let id = extract_root_node_id(&response).unwrap();
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn test_extract_root_node_id_missing() {
+        let response = json!({});
+        let result = extract_root_node_id(&response);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("无法获取文档根节点"));
+    }
+
+    // ===== build_command =====
+
+    #[test]
+    fn test_build_command() {
+        let cmd = build_command(1, "Runtime.evaluate", json!({"expression": "1+1"}));
+        assert_eq!(cmd["id"], 1);
+        assert_eq!(cmd["method"], "Runtime.evaluate");
+        assert_eq!(cmd["params"]["expression"], "1+1");
+    }
+
+    #[test]
+    fn test_build_command_empty_params() {
+        let cmd = build_command(5, "DOM.enable", json!({}));
+        assert_eq!(cmd["id"], 5);
+        assert_eq!(cmd["method"], "DOM.enable");
+    }
+
+    // ===== extract_response_id =====
+
+    #[test]
+    fn test_extract_response_id_with_id() {
+        let text = r#"{"id": 42, "result": {"value": "ok"}}"#;
+        assert_eq!(extract_response_id(text), Some(42));
+    }
+
+    #[test]
+    fn test_extract_response_id_event_no_id() {
+        let text = r#"{"method": "Page.frameNavigated", "params": {}}"#;
+        assert_eq!(extract_response_id(text), None);
+    }
+
+    #[test]
+    fn test_extract_response_id_invalid_json() {
+        assert_eq!(extract_response_id("not json"), None);
+    }
+
+    #[test]
+    fn test_extract_response_id_empty_string() {
+        assert_eq!(extract_response_id(""), None);
+    }
+
+    #[test]
+    fn test_extract_response_id_large_id() {
+        let text = r#"{"id": 999999, "result": null}"#;
+        assert_eq!(extract_response_id(text), Some(999999));
+    }
+
+    // ===== build_file_change_js =====
+
+    #[test]
+    fn test_build_file_change_js() {
+        let js = build_file_change_js("input[type='file']");
+        assert!(js.contains("change"));
+        assert!(js.contains("input"));
+        assert!(js.contains("dispatchEvent"));
+    }
+
+    #[test]
+    fn test_build_file_change_js_escapes_quotes() {
+        let js = build_file_change_js("input[name='test']");
+        assert!(js.contains("input[name=\\'test\\']"));
+    }
+
+    // ===== extract_browser_ws_url =====
+
+    #[test]
+    fn test_extract_browser_ws_url_success() {
+        let response = json!({
+            "webSocketDebuggerUrl": "ws://localhost:9222/devtools/browser/abc"
+        });
+        let url = extract_browser_ws_url(&response).unwrap();
+        assert_eq!(url, "ws://localhost:9222/devtools/browser/abc");
+    }
+
+    #[test]
+    fn test_extract_browser_ws_url_missing() {
+        let response = json!({});
+        let result = extract_browser_ws_url(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_browser_ws_url_not_string() {
+        let response = json!({"webSocketDebuggerUrl": 123});
+        let result = extract_browser_ws_url(&response);
+        assert!(result.is_err());
+    }
+
+    // ===== extract_target_id =====
+
+    #[test]
+    fn test_extract_target_id_success() {
+        let response = json!({
+            "result": {"targetId": "target-123"}
+        });
+        let id = extract_target_id(&response).unwrap();
+        assert_eq!(id, "target-123");
+    }
+
+    #[test]
+    fn test_extract_target_id_missing() {
+        let response = json!({});
+        let result = extract_target_id(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_target_id_no_result_key() {
+        let response = json!({"id": 1});
+        let result = extract_target_id(&response);
+        assert!(result.is_err());
+    }
 }

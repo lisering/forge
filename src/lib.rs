@@ -101,7 +101,9 @@ pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteracti
 pub use language::{
     detect_language, GoAdapter, MultiLanguageTestRunner, NodeAdapter, PythonAdapter, RustAdapter,
 };
-pub use llm_clarify::{HybridClarificationChecker, LlmClarificationChecker, LlmClient, OllamaClient};
+pub use llm_clarify::{
+    HybridClarificationChecker, LlmClarificationChecker, LlmClient, OllamaClient,
+};
 pub use loop_detector::{ErrorRound, LoopDetector};
 pub use memory::{Memory, RequirementChange};
 pub use orchestrator::Orchestrator;
