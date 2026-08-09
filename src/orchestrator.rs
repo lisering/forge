@@ -3309,7 +3309,11 @@ mod tests {
         let summary = ContextBuilder::get_current_code_summary(&ws);
         // get_current_code_summary 取前 10 个文件
         let file_count = summary.lines().filter(|l| l.contains("行")).count();
-        assert!(file_count <= 10, "只显示前 10 个文件, 实际 {} 个", file_count);
+        assert!(
+            file_count <= 10,
+            "只显示前 10 个文件, 实际 {} 个",
+            file_count
+        );
     }
 
     #[test]

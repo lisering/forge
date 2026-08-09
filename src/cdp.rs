@@ -359,7 +359,10 @@ impl CdpSession {
             )
             .await?;
 
-        let node_id = extract_node_id(&query_result, &format!("无法找到文件输入元素: {}", selector))?;
+        let node_id = extract_node_id(
+            &query_result,
+            &format!("无法找到文件输入元素: {}", selector),
+        )?;
 
         if node_id == 0 {
             bail!("文件输入元素不存在: {}", selector);
@@ -399,9 +402,7 @@ impl CdpSession {
                 bail!("等待条件超时 ({}ms): {}", timeout_ms, condition_js);
             }
 
-            let result = self
-                .evaluate(&build_condition_js(condition_js))
-                .await?;
+            let result = self.evaluate(&build_condition_js(condition_js)).await?;
 
             if value_as_bool(&result) {
                 return Ok(());

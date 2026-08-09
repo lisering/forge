@@ -202,23 +202,14 @@ const UI_TEXT_PATTERNS: &[&str] = &[
     "下载复制",
 ];
 
-/// 检测文本是否包含有意义的回复内容 (过滤 UI 文本后)
+// ============================================================================
+//  Pure Logic Functions — 可测试的纯逻辑函数
+// ============================================================================
+
+/// 判断文本是否包含有意义的实际内容（非 UI 文本）
 ///
-/// Phase 2 中使用此函数判断 AI 是否已开始输出实际回答。
-/// 过滤逻辑:
-/// 1. 逐行检查, 移除已知 UI 文本行
-/// 2. 移除以 "深度思考" 开头的行 (模式选择器文本变体)
-/// 3. 移除纯空白行
-/// 4. 如果剩余文本超过 5 个字符, 认为有实际内容
-///
-/// # 示例
-///
-/// ```ignore
-/// assert!(!is_meaningful_content("深度思考 最高"));
-/// assert!(!is_meaningful_content("思考过程\n跳过"));
-/// assert!(is_meaningful_content("Hello, world!"));
-/// assert!(is_meaningful_content("这是一个实际的回复内容。"));
-/// ```
+/// 此函数不依赖 ChatTab 或 CDP，可在无浏览器环境下测试。
+/// 用于检测 AI 回复是否包含实际内容，过滤 UI 文本泄漏。
 fn is_meaningful_content(text: &str) -> bool {
     let mut content_lines = 0;
     let mut content_chars = 0usize;
@@ -261,6 +252,172 @@ fn is_meaningful_content(text: &str) -> bool {
     // 至少有一行实际内容, 且总字符数 > 1
     // (降低阈值从 5 → 1, 因为 AI 可能回复 "OK" 等短消息)
     content_lines > 0 && content_chars > 1
+}
+
+/// Phase 3: 计算文本稳定目标的纯逻辑
+///
+/// 根据文本长度动态调整稳定检测的目标次数：
+/// - 文本 < 500 字符: 3 次稳定 (短回复)
+/// - 文本 500-5000 字符: 5 次稳定 (中等回复)  
+/// - 文本 > 5000 字符: 6 次稳定 (长回复, 如 JSON 规划)
+fn calculate_stability_target(text_length: usize) -> u32 {
+    if text_length > 5000 {
+        6
+    } else if text_length > 500 {
+        5
+    } else {
+        3
+    }
+}
+
+/// Phase 3: 判断文本是否稳定（纯逻辑版本）
+///
+/// 参数:
+/// - current_text: 当前文本
+/// - prev_text: 上一次检测的文本
+/// - stable_count: 当前稳定计数
+/// - stable_target: 目标稳定次数
+/// - last_growth_time: 上次增长时间
+/// - now: 当前时间
+///
+/// 返回: (是否稳定, 新的稳定计数)
+fn check_text_stability(
+    current_text: &str,
+    prev_text: &str,
+    stable_count: u32,
+    stable_target: u32,
+    last_growth_time: tokio::time::Instant,
+    _now: tokio::time::Instant,
+) -> (bool, u32) {
+    if current_text == prev_text {
+        let new_stable_count = stable_count + 1;
+
+        // 如果最近 10 秒内有文本增长, 额外等待
+        let recent_growth = last_growth_time.elapsed() < tokio::time::Duration::from_secs(10);
+
+        if new_stable_count >= stable_target && !recent_growth {
+            // 文本稳定完成
+            (true, new_stable_count)
+        } else if new_stable_count >= stable_target && recent_growth {
+            // 文本最近还在增长, 重置稳定计数继续等待
+            (false, 0)
+        } else {
+            // 继续等待稳定
+            (false, new_stable_count)
+        }
+    } else {
+        // 文本有变化，重置稳定计数
+        (false, 0)
+    }
+}
+
+/// Phase 1: 卡死检测的纯逻辑
+///
+/// 检测给定时间内是否有页面变化（assistant 数量或文本哈希）
+///
+/// 参数:
+/// - last_change_time: 上次变化时间
+/// - stuck_threshold: 卡死阈值（秒）
+/// - current_count: 当前 assistant 数量
+/// - last_count: 上次 assistant 数量  
+/// - current_hash: 当前页面文本哈希
+/// - last_hash: 上次页面文本哈希
+/// - now: 当前时间
+///
+/// 返回: (是否卡死, 新的最后变化时间)
+fn check_stuck_detection(
+    last_change_time: tokio::time::Instant,
+    stuck_threshold: u64,
+    current_count: usize,
+    last_count: usize,
+    current_hash: u64,
+    last_hash: u64,
+    now: tokio::time::Instant,
+) -> (bool, tokio::time::Instant) {
+    let stuck_duration = last_change_time.elapsed();
+    let is_stuck = stuck_duration > tokio::time::Duration::from_secs(stuck_threshold);
+
+    // 如果有任何变化，更新最后变化时间
+    let new_change_time = if current_count != last_count || current_hash != last_hash {
+        now
+    } else {
+        last_change_time
+    };
+
+    (is_stuck, new_change_time)
+}
+
+/// Phase 2: 思考延长逻辑的纯逻辑
+///
+/// 当检测到 AI 正在思考且接近超时时，自动延长 Phase 2
+///
+/// 参数:
+/// - current_time: 当前时间
+/// - phase2_deadline: Phase 2 截止时间
+/// - phase2_max_deadline: Phase 2 最大截止时间
+/// - thinking_extensions: 当前已延长的次数
+/// - thinking_detected: 是否检测到正在思考
+///
+/// 返回: (是否应该延长, 新的截止时间, 新的延长次数)
+fn check_thinking_extension(
+    current_time: tokio::time::Instant,
+    phase2_deadline: tokio::time::Instant,
+    phase2_max_deadline: tokio::time::Instant,
+    thinking_extensions: u32,
+    thinking_detected: bool,
+) -> (bool, tokio::time::Instant, u32) {
+    if thinking_detected
+        && current_time + tokio::time::Duration::from_secs(30) > phase2_deadline
+        && phase2_deadline < phase2_max_deadline
+        && thinking_extensions < 10
+    {
+        let new_deadline = current_time + tokio::time::Duration::from_secs(60);
+        let new_extensions = thinking_extensions + 1;
+        (true, new_deadline, new_extensions)
+    } else {
+        (false, phase2_deadline, thinking_extensions)
+    }
+}
+
+/// 计算页面状态的纯逻辑函数（用于测试）
+///
+/// 模拟 get_page_state 中的页面状态计算逻辑
+///
+/// 参数:
+/// - assistant_elements: assistant 元素数量
+/// - markdown_elements: markdown 元素数量
+/// - kimi_elements: Kimi 特定元素数量
+/// - tongyi_elements: 通义千问特定元素数量
+/// - claude_elements: Claude 特定元素数量
+/// - page_text_length: 页面文本长度
+///
+/// 返回: (assistant 数量, 页面文本哈希)
+#[allow(dead_code)]
+fn calculate_page_state(
+    assistant_elements: usize,
+    markdown_elements: usize,
+    kimi_elements: usize,
+    tongyi_elements: usize,
+    claude_elements: usize,
+    page_text_length: usize,
+) -> (usize, u64) {
+    // assistant 计数逻辑
+    let count = if assistant_elements > 0 {
+        assistant_elements
+    } else if markdown_elements > 0 {
+        markdown_elements
+    } else if kimi_elements > 0 {
+        kimi_elements
+    } else if tongyi_elements > 0 {
+        tongyi_elements
+    } else {
+        claude_elements
+    };
+
+    // 简单哈希计算（模拟实际实现）
+    let hash = page_text_length as u64;
+
+    (count, hash)
 }
 
 impl ChatTab {
@@ -1168,7 +1325,7 @@ impl ChatTab {
         );
 
         // 卡死检测: 记录上次页面变化时间
-        let mut last_change_time = Instant::now();
+        let mut last_change_time = tokio::time::Instant::now();
         let mut last_count = prev_count;
         let mut last_hash = prev_text_hash;
 
@@ -1181,10 +1338,33 @@ impl ChatTab {
                 );
             }
 
+            // 方法 1+2 合并: 一次 evaluate 获取 assistant 数量 + 页面文本 hash (性能优化)
+            let (current_count, current_hash) = self.get_page_state().await;
+
+            // 更新卡死检测追踪
+            let now = tokio::time::Instant::now();
+            let (_, new_change_time) = check_stuck_detection(
+                last_change_time,
+                config.stuck_threshold_secs,
+                current_count,
+                last_count,
+                current_hash,
+                last_hash,
+                now,
+            );
+
             // 卡死检测
             if config.has_stuck_detection() {
-                let stuck_duration = last_change_time.elapsed();
-                if stuck_duration > Duration::from_secs(config.stuck_threshold_secs) {
+                let (is_stuck, _) = check_stuck_detection(
+                    last_change_time,
+                    config.stuck_threshold_secs,
+                    current_count,
+                    last_count,
+                    current_hash,
+                    last_hash,
+                    now,
+                );
+                if is_stuck {
                     bail!(
                         "聊天页面卡死: 连续 {}s 无变化 (count={}, hash={}), 可能需要自动恢复",
                         config.stuck_threshold_secs,
@@ -1194,15 +1374,9 @@ impl ChatTab {
                 }
             }
 
-            // 方法 1+2 合并: 一次 evaluate 获取 assistant 数量 + 页面文本 hash (性能优化)
-            let (current_count, current_hash) = self.get_page_state().await;
-
-            // 更新卡死检测追踪
-            if current_count != last_count || current_hash != last_hash {
-                last_change_time = Instant::now();
-                last_count = current_count;
-                last_hash = current_hash;
-            }
+            last_change_time = new_change_time;
+            last_count = current_count;
+            last_hash = current_hash;
 
             if current_count > prev_count {
                 info!("✅ 新 AI 消息出现 ({} -> {})", prev_count, current_count);
@@ -1298,17 +1472,24 @@ impl ChatTab {
                 // AI 正在思考, 继续等待
                 // 思考延长: 当检测到 AI 正在思考且接近超时时, 自动延长 Phase 2
                 // 深度思考"最高"模式可能需要 5-10 分钟
-                if tokio::time::Instant::now() + Duration::from_secs(30) > phase2_deadline
-                    && phase2_deadline < phase2_max_deadline
-                    && thinking_extensions < 10
-                {
-                    phase2_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-                    thinking_extensions += 1;
+                let now = tokio::time::Instant::now();
+                let (should_extend, new_deadline, new_extensions) = check_thinking_extension(
+                    now,
+                    phase2_deadline,
+                    phase2_max_deadline,
+                    thinking_extensions,
+                    thinking,
+                );
+
+                if should_extend {
+                    phase2_deadline = new_deadline;
+                    thinking_extensions = new_extensions;
                     info!(
                         "🧠 AI 正在思考, 延长 Phase 2 超时 (+60s, 第 {} 次延长)",
                         thinking_extensions
                     );
                 }
+
                 if waited_secs.is_multiple_of(10) {
                     debug!(
                         "AI 正在思考中... ({}s, 延长 {} 次)",
@@ -1342,7 +1523,7 @@ impl ChatTab {
         // - 文本 < 500 字符: 3 次稳定 (短回复)
         // - 文本 500-5000 字符: 5 次稳定 (中等回复)
         // - 文本 > 5000 字符: 6 次稳定 (长回复, 如 JSON 规划)
-        let mut stable_target = 3u32;
+        let mut stable_target;
         let mut last_growth_time = tokio::time::Instant::now();
         let mut phase3_start = None;
 
@@ -1355,11 +1536,7 @@ impl ChatTab {
             let current_text = self.extract_last_response().await.unwrap_or_default();
 
             // 动态调整稳定目标 (长文本需要更多稳定次数)
-            if current_text.len() > 5000 {
-                stable_target = 6;
-            } else if current_text.len() > 500 {
-                stable_target = 5;
-            }
+            stable_target = calculate_stability_target(current_text.len());
 
             // 如果文本为空或只有 UI 文本,可能还在思考中
             // 使用 is_meaningful_content 过滤 UI 文本, 避免误判
@@ -1370,34 +1547,34 @@ impl ChatTab {
                 continue;
             }
 
-            if current_text == prev_text {
-                stable_count += 1;
-                // 如果最近 10 秒内有文本增长, 额外等待
-                // (AI 可能暂停几秒后继续生成)
-                let recent_growth = last_growth_time.elapsed() < Duration::from_secs(10);
-                if stable_count >= stable_target && !recent_growth {
-                    info!(
-                        "✅ 回复完成 (稳定 {} 次, {}字符, target={})",
-                        stable_target,
-                        current_text.len(),
-                        stable_target
-                    );
-                    return Ok(false);
-                } else if stable_count >= stable_target && recent_growth {
-                    // 文本最近还在增长, 重置稳定计数继续等待
-                    debug!(
-                        "文本最近增长, 额外等待 (stable={}, target={})",
-                        stable_count, stable_target
-                    );
-                    stable_count = 0;
-                }
-            } else {
-                // 如果文本增长了,记录开始时间
+            let now = tokio::time::Instant::now();
+            let (is_stable, new_stable_count) = check_text_stability(
+                &current_text,
+                &prev_text,
+                stable_count,
+                stable_target,
+                last_growth_time,
+                now,
+            );
+
+            if is_stable {
+                info!(
+                    "✅ 回复完成 (稳定 {} 次, {}字符, target={})",
+                    stable_target,
+                    current_text.len(),
+                    stable_target
+                );
+                return Ok(false);
+            }
+
+            stable_count = new_stable_count;
+
+            // 如果文本增长了,记录开始时间
+            if current_text != prev_text {
                 if phase3_start.is_none() && current_text.len() > 3 {
                     phase3_start = Some(tokio::time::Instant::now());
                 }
                 last_growth_time = tokio::time::Instant::now();
-                stable_count = 0;
                 prev_text = current_text.clone();
             }
 
@@ -1968,6 +2145,269 @@ mod tests {
         let config = TimeoutConfig::default().with_stuck_threshold(0);
         assert_eq!(config.stuck_threshold_secs, 0);
         assert!(!config.has_stuck_detection());
+    }
+
+    // ===== 纯逻辑函数测试 =====
+
+    #[test]
+    fn test_calculate_stability_target_short_text() {
+        assert_eq!(calculate_stability_target(100), 3);
+        assert_eq!(calculate_stability_target(499), 3);
+    }
+
+    #[test]
+    fn test_calculate_stability_target_medium_text() {
+        assert_eq!(calculate_stability_target(500), 5);
+        assert_eq!(calculate_stability_target(2500), 5);
+        assert_eq!(calculate_stability_target(4999), 5);
+    }
+
+    #[test]
+    fn test_calculate_stability_target_long_text() {
+        assert_eq!(calculate_stability_target(5000), 6);
+        assert_eq!(calculate_stability_target(10000), 6);
+    }
+
+    #[test]
+    fn test_check_text_stability_stable() {
+        let now = tokio::time::Instant::now();
+        let last_growth = now - tokio::time::Duration::from_secs(15); // 15秒前
+
+        // 文本相同且超过目标次数，且无近期增长
+        let (stable, new_count) = check_text_stability(
+            "Hello world!",
+            "Hello world!",
+            5, // stable_count
+            3, // stable_target
+            last_growth,
+            now,
+        );
+        assert!(stable);
+        assert_eq!(new_count, 6);
+    }
+
+    #[test]
+    fn test_check_text_stability_recent_growth() {
+        let now = tokio::time::Instant::now();
+        let last_growth = now - tokio::time::Duration::from_secs(5); // 5秒前，仍在10秒窗口内
+
+        // 文本相同且超过目标次数，但有近期增长，应重置计数
+        let (stable, new_count) = check_text_stability(
+            "Hello world!",
+            "Hello world!",
+            5, // stable_count
+            3, // stable_target
+            last_growth,
+            now,
+        );
+        assert!(!stable);
+        assert_eq!(new_count, 0);
+    }
+
+    #[test]
+    fn test_check_text_stability_unstable() {
+        let now = tokio::time::Instant::now();
+        let last_growth = now - tokio::time::Duration::from_secs(15);
+
+        // 文本未达到目标次数
+        let (stable, new_count) = check_text_stability(
+            "Hello world!",
+            "Hello world!",
+            1, // stable_count
+            3, // stable_target
+            last_growth,
+            now,
+        );
+        assert!(!stable);
+        assert_eq!(new_count, 2);
+    }
+
+    #[test]
+    fn test_check_text_stability_text_changed() {
+        let now = tokio::time::Instant::now();
+        let last_growth = now - tokio::time::Duration::from_secs(15);
+
+        // 文本发生变化，应重置计数
+        let (stable, new_count) = check_text_stability(
+            "Hello world! Updated",
+            "Hello world!",
+            5, // stable_count
+            3, // stable_target
+            last_growth,
+            now,
+        );
+        assert!(!stable);
+        assert_eq!(new_count, 0);
+    }
+
+    #[test]
+    fn test_check_stuck_detection_stuck() {
+        let now = tokio::time::Instant::now();
+        let last_change = now - tokio::time::Duration::from_secs(200); // 200秒前
+
+        // 超过阈值(180秒)，应检测为卡死
+        let (is_stuck, _) = check_stuck_detection(
+            last_change,
+            180, // stuck_threshold
+            5,   // current_count
+            5,   // last_count (相同)
+            123, // current_hash
+            123, // last_hash (相同)
+            now,
+        );
+        assert!(is_stuck);
+    }
+
+    #[test]
+    fn test_check_stuck_detection_not_stuck() {
+        let now = tokio::time::Instant::now();
+        let last_change = now - tokio::time::Duration::from_secs(100); // 100秒前
+
+        // 未超过阈值(180秒)，不应检测为卡死
+        let (is_stuck, _) = check_stuck_detection(
+            last_change,
+            180, // stuck_threshold
+            5,   // current_count
+            5,   // last_count
+            123, // current_hash
+            123, // last_hash
+            now,
+        );
+        assert!(!is_stuck);
+    }
+
+    #[test]
+    fn test_check_stuck_detection_with_change() {
+        let now = tokio::time::Instant::now();
+        let last_change = now - tokio::time::Duration::from_secs(200); // 200秒前
+
+        // 有页面变化，应更新最后变化时间
+        let (is_stuck, new_change_time) = check_stuck_detection(
+            last_change,
+            180, // stuck_threshold
+            6,   // current_count (changed from 5)
+            5,   // last_count
+            123, // current_hash
+            123, // last_hash
+            now,
+        );
+        assert!(!is_stuck);
+        assert_eq!(new_change_time, now);
+    }
+
+    #[test]
+    fn test_check_thinking_extension_should_extend() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(20); // 20秒后，小于30秒阈值
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 满足延长条件
+        let (should_extend, new_deadline, extensions) = check_thinking_extension(
+            now,
+            deadline,
+            max_deadline,
+            2,    // thinking_extensions
+            true, // thinking_detected
+        );
+        assert!(should_extend);
+        assert_eq!(extensions, 3);
+        assert!(new_deadline > deadline);
+    }
+
+    #[test]
+    fn test_check_thinking_extension_not_near_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(60); // 60秒后，大于30秒阈值
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 不接近deadline，不应延长
+        let (should_extend, new_deadline, extensions) = check_thinking_extension(
+            now,
+            deadline,
+            max_deadline,
+            2,    // thinking_extensions
+            true, // thinking_detected
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 2);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_check_thinking_extension_max_extensions() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(20);
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 已达到最大延长次数
+        let (should_extend, new_deadline, extensions) = check_thinking_extension(
+            now,
+            deadline,
+            max_deadline,
+            10,   // thinking_extensions (已达到上限)
+            true, // thinking_detected
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 10);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_check_thinking_extension_not_thinking() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(20);
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 未检测到思考，不应延长
+        let (should_extend, new_deadline, extensions) = check_thinking_extension(
+            now,
+            deadline,
+            max_deadline,
+            2,     // thinking_extensions
+            false, // thinking_detected
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 2);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_calculate_page_state_precedence() {
+        // 测试优先级顺序：assistant > markdown > kimi > tongyi > claude
+
+        // 优先使用 assistant
+        let (count, _) = calculate_page_state(5, 10, 15, 20, 25, 1000);
+        assert_eq!(count, 5);
+
+        // 无assistant时用markdown
+        let (count, _) = calculate_page_state(0, 10, 15, 20, 25, 1000);
+        assert_eq!(count, 10);
+
+        // 无assistant和markdown时用kimi
+        let (count, _) = calculate_page_state(0, 0, 15, 20, 25, 1000);
+        assert_eq!(count, 15);
+
+        // 无assistant、markdown、kimi时用tongyi
+        let (count, _) = calculate_page_state(0, 0, 0, 20, 25, 1000);
+        assert_eq!(count, 20);
+
+        // 最后使用claude
+        let (count, _) = calculate_page_state(0, 0, 0, 0, 25, 1000);
+        assert_eq!(count, 25);
+
+        // 全为0时返回0
+        let (count, _) = calculate_page_state(0, 0, 0, 0, 0, 1000);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_calculate_page_state_hash() {
+        // 测试哈希计算基于文本长度
+        let (_, hash) = calculate_page_state(5, 0, 0, 0, 0, 500);
+        assert_eq!(hash, 500);
+
+        let (_, hash) = calculate_page_state(0, 0, 0, 0, 0, 1500);
+        assert_eq!(hash, 1500);
     }
 
     #[test]
@@ -2693,6 +3133,26 @@ mod tests {
         assert!(!UI_TEXT_PATTERNS.is_empty());
         assert!(UI_TEXT_PATTERNS.contains(&"深度思考 最高"));
         assert!(UI_TEXT_PATTERNS.contains(&"复制下载"));
+    }
+
+    #[test]
+    fn test_is_meaningful_content_edge_cases() {
+        // 测试混合内容（UI文本+实际内容）
+        assert!(!is_meaningful_content("深度思考\n正在思考...".trim()));
+        assert!(is_meaningful_content("深度思考\nHello world!".trim()));
+        assert!(is_meaningful_content("复制\n这是一个实际的回复".trim()));
+
+        // 测试短内容
+        assert!(is_meaningful_content("A"));
+        assert!(is_meaningful_content("OK"));
+        assert!(!is_meaningful_content("跳过")); // UI文本
+
+        // 测试复杂混合情况
+        let mixed_ui_text = "深度思考 最高\n正在思考\n思考过程\n跳过";
+        assert!(!is_meaningful_content(mixed_ui_text));
+
+        let mixed_with_content = "深度思考\n这是一个实际的回答内容\n复制";
+        assert!(is_meaningful_content(mixed_with_content));
     }
 
     // ===== 发送按钮重试逻辑验证 =====
