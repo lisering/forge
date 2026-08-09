@@ -191,11 +191,14 @@ enum Commands {
         /// 每次重试间隔按指数退避 (2^n 秒, 上限 60s)。
         #[arg(long, default_value = "10")]
         recovery_retries: u32,
-        /// Phase 1 超时: 等待新 AI 消息出现 (秒, 默认 15)
+        /// Phase 1 超时: 等待新 AI 消息出现 (秒, 默认 30)
         ///
         /// 24h 可靠性强化: 流式响应检测的第一阶段超时。
         /// 超过后判定为新消息未出现。
-        #[arg(long, default_value = "15")]
+        ///
+        /// 端到端验证 (Session 67): 默认值从 15s 提升到 30s,
+        /// 因为 Z.ai 处理复杂 prompt (2000+ 字符) 时新消息出现可能 >15s。
+        #[arg(long, default_value = "30")]
         phase1_timeout: u64,
         /// Phase 2 超时: 等待实际回答内容出现 (秒, 默认 60)
         ///

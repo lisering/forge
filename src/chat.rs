@@ -66,7 +66,10 @@ pub struct TimeoutConfig {
     /// Phase 1 超时: 等待新 assistant 消息出现 (秒)
     ///
     /// 超过后判定为新消息未出现, 触发超时。
-    /// 默认 15 秒。
+    /// 默认 30 秒。
+    ///
+    /// 端到端验证 (Session 67) 发现: Z.ai 处理复杂 prompt (2000+ 字符) 时,
+    /// 新消息出现可能需要 >15s, 因此默认值从 15s 提升到 30s。
     pub phase1_secs: u64,
 
     /// Phase 2 超时: 等待实际回答内容出现 (秒)
@@ -93,7 +96,7 @@ pub struct TimeoutConfig {
 impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
-            phase1_secs: 15,
+            phase1_secs: 30,
             phase2_secs: 60,
             phase3_secs: 45,
             stuck_threshold_secs: 180,
@@ -115,14 +118,16 @@ impl TimeoutConfig {
     /// 从单一超时值创建配置 (向后兼容)
     ///
     /// 合理分配超时到三个阶段:
-    /// - Phase 1: 最多 30s (新消息通常很快出现)
+    /// - Phase 1: 最多 60s (新消息出现, 复杂 prompt 可能需要更长时间)
     /// - Phase 2: `timeout_secs` (AI 思考 + 实际回答, 深度思考模式需要更长时间)
     /// - Phase 3: 45s (文本稳定性检测)
     ///
-    /// 这样 `--timeout 120` 会给 Phase 2 120s, 足够深度思考模式完成。
+    /// 端到端验证 (Session 67): Phase 1 上限从 30s 提升到 60s,
+    /// 因为 Z.ai 处理 2000+ 字符的复杂 prompt 时新消息出现可能 >15s。
+    /// `--timeout 120` → Phase 1 = 60s, Phase 2 = 120s。
     pub fn from_timeout_secs(timeout_secs: u64) -> Self {
         Self {
-            phase1_secs: timeout_secs.min(30),
+            phase1_secs: timeout_secs.min(60),
             phase2_secs: timeout_secs,
             phase3_secs: 45,
             stuck_threshold_secs: 0, // 向后兼容: 禁用卡死检测
@@ -148,20 +153,23 @@ impl TimeoutConfig {
     /// 根据网站类型调整 Phase 1 超时 (网站特定超时)
     ///
     /// 不同网站的 AI 响应速度不同:
-    /// - Z.ai: 15s (通常很快, 1-3s 内出现新消息)
-    /// - DeepSeek: 30s (可能需要登录/加载, 响应较慢)
-    /// - Kimi/通义千问/Claude: 20s (中等速度)
+    /// - Z.ai: 至少 30s (端到端验证发现复杂 prompt 需要 >15s)
+    /// - DeepSeek: 至少 30s (可能需要登录/加载, 响应较慢)
+    /// - Kimi/通义千问/Claude: 至少 20s (中等速度)
     /// - Unknown: 保持原值 (保守策略)
+    ///
+    /// 端到端验证 (Session 67): Z.ai 的下限从无限制改为 30s,
+    /// 因为实测发现 2000+ 字符的复杂 prompt 新消息出现需要 >15s。
     ///
     /// 此方法返回调整后的 TimeoutConfig, 不修改原始配置。
     /// 在 main.rs 中为每个标签页设置超时时调用。
     pub fn for_site_type(&self, site: crate::browser::SiteType) -> Self {
         let phase1_secs = match site {
             crate::browser::SiteType::DeepSeek => self.phase1_secs.max(30),
+            crate::browser::SiteType::Zai => self.phase1_secs.max(30),
             crate::browser::SiteType::Kimi
             | crate::browser::SiteType::Tongyi
             | crate::browser::SiteType::Claude => self.phase1_secs.max(20),
-            crate::browser::SiteType::Zai => self.phase1_secs,
             crate::browser::SiteType::Unknown => self.phase1_secs,
         };
         Self {
@@ -2105,7 +2113,7 @@ mod tests {
     #[test]
     fn test_timeout_config_default() {
         let config = TimeoutConfig::default();
-        assert_eq!(config.phase1_secs, 15);
+        assert_eq!(config.phase1_secs, 30);
         assert_eq!(config.phase2_secs, 60);
         assert_eq!(config.phase3_secs, 45);
         assert_eq!(config.stuck_threshold_secs, 180);
@@ -2123,8 +2131,8 @@ mod tests {
     #[test]
     fn test_timeout_config_from_timeout_secs() {
         let config = TimeoutConfig::from_timeout_secs(120);
-        // Phase 1: min(120, 30) = 30 (新消息通常很快出现)
-        assert_eq!(config.phase1_secs, 30);
+        // Phase 1: min(120, 60) = 60 (复杂 prompt 新消息出现可能需要更长时间)
+        assert_eq!(config.phase1_secs, 60);
         // Phase 2: 120 (AI 思考 + 实际回答, 深度思考模式需要更长时间)
         assert_eq!(config.phase2_secs, 120);
         // Phase 3: 45 (文本稳定性检测)
@@ -2418,14 +2426,22 @@ mod tests {
     // ===== 网站特定 Phase 1 超时测试 =====
 
     #[test]
-    fn test_for_site_type_zai_unchanged() {
-        // Z.ai Phase 1 超时应保持不变 (15s)
+    fn test_for_site_type_zai_increased() {
+        // Z.ai Phase 1 超时应至少 30s (端到端验证发现复杂 prompt 需要 >15s)
         let config = TimeoutConfig::new(15, 60, 45).with_stuck_threshold(180);
         let adjusted = config.for_site_type(crate::browser::SiteType::Zai);
-        assert_eq!(adjusted.phase1_secs, 15, "Z.ai Phase 1 应保持 15s");
+        assert_eq!(adjusted.phase1_secs, 30, "Z.ai Phase 1 应至少 30s");
         assert_eq!(adjusted.phase2_secs, 60);
         assert_eq!(adjusted.phase3_secs, 45);
         assert_eq!(adjusted.stuck_threshold_secs, 180);
+    }
+
+    #[test]
+    fn test_for_site_type_zai_already_high() {
+        // 如果 Phase 1 已经 > 30s, Z.ai 不应降低
+        let config = TimeoutConfig::new(60, 120, 45);
+        let adjusted = config.for_site_type(crate::browser::SiteType::Zai);
+        assert_eq!(adjusted.phase1_secs, 60, "已高于 30s 时应保持原值");
     }
 
     #[test]
@@ -2539,7 +2555,7 @@ mod tests {
     #[test]
     fn test_timeout_config_from_timeout_secs_zero() {
         let config = TimeoutConfig::from_timeout_secs(0);
-        // Phase 1: min(0, 30) = 0
+        // Phase 1: min(0, 60) = 0
         assert_eq!(config.phase1_secs, 0);
         // Phase 2: 0 (timeout_secs = 0)
         assert_eq!(config.phase2_secs, 0);
@@ -2611,7 +2627,7 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("TimeoutConfig"));
         assert!(debug_str.contains("phase1_secs"));
-        assert!(debug_str.contains("15"));
+        assert!(debug_str.contains("30"));
     }
 
     // ===== 多网站适配 — extract_last_response JS 逻辑验证 =====

@@ -1538,7 +1538,10 @@ where
              \"\"\"\n{}\n\"\"\"\n\n\
              请将这个目标拆解为 3-6 个开发阶段,每个阶段包含 1-4 个具体任务。\n\
              \n\
-             输出格式 (严格遵循):\n\
+             ⚠️ 重要: 此阶段 ONLY 输出 JSON 格式的开发计划,不要输出任何代码文件。\n\
+             不要使用 ```file:路径``` 格式,只输出 JSON。\n\
+             \n\
+             输出格式 (严格遵循,只输出 JSON,不要输出其他内容):\n\
              ```json\n\
              [\n\
                {{\n\
@@ -1694,6 +1697,14 @@ where
                     text[start..].to_string()
                 }
             } else {
+                // 检测 AI 是否返回了代码文件而非 JSON
+                if text.contains("file:") || text.contains("```rust") {
+                    warn!(
+                        "AI 返回了代码文件而非 JSON 阶段计划, 使用默认计划 (提示: 规划阶段应只输出 JSON)"
+                    );
+                } else {
+                    warn!("AI 未返回 JSON 格式的阶段计划, 使用默认计划");
+                }
                 return Ok(vec![]);
             }
         };
