@@ -85,7 +85,10 @@ pub use browser::{BrowserManager, ChatTab, SiteType};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
 pub use clarify::HeuristicClarificationChecker;
 pub use connection_monitor::{
-    ConnectionMonitor, ConnectionMonitorSummary, ConnectionStatus, MonitorConfig, RecoveryEvent,
+    calculate_monitor_success_rate, classify_connection_severity, compute_next_check_delay,
+    determine_health_level, format_monitor_success_rate, format_recovery_event_line, format_uptime,
+    is_chrome_crashed_status, should_trigger_recovery, ConnectionMonitor, ConnectionMonitorSummary,
+    ConnectionSeverity, ConnectionStatus, HealthLevel, MonitorConfig, RecoveryEvent,
 };
 pub use context_handoff::{
     build_phase_summary, build_task_summary, collect_completed_tasks,
