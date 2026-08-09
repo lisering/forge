@@ -87,7 +87,13 @@ pub use clarify::HeuristicClarificationChecker;
 pub use connection_monitor::{
     ConnectionMonitor, ConnectionMonitorSummary, ConnectionStatus, MonitorConfig, RecoveryEvent,
 };
-pub use context_handoff::ContextHandoff;
+pub use context_handoff::{
+    build_phase_summary, build_task_summary, collect_completed_tasks,
+    format_completed_tasks_section, format_error_code_badge, format_error_history_section,
+    format_known_issues_section, format_phase_section, format_recent_errors_section,
+    format_task_section, format_workspace_files_section, is_workspace_file_included,
+    should_trigger_handoff, truncate_text, ContextHandoff,
+};
 pub use dev_trace::{
     ActionStats, DevTraceEntry, DevTraceSummary, DevTraceWriter, TimelineEntry, TraceAction,
 };
