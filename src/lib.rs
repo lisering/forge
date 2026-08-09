@@ -102,7 +102,9 @@ pub use language::{
     detect_language, GoAdapter, MultiLanguageTestRunner, NodeAdapter, PythonAdapter, RustAdapter,
 };
 pub use llm_clarify::{
-    HybridClarificationChecker, LlmClarificationChecker, LlmClient, OllamaClient,
+    build_default_follow_up_message, build_judge_prompt_text, classify_llm_failure,
+    is_duplicate_question, parse_llm_judge_result, should_retry_llm, truncate_response,
+    HybridClarificationChecker, LlmClarificationChecker, LlmClient, LlmFailureType, OllamaClient,
 };
 pub use loop_detector::{ErrorRound, LoopDetector};
 pub use memory::{Memory, RequirementChange};
