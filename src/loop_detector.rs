@@ -27,7 +27,361 @@
 //! - 两者互补: 错误诊断关注"这个错误是什么", 循环终止关注"是否在重复犯同样的错误"
 
 use crate::testrunner::CompileError;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+// ============================================================================
+//  纯逻辑函数 — 可独立测试, 不依赖 LoopDetector 状态
+// ============================================================================
+
+/// 截断文本到指定字符数 (按 Unicode 字符, 非字节)
+///
+/// 用于错误签名截断、摘要显示等场景。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::truncate_text;
+/// assert_eq!(truncate_text("hello world", 5), "hello");
+/// assert_eq!(truncate_text("hi", 10), "hi"); // 短于 max_chars 不变
+/// assert_eq!(truncate_text("", 10), "");
+/// assert_eq!(truncate_text("你好世界", 2), "你好"); // UTF-8 安全
+/// ```
+pub fn truncate_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+/// 从 `CompileError` 生成错误签名 (error_code + 消息前 100 字符)
+///
+/// 签名用于跨轮次比较同一错误是否重复出现。
+/// 有 `error_code` 时格式为 `[CODE] message`, 无则直接使用消息。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::make_error_signature;
+/// # use forge::testrunner::CompileError;
+/// let err = CompileError {
+///     file: "src/main.rs".to_string(),
+///     line: Some(10),
+///     column: Some(5),
+///     message: "mismatched types".to_string(),
+///     error_code: Some("E0308".to_string()),
+/// };
+/// assert_eq!(make_error_signature(&err), "[E0308] mismatched types");
+/// ```
+pub fn make_error_signature(error: &CompileError) -> String {
+    let msg_part = truncate_text(&error.message, 100);
+    match &error.error_code {
+        Some(code) => format!("[{}] {}", code, msg_part),
+        None => msg_part,
+    }
+}
+
+/// 判断是否应进行循环检测 (guard check)
+///
+/// `max_repeats == 0` 时禁用检测; 轮次数少于 `max_repeats` 时数据不足。
+/// 只有两者均满足时才返回 `true`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::should_detect_loop;
+/// assert!(!should_detect_loop(0, 10));   // 禁用
+/// assert!(!should_detect_loop(3, 2));    // 轮次不足
+/// assert!(should_detect_loop(3, 3));     // 刚好
+/// assert!(should_detect_loop(3, 5));     // 超过
+/// ```
+pub fn should_detect_loop(max_repeats: usize, round_count: usize) -> bool {
+    max_repeats > 0 && round_count >= max_repeats
+}
+
+/// 检查是否有重复的错误码 (同一 `error_code` 出现 ≥ `max_repeats` 次)
+///
+/// 遍历所有轮次中的所有错误码 (排除 `None`),
+/// 统计每个码的出现次数, 任一码 ≥ `max_repeats` 即返回 `true`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::{has_any_repeated_codes, ErrorRound};
+/// let rounds = vec![
+///     ErrorRound { codes: vec![Some("E0308".into())], signatures: vec![], files: vec![] },
+///     ErrorRound { codes: vec![Some("E0308".into())], signatures: vec![], files: vec![] },
+///     ErrorRound { codes: vec![Some("E0308".into())], signatures: vec![], files: vec![] },
+/// ];
+/// assert!(has_any_repeated_codes(&rounds, 3));
+/// assert!(!has_any_repeated_codes(&rounds, 4));
+/// ```
+pub fn has_any_repeated_codes<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+    max_repeats: usize,
+) -> bool {
+    let counts = count_code_occurrences(rounds);
+    counts.values().any(|&c| c >= max_repeats)
+}
+
+/// 检查是否有重复的错误签名 (同一 `signature` 出现 ≥ `max_repeats` 次)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::{has_any_repeated_signatures, ErrorRound};
+/// let sig = "[E0308] error".to_string();
+/// let rounds = vec![
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+/// ];
+/// assert!(has_any_repeated_signatures(&rounds, 3));
+/// ```
+pub fn has_any_repeated_signatures<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+    max_repeats: usize,
+) -> bool {
+    let counts = count_signature_occurrences(rounds);
+    counts.values().any(|&c| c >= max_repeats)
+}
+
+/// 检查是否有重复的文件路径 (同一文件出现 ≥ `max_repeats` 次)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::{has_any_repeated_files, ErrorRound};
+/// let rounds = vec![
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+/// ];
+/// assert!(has_any_repeated_files(&rounds, 3));
+/// ```
+pub fn has_any_repeated_files<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+    max_repeats: usize,
+) -> bool {
+    let counts = count_file_occurrences(rounds);
+    counts.values().any(|&c| c >= max_repeats)
+}
+
+/// 收集出现次数 ≥ `max_repeats` 的错误签名及其计数
+///
+/// 返回 `(签名, 出现次数)` 列表, 按出现次数降序排列。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::{collect_repeated_signatures, ErrorRound};
+/// let sig = "[E0308] error".to_string();
+/// let rounds = vec![
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+///     ErrorRound { codes: vec![], signatures: vec![sig.clone()], files: vec![] },
+/// ];
+/// let repeated = collect_repeated_signatures(&rounds, 3);
+/// assert_eq!(repeated.len(), 1);
+/// assert_eq!(repeated[0].1, 3);
+/// ```
+pub fn collect_repeated_signatures<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+    max_repeats: usize,
+) -> Vec<(String, usize)> {
+    let counts = count_signature_occurrences(rounds);
+    let mut result: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter(|(_, c)| *c >= max_repeats)
+        .collect();
+    result.sort_by_key(|b| std::cmp::Reverse(b.1));
+    result
+}
+
+/// 收集出现次数 ≥ `max_repeats` 的文件路径及其计数
+///
+/// 返回 `(文件路径, 出现次数)` 列表, 按出现次数降序排列。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::{collect_repeated_files, ErrorRound};
+/// let rounds = vec![
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+///     ErrorRound { codes: vec![], signatures: vec![], files: vec!["src/main.rs".into()] },
+/// ];
+/// let repeated = collect_repeated_files(&rounds, 3);
+/// assert_eq!(repeated.len(), 1);
+/// assert_eq!(repeated[0].0, "src/main.rs");
+/// assert_eq!(repeated[0].1, 3);
+/// ```
+pub fn collect_repeated_files<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+    max_repeats: usize,
+) -> Vec<(String, usize)> {
+    let counts = count_file_occurrences(rounds);
+    let mut result: Vec<(String, usize)> = counts
+        .into_iter()
+        .filter(|(_, c)| *c >= max_repeats)
+        .collect();
+    result.sort_by_key(|b| std::cmp::Reverse(b.1));
+    result
+}
+
+/// 格式化重复错误摘要文本
+///
+/// 优先展示重复的签名, 无签名时回退到文件, 两者皆无则返回默认提示。
+/// 每条签名截断到 150 字符以避免 prompt 过长。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::format_repeated_summary;
+/// let sigs = vec![("[E0308] mismatched types".into(), 3usize)];
+/// let files = vec![];
+/// let summary = format_repeated_summary(&sigs, &files);
+/// assert!(summary.contains("mismatched types"));
+/// assert!(summary.contains("3 次"));
+/// ```
+pub fn format_repeated_summary(
+    repeated_sigs: &[(String, usize)],
+    repeated_files: &[(String, usize)],
+) -> String {
+    if !repeated_sigs.is_empty() {
+        let summaries: Vec<String> = repeated_sigs
+            .iter()
+            .map(|(sig, count)| {
+                let display = truncate_text(sig, 150);
+                format!("  - {} (出现 {} 次)", display, count)
+            })
+            .collect();
+        summaries.join("\n")
+    } else if !repeated_files.is_empty() {
+        let summaries: Vec<String> = repeated_files
+            .iter()
+            .map(|(file, count)| format!("  - 文件 {} 出现错误 {} 次", file, count))
+            .collect();
+        summaries.join("\n")
+    } else {
+        "(无法提取具体错误摘要)".to_string()
+    }
+}
+
+/// 构建"换方法"策略 prompt 文本
+///
+/// 首次检测到死循环时调用, 提示 AI 换一种完全不同的方法。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::build_strategy_change_prompt_text;
+/// let prompt = build_strategy_change_prompt_text(3, "  - [E0308] error (出现 3 次)");
+/// assert!(prompt.contains("循环终止检测"));
+/// assert!(prompt.contains("换一种完全不同的方法"));
+/// assert!(prompt.contains("3 次"));
+/// ```
+pub fn build_strategy_change_prompt_text(max_repeats: usize, repeated_summary: &str) -> String {
+    format!(
+        "⚠️ 循环终止检测: 检测到修复死循环\n\
+         \n\
+         以下错误已连续出现 {n} 次, 说明当前修复策略无效:\n\
+         {repeated}\n\
+         \n\
+         🔧 策略改变要求:\n\
+         - 你之前的修复方法没有解决问题, 请换一种完全不同的方法\n\
+         - 重新审视问题的根因, 而非在原有代码上微调\n\
+         - 考虑: 重构相关代码结构、使用不同的数据类型/算法、检查依赖关系\n\
+         - 如果是类型错误, 考虑重新设计接口签名\n\
+         - 如果是借用错误, 考虑改变所有权结构或使用 clone\n\
+         - 如果是导入错误, 检查模块组织是否合理\n\
+         \n\
+         请用全新的方法修复这些错误, 用 ```file:路径``` 格式输出完整文件。",
+        n = max_repeats,
+        repeated = repeated_summary,
+    )
+}
+
+/// 构建"建议跳过"策略 prompt 文本
+///
+/// 策略改变后仍然死循环时调用, 建议跳过当前任务。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::build_skip_prompt_text;
+/// let prompt = build_skip_prompt_text(3);
+/// assert!(prompt.contains("跳过"));
+/// assert!(prompt.contains("3 次"));
+/// ```
+pub fn build_skip_prompt_text(max_repeats: usize) -> String {
+    format!(
+        "🛑 循环终止检测: 策略改变后仍然死循环\n\
+         \n\
+         已经尝试了换方法但同样的错误仍然反复出现 ({n} 次)。\n\
+         当前任务可能需要人工介入或更多上下文才能解决。\n\
+         建议跳过当前任务, 避免继续浪费修复轮次。\n\
+         \n\
+         请输出当前最佳尝试的代码, 我们将标记此任务为未完全通过。",
+        n = max_repeats,
+    )
+}
+
+/// 判断是否应该跳过当前任务
+///
+/// 策略已改变 (`strategy_changed == true`) 且仍然在死循环 (`is_looping == true`) 时返回 `true`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::loop_detector::should_skip_task;
+/// assert!(should_skip_task(true, true));
+/// assert!(!should_skip_task(true, false));
+/// assert!(!should_skip_task(false, true));
+/// assert!(!should_skip_task(false, false));
+/// ```
+pub fn should_skip_task(strategy_changed: bool, is_looping: bool) -> bool {
+    strategy_changed && is_looping
+}
+
+// ============================================================================
+//  内部辅助 — 计数函数 (纯逻辑, 不导出)
+// ============================================================================
+
+/// 统计所有轮次中各 error_code 的出现次数 (排除 None)
+fn count_code_occurrences<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for round in rounds {
+        for c in round.codes.iter().flatten() {
+            *counts.entry(c.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// 统计所有轮次中各签名的出现次数
+fn count_signature_occurrences<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for round in rounds {
+        for sig in &round.signatures {
+            *counts.entry(sig.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// 统计所有轮次中各文件路径的出现次数
+fn count_file_occurrences<'a>(
+    rounds: impl IntoIterator<Item = &'a ErrorRound>,
+) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for round in rounds {
+        for file in &round.files {
+            *counts.entry(file.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
 
 // ============================================================================
 //  ErrorRound — 一轮修复失败的错误记录
@@ -51,21 +405,12 @@ impl ErrorRound {
     /// 从编译错误列表构建一轮记录
     pub fn from_errors(errors: &[CompileError]) -> Self {
         let codes = errors.iter().map(|e| e.error_code.clone()).collect();
-        let signatures = errors.iter().map(Self::make_signature).collect();
+        let signatures = errors.iter().map(make_error_signature).collect();
         let files = errors.iter().map(|e| e.file.clone()).collect();
         Self {
             codes,
             signatures,
             files,
-        }
-    }
-
-    /// 生成错误签名 (error_code + 消息前 100 字符)
-    fn make_signature(error: &CompileError) -> String {
-        let msg_part: String = error.message.chars().take(100).collect();
-        match &error.error_code {
-            Some(code) => format!("[{}] {}", code, msg_part),
-            None => msg_part,
         }
     }
 }
@@ -132,70 +477,26 @@ impl LoopDetector {
     /// 任一维度满足即判定为死循环。
     /// `max_repeats == 0` 或轮次数 < max_repeats 时返回 false。
     pub fn is_looping(&self) -> bool {
-        if self.max_repeats == 0 || self.rounds.len() < self.max_repeats {
+        if !should_detect_loop(self.max_repeats, self.rounds.len()) {
             return false;
         }
 
         // 维度 1: 错误码重复
-        if self.has_repeated_codes() {
+        if has_any_repeated_codes(&self.rounds, self.max_repeats) {
             return true;
         }
 
         // 维度 2: 消息签名重复
-        if self.has_repeated_signatures() {
+        if has_any_repeated_signatures(&self.rounds, self.max_repeats) {
             return true;
         }
 
         // 维度 3: 错误文件重复
-        if self.has_repeated_files() {
+        if has_any_repeated_files(&self.rounds, self.max_repeats) {
             return true;
         }
 
         false
-    }
-
-    /// 检查是否有重复的 error_code
-    fn has_repeated_codes(&self) -> bool {
-        // 收集所有 error_code (排除 None)
-        let mut code_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-
-        for round in &self.rounds {
-            for c in round.codes.iter().flatten() {
-                *code_counts.entry(c.as_str()).or_insert(0) += 1;
-            }
-        }
-
-        // 检查是否有任何 error_code 出现 >= max_repeats 次
-        code_counts.values().any(|&count| count >= self.max_repeats)
-    }
-
-    /// 检查是否有重复的消息签名
-    fn has_repeated_signatures(&self) -> bool {
-        let mut sig_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-
-        for round in &self.rounds {
-            for sig in &round.signatures {
-                *sig_counts.entry(sig.as_str()).or_insert(0) += 1;
-            }
-        }
-
-        sig_counts.values().any(|&count| count >= self.max_repeats)
-    }
-
-    /// 检查是否有重复的文件路径
-    fn has_repeated_files(&self) -> bool {
-        let mut file_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-
-        for round in &self.rounds {
-            for file in &round.files {
-                *file_counts.entry(file.as_str()).or_insert(0) += 1;
-            }
-        }
-
-        file_counts.values().any(|&count| count >= self.max_repeats)
     }
 
     /// 生成策略改变 prompt
@@ -206,10 +507,11 @@ impl LoopDetector {
         if !self.strategy_changed {
             // 首次: 建议换方法
             self.strategy_changed = true;
-            self.build_strategy_change_prompt()
+            let repeated = self.get_repeated_errors_summary();
+            build_strategy_change_prompt_text(self.max_repeats, &repeated)
         } else {
             // 二次: 建议跳过
-            self.build_skip_prompt()
+            build_skip_prompt_text(self.max_repeats)
         }
     }
 
@@ -217,89 +519,14 @@ impl LoopDetector {
     ///
     /// 策略已改变且仍然在死循环时返回 true。
     pub fn should_skip(&self) -> bool {
-        self.strategy_changed && self.is_looping()
-    }
-
-    /// 构建"换方法"策略 prompt
-    fn build_strategy_change_prompt(&self) -> String {
-        // 收集重复的错误摘要
-        let repeated = self.get_repeated_errors_summary();
-
-        format!(
-            "⚠️ 循环终止检测: 检测到修复死循环\n\
-             \n\
-             以下错误已连续出现 {n} 次, 说明当前修复策略无效:\n\
-             {repeated}\n\
-             \n\
-             🔧 策略改变要求:\n\
-             - 你之前的修复方法没有解决问题, 请换一种完全不同的方法\n\
-             - 重新审视问题的根因, 而非在原有代码上微调\n\
-             - 考虑: 重构相关代码结构、使用不同的数据类型/算法、检查依赖关系\n\
-             - 如果是类型错误, 考虑重新设计接口签名\n\
-             - 如果是借用错误, 考虑改变所有权结构或使用 clone\n\
-             - 如果是导入错误, 检查模块组织是否合理\n\
-             \n\
-             请用全新的方法修复这些错误, 用 ```file:路径``` 格式输出完整文件。",
-            n = self.max_repeats,
-            repeated = repeated,
-        )
-    }
-
-    /// 构建"建议跳过"策略 prompt
-    fn build_skip_prompt(&self) -> String {
-        format!(
-            "🛑 循环终止检测: 策略改变后仍然死循环\n\
-             \n\
-             已经尝试了换方法但同样的错误仍然反复出现 ({n} 次)。\n\
-             当前任务可能需要人工介入或更多上下文才能解决。\n\
-             建议跳过当前任务, 避免继续浪费修复轮次。\n\
-             \n\
-             请输出当前最佳尝试的代码, 我们将标记此任务为未完全通过。",
-            n = self.max_repeats,
-        )
+        should_skip_task(self.strategy_changed, self.is_looping())
     }
 
     /// 获取重复错误的摘要文本
     fn get_repeated_errors_summary(&self) -> String {
-        let mut summaries = Vec::new();
-
-        // 检查重复的签名
-        let mut sig_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for round in &self.rounds {
-            for sig in &round.signatures {
-                *sig_counts.entry(sig.as_str()).or_insert(0) += 1;
-            }
-        }
-
-        for (sig, count) in sig_counts.iter() {
-            if *count >= self.max_repeats {
-                let display: String = sig.chars().take(150).collect();
-                summaries.push(format!("  - {} (出现 {} 次)", display, count));
-            }
-        }
-
-        if summaries.is_empty() {
-            // 检查重复的文件
-            let mut file_counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for round in &self.rounds {
-                for file in &round.files {
-                    *file_counts.entry(file.as_str()).or_insert(0) += 1;
-                }
-            }
-            for (file, count) in file_counts.iter() {
-                if *count >= self.max_repeats {
-                    summaries.push(format!("  - 文件 {} 出现错误 {} 次", file, count));
-                }
-            }
-        }
-
-        if summaries.is_empty() {
-            "(无法提取具体错误摘要)".to_string()
-        } else {
-            summaries.join("\n")
-        }
+        let repeated_sigs = collect_repeated_signatures(&self.rounds, self.max_repeats);
+        let repeated_files = collect_repeated_files(&self.rounds, self.max_repeats);
+        format_repeated_summary(&repeated_sigs, &repeated_files)
     }
 
     /// 重置检测器 (任务完成后调用)
@@ -814,6 +1041,732 @@ mod tests {
 
         detector.record_errors(&[make_error(Some("E0308"), "e2", "f.rs")]);
         assert_eq!(detector.round_count(), 2);
+    }
+
+    // ===== 纯逻辑函数测试 =====
+
+    // --- truncate_text ---
+
+    #[test]
+    fn test_truncate_text_normal() {
+        assert_eq!(truncate_text("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_text_shorter_than_max() {
+        assert_eq!(truncate_text("hi", 10), "hi");
+    }
+
+    #[test]
+    fn test_truncate_text_empty() {
+        assert_eq!(truncate_text("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_text_zero_max() {
+        assert_eq!(truncate_text("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_text_utf8_multibyte() {
+        assert_eq!(truncate_text("你好世界", 2), "你好");
+    }
+
+    #[test]
+    fn test_truncate_text_exact_length() {
+        assert_eq!(truncate_text("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_text_single_char() {
+        assert_eq!(truncate_text("A", 1), "A");
+    }
+
+    // --- make_error_signature ---
+
+    #[test]
+    fn test_make_error_signature_with_code() {
+        let err = make_error(Some("E0308"), "mismatched types", "src/main.rs");
+        assert_eq!(make_error_signature(&err), "[E0308] mismatched types");
+    }
+
+    #[test]
+    fn test_make_error_signature_without_code() {
+        let err = make_error(None, "cannot borrow `x`", "src/main.rs");
+        assert_eq!(make_error_signature(&err), "cannot borrow `x`");
+    }
+
+    #[test]
+    fn test_make_error_signature_long_message_truncated() {
+        let long_msg = "x".repeat(200);
+        let err = make_error(Some("E0308"), &long_msg, "src/main.rs");
+        let expected_msg: String = "x".repeat(100);
+        assert_eq!(
+            make_error_signature(&err),
+            format!("[E0308] {}", expected_msg)
+        );
+    }
+
+    #[test]
+    fn test_make_error_signature_empty_message() {
+        let err = make_error(Some("E0308"), "", "src/main.rs");
+        assert_eq!(make_error_signature(&err), "[E0308] ");
+    }
+
+    #[test]
+    fn test_make_error_signature_empty_message_no_code() {
+        let err = make_error(None, "", "src/main.rs");
+        assert_eq!(make_error_signature(&err), "");
+    }
+
+    #[test]
+    fn test_make_error_signature_utf8_message() {
+        let err = make_error(Some("E0308"), "类型不匹配", "src/main.rs");
+        assert_eq!(make_error_signature(&err), "[E0308] 类型不匹配");
+    }
+
+    // --- should_detect_loop ---
+
+    #[test]
+    fn test_should_detect_loop_disabled() {
+        assert!(!should_detect_loop(0, 10));
+    }
+
+    #[test]
+    fn test_should_detect_loop_insufficient_rounds() {
+        assert!(!should_detect_loop(3, 2));
+    }
+
+    #[test]
+    fn test_should_detect_loop_exact_match() {
+        assert!(should_detect_loop(3, 3));
+    }
+
+    #[test]
+    fn test_should_detect_loop_more_than_enough() {
+        assert!(should_detect_loop(3, 5));
+    }
+
+    #[test]
+    fn test_should_detect_loop_both_zero() {
+        assert!(!should_detect_loop(0, 0));
+    }
+
+    #[test]
+    fn test_should_detect_loop_one_round() {
+        assert!(should_detect_loop(1, 1));
+        assert!(!should_detect_loop(1, 0));
+    }
+
+    // --- has_any_repeated_codes ---
+
+    #[test]
+    fn test_has_any_repeated_codes_empty_rounds() {
+        assert!(!has_any_repeated_codes(&[], 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_true() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        assert!(has_any_repeated_codes(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_false_different_codes() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0382".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0425".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        assert!(!has_any_repeated_codes(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_none_codes_excluded() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![None],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![None],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![None],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        assert!(!has_any_repeated_codes(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_multiple_errors_per_round() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![Some("E0308".into()), Some("E0382".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        // E0308 appears 2 times → threshold 2 → true
+        assert!(has_any_repeated_codes(&rounds, 2));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_mixed_none_and_some() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![None, Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0308".into()), None],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        assert!(has_any_repeated_codes(&rounds, 2));
+    }
+
+    #[test]
+    fn test_has_any_repeated_codes_threshold_not_met() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![Some("E0308".into())],
+                signatures: vec![],
+                files: vec![],
+            },
+        ];
+        assert!(!has_any_repeated_codes(&rounds, 3));
+    }
+
+    // --- has_any_repeated_signatures ---
+
+    #[test]
+    fn test_has_any_repeated_signatures_empty() {
+        assert!(!has_any_repeated_signatures(&[], 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_signatures_true() {
+        let sig = "[E0308] error".to_string();
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+        ];
+        assert!(has_any_repeated_signatures(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_signatures_false_different_sigs() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec!["sig A".into()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec!["sig B".into()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec!["sig C".into()],
+                files: vec![],
+            },
+        ];
+        assert!(!has_any_repeated_signatures(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_signatures_multiple_sigs_per_round() {
+        let sig = "common sig".to_string();
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone(), "other".into()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+        ];
+        assert!(has_any_repeated_signatures(&rounds, 2));
+    }
+
+    // --- has_any_repeated_files ---
+
+    #[test]
+    fn test_has_any_repeated_files_empty() {
+        assert!(!has_any_repeated_files(&[], 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_files_true() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+        ];
+        assert!(has_any_repeated_files(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_files_false_different_files() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/lib.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/utils.rs".into()],
+            },
+        ];
+        assert!(!has_any_repeated_files(&rounds, 3));
+    }
+
+    #[test]
+    fn test_has_any_repeated_files_multiple_files_per_round() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+        ];
+        assert!(has_any_repeated_files(&rounds, 2));
+    }
+
+    // --- collect_repeated_signatures ---
+
+    #[test]
+    fn test_collect_repeated_signatures_empty() {
+        assert!(collect_repeated_signatures(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn test_collect_repeated_signatures_no_repeats() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec!["sig A".into()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec!["sig B".into()],
+                files: vec![],
+            },
+        ];
+        assert!(collect_repeated_signatures(&rounds, 3).is_empty());
+    }
+
+    #[test]
+    fn test_collect_repeated_signatures_one_repeat() {
+        let sig = "[E0308] error".to_string();
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig.clone()],
+                files: vec![],
+            },
+        ];
+        let result = collect_repeated_signatures(&rounds, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "[E0308] error");
+        assert_eq!(result[0].1, 3);
+    }
+
+    #[test]
+    fn test_collect_repeated_signatures_multiple_repeats() {
+        let sig_a = "[E0308] error A".to_string();
+        let sig_b = "[E0382] error B".to_string();
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_a.clone(), sig_b.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_a.clone(), sig_b.clone()],
+                files: vec![],
+            },
+        ];
+        let result = collect_repeated_signatures(&rounds, 2);
+        assert_eq!(result.len(), 2);
+        // Both have count 2; order between them is non-deterministic by sort
+        // since both have count 2, but both should be present
+        let sigs: Vec<&str> = result.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(sigs.contains(&"[E0308] error A"));
+        assert!(sigs.contains(&"[E0382] error B"));
+    }
+
+    #[test]
+    fn test_collect_repeated_signatures_sorted_by_count_desc() {
+        let sig_a = "frequent".to_string();
+        let sig_b = "rare".to_string();
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_a.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_a.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_a.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_b.clone()],
+                files: vec![],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![sig_b.clone()],
+                files: vec![],
+            },
+        ];
+        let result = collect_repeated_signatures(&rounds, 2);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, "frequent");
+        assert_eq!(result[0].1, 3);
+        assert_eq!(result[1].0, "rare");
+        assert_eq!(result[1].1, 2);
+    }
+
+    // --- collect_repeated_files ---
+
+    #[test]
+    fn test_collect_repeated_files_empty() {
+        assert!(collect_repeated_files(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn test_collect_repeated_files_no_repeats() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/lib.rs".into()],
+            },
+        ];
+        assert!(collect_repeated_files(&rounds, 3).is_empty());
+    }
+
+    #[test]
+    fn test_collect_repeated_files_one_repeat() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into()],
+            },
+        ];
+        let result = collect_repeated_files(&rounds, 3);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "src/main.rs");
+        assert_eq!(result[0].1, 3);
+    }
+
+    #[test]
+    fn test_collect_repeated_files_multiple_repeats() {
+        let rounds = vec![
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            },
+            ErrorRound {
+                codes: vec![],
+                signatures: vec![],
+                files: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            },
+        ];
+        let result = collect_repeated_files(&rounds, 2);
+        assert_eq!(result.len(), 2);
+        let files: Vec<&str> = result.iter().map(|(f, _)| f.as_str()).collect();
+        assert!(files.contains(&"src/main.rs"));
+        assert!(files.contains(&"src/lib.rs"));
+    }
+
+    // --- format_repeated_summary ---
+
+    #[test]
+    fn test_format_repeated_summary_with_signatures() {
+        let sigs = vec![("[E0308] mismatched types".into(), 3usize)];
+        let files: Vec<(String, usize)> = vec![];
+        let summary = format_repeated_summary(&sigs, &files);
+        assert!(summary.contains("[E0308] mismatched types"));
+        assert!(summary.contains("3 次"));
+    }
+
+    #[test]
+    fn test_format_repeated_summary_fallback_to_files() {
+        let sigs: Vec<(String, usize)> = vec![];
+        let files = vec![("src/main.rs".into(), 3usize)];
+        let summary = format_repeated_summary(&sigs, &files);
+        assert!(summary.contains("src/main.rs"));
+        assert!(summary.contains("3 次"));
+        assert!(summary.contains("文件"));
+    }
+
+    #[test]
+    fn test_format_repeated_summary_both_empty() {
+        let summary = format_repeated_summary(&[], &[]);
+        assert_eq!(summary, "(无法提取具体错误摘要)");
+    }
+
+    #[test]
+    fn test_format_repeated_summary_signatures_take_priority() {
+        let sigs = vec![("[E0308] sig".into(), 3usize)];
+        let files = vec![("src/main.rs".into(), 3usize)];
+        let summary = format_repeated_summary(&sigs, &files);
+        assert!(summary.contains("[E0308] sig"));
+        assert!(!summary.contains("文件")); // files should not appear when sigs present
+    }
+
+    #[test]
+    fn test_format_repeated_summary_multiple_signatures() {
+        let sigs = vec![
+            ("[E0308] error A".into(), 3usize),
+            ("[E0382] error B".into(), 3usize),
+        ];
+        let summary = format_repeated_summary(&sigs, &[]);
+        assert!(summary.contains("error A"));
+        assert!(summary.contains("error B"));
+        assert!(summary.contains('\n')); // multiple entries joined by newline
+    }
+
+    #[test]
+    fn test_format_repeated_summary_truncates_long_signature() {
+        let long_sig = "x".repeat(200);
+        let sigs = vec![(long_sig, 3usize)];
+        let summary = format_repeated_summary(&sigs, &[]);
+        // Should be truncated to 150 chars in the display
+        let display_part: String = summary.chars().filter(|c| *c == 'x').collect();
+        assert_eq!(display_part.chars().count(), 150);
+    }
+
+    #[test]
+    fn test_format_repeated_summary_multiple_files() {
+        let files = vec![
+            ("src/main.rs".into(), 3usize),
+            ("src/lib.rs".into(), 3usize),
+        ];
+        let summary = format_repeated_summary(&[], &files);
+        assert!(summary.contains("src/main.rs"));
+        assert!(summary.contains("src/lib.rs"));
+        assert!(summary.contains('\n'));
+    }
+
+    // --- build_strategy_change_prompt_text ---
+
+    #[test]
+    fn test_build_strategy_change_prompt_text_basic() {
+        let prompt = build_strategy_change_prompt_text(3, "  - [E0308] error (出现 3 次)");
+        assert!(prompt.contains("循环终止检测"));
+        assert!(prompt.contains("换一种完全不同的方法"));
+        assert!(prompt.contains("[E0308] error"));
+        assert!(prompt.contains("3 次"));
+    }
+
+    #[test]
+    fn test_build_strategy_change_prompt_text_empty_summary() {
+        let prompt = build_strategy_change_prompt_text(2, "(无法提取具体错误摘要)");
+        assert!(prompt.contains("2 次"));
+        assert!(prompt.contains("无法提取"));
+    }
+
+    #[test]
+    fn test_build_strategy_change_prompt_text_max_repeats_one() {
+        let prompt = build_strategy_change_prompt_text(1, "  - error (出现 1 次)");
+        assert!(prompt.contains("1 次"));
+    }
+
+    #[test]
+    fn test_build_strategy_change_prompt_text_contains_strategy_options() {
+        let prompt = build_strategy_change_prompt_text(3, "");
+        assert!(prompt.contains("重构"));
+        assert!(prompt.contains("数据类型"));
+        assert!(prompt.contains("借用错误"));
+        assert!(prompt.contains("导入错误"));
+    }
+
+    #[test]
+    fn test_build_strategy_change_prompt_text_contains_file_format_instruction() {
+        let prompt = build_strategy_change_prompt_text(3, "");
+        assert!(prompt.contains("file:路径"));
+    }
+
+    // --- build_skip_prompt_text ---
+
+    #[test]
+    fn test_build_skip_prompt_text_basic() {
+        let prompt = build_skip_prompt_text(3);
+        assert!(prompt.contains("跳过"));
+        assert!(prompt.contains("3 次"));
+    }
+
+    #[test]
+    fn test_build_skip_prompt_text_max_repeats_one() {
+        let prompt = build_skip_prompt_text(1);
+        assert!(prompt.contains("1 次"));
+    }
+
+    #[test]
+    fn test_build_skip_prompt_text_max_repeats_large() {
+        let prompt = build_skip_prompt_text(100);
+        assert!(prompt.contains("100 次"));
+    }
+
+    #[test]
+    fn test_build_skip_prompt_text_contains_human_intervention() {
+        let prompt = build_skip_prompt_text(3);
+        assert!(prompt.contains("人工介入") || prompt.contains("上下文"));
+    }
+
+    #[test]
+    fn test_build_skip_prompt_text_contains_best_attempt_instruction() {
+        let prompt = build_skip_prompt_text(3);
+        assert!(prompt.contains("最佳尝试"));
+    }
+
+    // --- should_skip_task ---
+
+    #[test]
+    fn test_should_skip_task_true() {
+        assert!(should_skip_task(true, true));
+    }
+
+    #[test]
+    fn test_should_skip_task_false_strategy_not_changed() {
+        assert!(!should_skip_task(false, true));
+    }
+
+    #[test]
+    fn test_should_skip_task_false_not_looping() {
+        assert!(!should_skip_task(true, false));
+    }
+
+    #[test]
+    fn test_should_skip_task_false_both_false() {
+        assert!(!should_skip_task(false, false));
     }
 
     // ===== 集成场景测试 =====

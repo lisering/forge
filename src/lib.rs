@@ -112,7 +112,12 @@ pub use llm_clarify::{
     is_duplicate_question, parse_llm_judge_result, should_retry_llm, truncate_response,
     HybridClarificationChecker, LlmClarificationChecker, LlmClient, LlmFailureType, OllamaClient,
 };
-pub use loop_detector::{ErrorRound, LoopDetector};
+pub use loop_detector::{
+    build_skip_prompt_text, build_strategy_change_prompt_text, collect_repeated_files,
+    collect_repeated_signatures, format_repeated_summary, has_any_repeated_codes,
+    has_any_repeated_files, has_any_repeated_signatures, make_error_signature, should_detect_loop,
+    should_skip_task, ErrorRound, LoopDetector,
+};
 pub use memory::{Memory, RequirementChange};
 pub use orchestrator::Orchestrator;
 pub use prompt_builder::SystemPrompt;
