@@ -120,11 +120,7 @@ impl CdpSession {
             *msg_id
         };
 
-        let command = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
+        let command = build_command(id, method, params);
 
         let (tx, rx) = oneshot::channel();
         {
@@ -147,12 +143,7 @@ impl CdpSession {
             .map_err(|_| anyhow!("CDP 命令超时 (30s): {}", method))?
             .map_err(|_| anyhow!("CDP 响应通道关闭"))?;
 
-        // 检查错误
-        if let Some(error) = result.get("error") {
-            bail!("CDP 命令失败: {} - {}", method, error);
-        }
-
-        Ok(result.get("result").cloned().unwrap_or(Value::Null))
+        extract_result(&result, method)
     }
 
     /// 在页面中执行 JavaScript 并返回结果
@@ -168,28 +159,13 @@ impl CdpSession {
             )
             .await?;
 
-        // 检查异常
-        if let Some(exception) = result.get("exceptionDetails") {
-            bail!("JS 执行异常: {}", exception);
-        }
-
-        let value = result
-            .get("result")
-            .and_then(|r| r.get("value"))
-            .cloned()
-            .unwrap_or(Value::Null);
-
-        Ok(value)
+        extract_evaluate_value(&result)
     }
 
     /// 在页面中执行 JavaScript,返回字符串结果
     pub async fn evaluate_string(&self, expression: &str) -> Result<String> {
         let value = self.evaluate(expression).await?;
-        match value {
-            Value::String(s) => Ok(s),
-            Value::Null => Ok(String::new()),
-            other => Ok(other.to_string()),
-        }
+        Ok(value_to_string(value))
     }
 
     /// 在页面中执行 JavaScript,返回可能很长的字符串结果 (分块提取)
@@ -211,28 +187,20 @@ impl CdpSession {
         let first_try = self.evaluate_string(expression).await?;
 
         // 如果结果较短, 直接返回
-        if first_try.len() < CHUNK_SIZE {
+        if !needs_chunking(first_try.len(), CHUNK_SIZE) {
             return Ok(first_try);
         }
 
         // 结果较长, 可能被截断 — 使用分块提取
         // 1. 先获取真实长度
-        let length_js = format!(
-            "(() => {{ let r = ({}); return r ? r.length : 0; }})()",
-            expression
-        );
+        let length_js = build_length_js(expression);
         let total_len = self
             .evaluate_string(&length_js)
             .await?
             .parse::<usize>()
             .unwrap_or(0);
 
-        if total_len == 0 {
-            return Ok(first_try);
-        }
-
-        // 2. 如果真实长度 <= first_try 长度, 说明没截断
-        if total_len <= first_try.len() {
+        if is_result_complete(total_len, first_try.len()) {
             return Ok(first_try);
         }
 
@@ -246,10 +214,7 @@ impl CdpSession {
         let mut offset = 0usize;
         while offset < total_len {
             let end = (offset + CHUNK_SIZE).min(total_len);
-            let chunk_js = format!(
-                "(() => {{ let r = ({}); return r ? r.substring({}, {}) : ''; }})()",
-                expression, offset, end
-            );
+            let chunk_js = build_chunk_js(expression, offset, end);
             let chunk = self.evaluate_string(&chunk_js).await?;
             if chunk.is_empty() {
                 warn!("分块提取: 块 {}-{} 返回空, 停止", offset, end);
@@ -291,7 +256,7 @@ impl CdpSession {
         .await?;
 
         // char (for printable keys)
-        if key.len() == 1 {
+        if is_printable_key(key) {
             self.send_command(
                 "Input.dispatchKeyEvent",
                 json!({
@@ -351,11 +316,7 @@ impl CdpSession {
 
     /// 通过 CDP 聚焦元素
     pub async fn focus(&self, selector: &str) -> Result<()> {
-        self.evaluate(&format!(
-            "document.querySelector('{}')?.focus()",
-            selector.replace('\'', "\\'")
-        ))
-        .await?;
+        self.evaluate(&build_focus_js(selector)).await?;
         Ok(())
     }
 
@@ -385,11 +346,7 @@ impl CdpSession {
         let doc_result = self
             .send_command("DOM.getDocument", json!({ "depth": 0 }))
             .await?;
-        let root_node_id = doc_result
-            .get("root")
-            .and_then(|r| r.get("nodeId"))
-            .and_then(|n| n.as_u64())
-            .ok_or_else(|| anyhow!("无法获取文档根节点 nodeId"))? as i64;
+        let root_node_id = extract_root_node_id(&doc_result)?;
 
         // 3. 查找文件输入元素
         let query_result = self
@@ -402,11 +359,7 @@ impl CdpSession {
             )
             .await?;
 
-        let node_id = query_result
-            .get("nodeId")
-            .and_then(|n| n.as_u64())
-            .ok_or_else(|| anyhow!("无法找到文件输入元素: {}", selector))?
-            as i64;
+        let node_id = extract_node_id(&query_result, &format!("无法找到文件输入元素: {}", selector))?;
 
         if node_id == 0 {
             bail!("文件输入元素不存在: {}", selector);
@@ -426,19 +379,7 @@ impl CdpSession {
         .await?;
 
         // 6. 触发 change 事件 (通知 Svelte/React 等框架)
-        self.evaluate(&format!(
-            r#"
-            (() => {{
-                let input = document.querySelector('{}');
-                if (input) {{
-                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                }}
-            }})()
-            "#,
-            selector.replace('\'', "\\'")
-        ))
-        .await?;
+        self.evaluate(&build_file_change_js(selector)).await?;
 
         debug!("文件上传完成: {} 个文件 -> {}", files.len(), selector);
         Ok(())
@@ -459,21 +400,10 @@ impl CdpSession {
             }
 
             let result = self
-                .evaluate(&format!(
-                    "(() => {{ try {{ return {}; }} catch(e) {{ return false; }} }})()",
-                    condition_js
-                ))
+                .evaluate(&build_condition_js(condition_js))
                 .await?;
 
-            let is_true = match &result {
-                Value::Bool(b) => *b,
-                Value::String(s) => !s.is_empty(),
-                Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                Value::Null => false,
-                _ => true,
-            };
-
-            if is_true {
+            if value_as_bool(&result) {
                 return Ok(());
             }
 
@@ -663,21 +593,14 @@ pub async fn create_tab(port: u16, url: &str) -> Result<TabInfo> {
     // 先获取 browser 的 ws url
     let version_url = format!("http://localhost:{}/json/version", port);
     let resp: serde_json::Value = reqwest::get(&version_url).await?.json().await?;
-    let browser_ws = resp
-        .get("webSocketDebuggerUrl")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("无法获取 browser WebSocket URL"))?;
+    let browser_ws = extract_browser_ws_url(&resp)?;
 
     // 连接 browser ws
     let (ws_stream, _) = connect_async(browser_ws).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // 发 Target.createTarget
-    let cmd = serde_json::json!({
-        "id": 1,
-        "method": "Target.createTarget",
-        "params": { "url": url }
-    });
+    let cmd = build_command(1, "Target.createTarget", json!({ "url": url }));
     write.send(Message::Text(cmd.to_string())).await?;
 
     // 读响应
@@ -685,11 +608,7 @@ pub async fn create_tab(port: u16, url: &str) -> Result<TabInfo> {
         if let Ok(Message::Text(text)) = msg {
             let v: serde_json::Value = serde_json::from_str(&text)?;
             if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
-                let target_id = v
-                    .get("result")
-                    .and_then(|r| r.get("targetId"))
-                    .and_then(|t| t.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("无法获取 targetId"))?;
+                let target_id = extract_target_id(&v)?;
 
                 // 获取新标签页信息
                 let tabs = discover_tabs(port).await?;
