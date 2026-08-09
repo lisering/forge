@@ -33,7 +33,7 @@ use tracing::debug;
 // ============================================================================
 
 /// 存储后端类型
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageBackend {
     /// JSONL 文件存储 (默认, 每行一个 JSON 对象)
     #[default]
@@ -53,6 +53,26 @@ impl std::fmt::Display for StorageBackend {
             Self::Json => write!(f, "JSON"),
             Self::Sqlite => write!(f, "SQLite"),
             Self::Postgres => write!(f, "PostgreSQL"),
+        }
+    }
+}
+
+impl std::str::FromStr for StorageBackend {
+    type Err = anyhow::Error;
+
+    /// 从字符串解析存储后端类型 (不区分大小写)
+    ///
+    /// 支持的值: "jsonl", "json", "sqlite", "postgres"
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "jsonl" => Ok(Self::Jsonl),
+            "json" => Ok(Self::Json),
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            other => anyhow::bail!(
+                "未知的存储后端类型: '{}' (支持: jsonl, json, sqlite, postgres)",
+                other
+            ),
         }
     }
 }
@@ -345,6 +365,38 @@ mod tests {
         let json = serde_json::to_string(&StorageBackend::Sqlite).unwrap();
         let parsed: StorageBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, StorageBackend::Sqlite);
+    }
+
+    #[test]
+    fn test_storage_backend_from_str_jsonl() {
+        let backend: StorageBackend = "jsonl".parse().unwrap();
+        assert_eq!(backend, StorageBackend::Jsonl);
+    }
+
+    #[test]
+    fn test_storage_backend_from_str_json() {
+        let backend: StorageBackend = "json".parse().unwrap();
+        assert_eq!(backend, StorageBackend::Json);
+    }
+
+    #[test]
+    fn test_storage_backend_from_str_case_insensitive() {
+        let backend: StorageBackend = "JSONL".parse().unwrap();
+        assert_eq!(backend, StorageBackend::Jsonl);
+        let backend: StorageBackend = "Json".parse().unwrap();
+        assert_eq!(backend, StorageBackend::Json);
+    }
+
+    #[test]
+    fn test_storage_backend_from_str_postgres_alias() {
+        let backend: StorageBackend = "postgresql".parse().unwrap();
+        assert_eq!(backend, StorageBackend::Postgres);
+    }
+
+    #[test]
+    fn test_storage_backend_from_str_invalid() {
+        let result: std::result::Result<StorageBackend, _> = "redis".parse();
+        assert!(result.is_err());
     }
 
     // ===== StorageConfig 测试 =====

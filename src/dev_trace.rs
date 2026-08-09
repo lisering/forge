@@ -36,6 +36,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use crate::trace_store::{StorageBackend, StorageConfig as TraceStorageConfig};
+
 // ============================================================================
 //  TraceAction — 操作类型
 // ============================================================================
@@ -584,44 +586,150 @@ pub fn format_action_stats_line(action: TraceAction, stats: &ActionStats) -> Str
 /// 使用追加模式写入, 支持 24 小时不间断运行。
 /// `write_entry` 接受 `&self` (非 `&mut self`), 避免与 Orchestrator 的借用冲突。
 pub struct DevTraceWriter {
-    /// trace 文件路径 (`workspace`/.forge/devtrace.jsonl)
+    /// trace 文件路径 (`workspace`/.forge/devtrace.jsonl 或 devtrace.json)
     pub trace_path: PathBuf,
+    /// 存储后端类型 (Session 69: 工厂模式集成)
+    ///
+    /// 决定写入格式: Jsonl → JSONL 追加, Json → JSON 数组
+    /// Sqlite/Postgres 未实现, 回退到 Jsonl
+    pub backend: StorageBackend,
 }
 
 impl Clone for DevTraceWriter {
-    /// 克隆 DevTraceWriter — 共享同一 trace 文件路径
+    /// 克隆 DevTraceWriter — 共享同一 trace 文件路径和后端配置
     ///
     /// 用于将 DevTraceWriter 共享给 FailoverChatClient,
     /// 使健康检查和网站切换事件也能写入同一 trace 文件。
     fn clone(&self) -> Self {
         Self {
             trace_path: self.trace_path.clone(),
+            backend: self.backend,
         }
     }
 }
 
 impl DevTraceWriter {
-    /// 创建 DevTraceWriter
+    /// 创建 DevTraceWriter (默认 JSONL 后端)
     ///
     /// trace 文件路径为 `<workspace_root>/.forge/devtrace.jsonl`。
     /// 文件在首次 `write_entry` 时自动创建 (追加模式)。
     pub fn new(workspace_root: &Path) -> Self {
         let trace_path = workspace_root.join(".forge").join("devtrace.jsonl");
-        Self { trace_path }
+        Self {
+            trace_path,
+            backend: StorageBackend::Jsonl,
+        }
     }
 
-    /// 写入一条 trace 条目 (追加模式)
+    /// 创建 DevTraceWriter 并指定存储后端 (Session 69: 工厂模式集成)
     ///
-    /// 将条目序列化为 JSON 并追加到文件末尾。
-    /// 使用 `&self` (非 `&mut self`), 每次调用打开-写入-关闭文件,
-    /// 避免与 Orchestrator 的借用冲突。
+    /// 根据后端类型选择文件格式:
+    /// - `Jsonl` → `devtrace.jsonl` (JSONL 追加模式, 默认)
+    /// - `Json` → `devtrace.json` (JSON 数组模式, 便于整体读取)
+    /// - `Sqlite`/`Postgres` → 回退到 JSONL (未实现)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::dev_trace::DevTraceWriter;
+    /// use forge::trace_store::StorageBackend;
+    /// use std::path::Path;
+    ///
+    /// let writer = DevTraceWriter::new_with_backend(
+    ///     Path::new("/tmp"),
+    ///     StorageBackend::Json,
+    /// );
+    /// assert!(writer.trace_path.ends_with("devtrace.json"));
+    /// ```
+    pub fn new_with_backend(workspace_root: &Path, backend: StorageBackend) -> Self {
+        let filename = match backend {
+            StorageBackend::Json => "devtrace.json",
+            StorageBackend::Jsonl | StorageBackend::Sqlite | StorageBackend::Postgres => {
+                "devtrace.jsonl"
+            }
+        };
+        let trace_path = workspace_root.join(".forge").join(filename);
+        Self {
+            trace_path,
+            // Sqlite/Postgres 回退到 Jsonl
+            backend: match backend {
+                StorageBackend::Sqlite | StorageBackend::Postgres => StorageBackend::Jsonl,
+                other => other,
+            },
+        }
+    }
+
+    /// 从 TraceStorageConfig 创建 DevTraceWriter (Session 69: 工厂模式集成)
+    ///
+    /// 使用 `trace_store::StorageConfig` 配置创建写入器,
+    /// 便于从 `config.toml` 的 `[storage]` 配置直接初始化。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::dev_trace::DevTraceWriter;
+    /// use forge::trace_store::{StorageBackend, StorageConfig};
+    /// use std::path::PathBuf;
+    ///
+    /// let config = StorageConfig {
+    ///     backend: StorageBackend::Jsonl,
+    ///     path: PathBuf::from("/tmp/.forge/devtrace.jsonl"),
+    /// };
+    /// let writer = DevTraceWriter::from_storage_config(&config);
+    /// assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+    /// ```
+    pub fn from_storage_config(config: &TraceStorageConfig) -> Self {
+        Self {
+            trace_path: config.path.clone(),
+            backend: match config.backend {
+                StorageBackend::Sqlite | StorageBackend::Postgres => StorageBackend::Jsonl,
+                other => other,
+            },
+        }
+    }
+
+    /// 获取存储后端类型
+    pub fn backend_type(&self) -> StorageBackend {
+        self.backend
+    }
+
+    /// 写入一条 trace 条目
+    ///
+    /// 根据后端类型选择写入方式:
+    /// - `Jsonl`: 追加模式, 每行一个 JSON 对象 (高效, 默认)
+    /// - `Json`: 读取全部 → 追加 → 写回 (便于整体读取, 适合少量数据)
+    ///
+    /// 使用 `&self` (非 `&mut self`), 避免与 Orchestrator 的借用冲突。
     pub fn write_entry(&self, entry: &DevTraceEntry) -> Result<()> {
-        let line = entry.to_jsonl()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.trace_path)?;
-        writeln!(file, "{}", line)?;
+        match self.backend {
+            StorageBackend::Jsonl => {
+                let line = entry.to_jsonl()?;
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.trace_path)?;
+                writeln!(file, "{}", line)?;
+            }
+            StorageBackend::Json => {
+                // JSON 模式: 读取现有条目, 追加新条目, 写回
+                let mut entries = self.read_all().unwrap_or_default();
+                entries.push(entry.clone());
+                let json = serde_json::to_string_pretty(&entries)?;
+                if let Some(parent) = self.trace_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&self.trace_path, json)?;
+            }
+            // Sqlite/Postgres 已在构造时回退到 Jsonl, 不会到达这里
+            StorageBackend::Sqlite | StorageBackend::Postgres => {
+                let line = entry.to_jsonl()?;
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.trace_path)?;
+                writeln!(file, "{}", line)?;
+            }
+        }
         Ok(())
     }
 
@@ -655,7 +763,10 @@ impl DevTraceWriter {
 
     /// 读取所有 trace 条目
     ///
-    /// 逐行读取 JSONL 文件并反序列化。
+    /// 根据后端类型选择读取方式:
+    /// - `Jsonl`: 逐行读取 JSONL 文件并反序列化
+    /// - `Json`: 读取整个 JSON 数组并反序列化
+    ///
     /// 空行和格式错误的行会被跳过 (不中断读取)。
     /// 文件不存在时返回空 Vec。
     pub fn read_all(&self) -> Result<Vec<DevTraceEntry>> {
@@ -663,25 +774,37 @@ impl DevTraceWriter {
             return Ok(vec![]);
         }
 
-        let file = std::fs::File::open(&self.trace_path)?;
-        let reader = BufReader::new(file);
-        let mut entries = Vec::new();
+        match self.backend {
+            StorageBackend::Json => {
+                // JSON 模式: 整体读取为 JSON 数组
+                let content = std::fs::read_to_string(&self.trace_path)?;
+                let entries: Vec<DevTraceEntry> =
+                    serde_json::from_str(&content).unwrap_or_default();
+                Ok(entries)
+            }
+            _ => {
+                // JSONL 模式: 逐行读取
+                let file = std::fs::File::open(&self.trace_path)?;
+                let reader = BufReader::new(file);
+                let mut entries = Vec::new();
 
-        for (line_num, line) in reader.lines().enumerate() {
-            let line = line?;
-            match parse_jsonl_line(&line) {
-                Some(entry) => entries.push(entry),
-                None => {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        let preview: String = trimmed.chars().take(100).collect();
-                        warn!("DevTrace: 跳过格式错误的行 {}: {}", line_num + 1, preview);
+                for (line_num, line) in reader.lines().enumerate() {
+                    let line = line?;
+                    match parse_jsonl_line(&line) {
+                        Some(entry) => entries.push(entry),
+                        None => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let preview: String = trimmed.chars().take(100).collect();
+                                warn!("DevTrace: 跳过格式错误的行 {}: {}", line_num + 1, preview);
+                            }
+                        }
                     }
                 }
+
+                Ok(entries)
             }
         }
-
-        Ok(entries)
     }
 
     /// 生成追踪摘要
@@ -700,8 +823,17 @@ impl DevTraceWriter {
     }
 
     /// 清空 trace 文件 (重新开始时调用)
+    ///
+    /// JSON 模式下写入空数组 `[]`, JSONL 模式下写入空字符串。
     pub fn clear(&self) -> Result<()> {
-        std::fs::write(&self.trace_path, "")?;
+        match self.backend {
+            StorageBackend::Json => {
+                std::fs::write(&self.trace_path, "[]")?;
+            }
+            _ => {
+                std::fs::write(&self.trace_path, "")?;
+            }
+        }
         Ok(())
     }
 
@@ -3157,5 +3289,235 @@ mod tests {
         let report = summary.to_report();
         assert!(report.contains("DevTrace 开发追踪报告"));
         assert!(report.contains("总条目: 0"));
+    }
+
+    // ======================================================================
+    //  Session 69: TraceStore 工厂模式集成测试
+    // ======================================================================
+
+    #[test]
+    fn test_new_with_backend_jsonl() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Jsonl);
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+        assert!(writer.trace_path.ends_with("devtrace.jsonl"));
+    }
+
+    #[test]
+    fn test_new_with_backend_json() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+        assert_eq!(writer.backend_type(), StorageBackend::Json);
+        assert!(writer.trace_path.ends_with("devtrace.json"));
+    }
+
+    #[test]
+    fn test_new_with_backend_sqlite_fallback() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Sqlite);
+        // SQLite 应回退到 JSONL
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+        assert!(writer.trace_path.ends_with("devtrace.jsonl"));
+    }
+
+    #[test]
+    fn test_new_with_backend_postgres_fallback() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Postgres);
+        // PostgreSQL 应回退到 JSONL
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+        assert!(writer.trace_path.ends_with("devtrace.jsonl"));
+    }
+
+    #[test]
+    fn test_from_storage_config_jsonl() {
+        use crate::trace_store::StorageConfig;
+        let config = StorageConfig {
+            backend: StorageBackend::Jsonl,
+            path: PathBuf::from("/tmp/test/.forge/devtrace.jsonl"),
+        };
+        let writer = DevTraceWriter::from_storage_config(&config);
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+        assert_eq!(
+            writer.trace_path,
+            PathBuf::from("/tmp/test/.forge/devtrace.jsonl")
+        );
+    }
+
+    #[test]
+    fn test_from_storage_config_json() {
+        use crate::trace_store::StorageConfig;
+        let config = StorageConfig {
+            backend: StorageBackend::Json,
+            path: PathBuf::from("/tmp/test/.forge/devtrace.json"),
+        };
+        let writer = DevTraceWriter::from_storage_config(&config);
+        assert_eq!(writer.backend_type(), StorageBackend::Json);
+    }
+
+    #[test]
+    fn test_from_storage_config_sqlite_fallback() {
+        use crate::trace_store::StorageConfig;
+        let config = StorageConfig {
+            backend: StorageBackend::Sqlite,
+            path: PathBuf::from("/tmp/test/.forge/devtrace.db"),
+        };
+        let writer = DevTraceWriter::from_storage_config(&config);
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+    }
+
+    #[test]
+    fn test_json_backend_write_and_read() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        let entry = make_entry(TraceAction::TaskExecution, true);
+        writer.write_entry(&entry).unwrap();
+
+        let entries = writer.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, TraceAction::TaskExecution);
+    }
+
+    #[test]
+    fn test_json_backend_multiple_writes() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        for i in 0..5 {
+            let entry = DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                Some(0),
+                Some(i),
+                Some(&format!("task{}", i)),
+                "input",
+                "output",
+                1000 * (i + 1) as u64,
+                true,
+                None,
+            );
+            writer.write_entry(&entry).unwrap();
+        }
+
+        let entries = writer.read_all().unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].task_idx, Some(0));
+        assert_eq!(entries[4].task_idx, Some(4));
+    }
+
+    #[test]
+    fn test_json_backend_clear() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        writer
+            .write_entry(&make_entry(TraceAction::Planning, true))
+            .unwrap();
+        assert_eq!(writer.entry_count(), 1);
+
+        writer.clear().unwrap();
+        assert_eq!(writer.entry_count(), 0);
+
+        // 清空后应能继续写入
+        writer
+            .write_entry(&make_entry(TraceAction::TaskExecution, true))
+            .unwrap();
+        assert_eq!(writer.entry_count(), 1);
+    }
+
+    #[test]
+    fn test_json_backend_creates_parent_dir() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        assert!(!writer.trace_path.exists());
+
+        writer
+            .write_entry(&make_entry(TraceAction::Planning, true))
+            .unwrap();
+
+        assert!(writer.trace_path.exists());
+    }
+
+    #[test]
+    fn test_json_backend_read_empty() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        let entries = writer.read_all().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_json_backend_summary() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+
+        writer
+            .write_entry(&make_entry(TraceAction::Planning, true))
+            .unwrap();
+        writer
+            .write_entry(&make_entry(TraceAction::TaskExecution, true))
+            .unwrap();
+        writer
+            .write_entry(&make_entry(TraceAction::CompileCheck, false))
+            .unwrap();
+
+        let summary = writer.summary();
+        assert_eq!(summary.total_entries, 3);
+        assert!((summary.success_rate - 2.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_clone_preserves_backend_jsonl() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Jsonl);
+        let cloned = writer.clone();
+        assert_eq!(cloned.backend_type(), StorageBackend::Jsonl);
+        assert_eq!(cloned.trace_path, writer.trace_path);
+    }
+
+    #[test]
+    fn test_clone_preserves_backend_json() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new_with_backend(dir.path(), StorageBackend::Json);
+        let cloned = writer.clone();
+        assert_eq!(cloned.backend_type(), StorageBackend::Json);
+        assert_eq!(cloned.trace_path, writer.trace_path);
+    }
+
+    #[test]
+    fn test_json_and_jsonl_write_same_content() {
+        // JSON 和 JSONL 后端写入相同条目后, 读取结果应一致
+        let dir1 = tempdir().unwrap();
+        std::fs::create_dir_all(dir1.path().join(".forge")).unwrap();
+        let writer_jsonl = DevTraceWriter::new_with_backend(dir1.path(), StorageBackend::Jsonl);
+
+        let dir2 = tempdir().unwrap();
+        std::fs::create_dir_all(dir2.path().join(".forge")).unwrap();
+        let writer_json = DevTraceWriter::new_with_backend(dir2.path(), StorageBackend::Json);
+
+        let entry = make_entry(TraceAction::TaskExecution, true);
+        writer_jsonl.write_entry(&entry).unwrap();
+        writer_json.write_entry(&entry).unwrap();
+
+        let entries_jsonl = writer_jsonl.read_all().unwrap();
+        let entries_json = writer_json.read_all().unwrap();
+
+        assert_eq!(entries_jsonl.len(), 1);
+        assert_eq!(entries_json.len(), 1);
+        assert_eq!(entries_jsonl[0].action, entries_json[0].action);
+        assert_eq!(entries_jsonl[0].success, entries_json[0].success);
+    }
+
+    #[test]
+    fn test_default_new_uses_jsonl_backend() {
+        let dir = tempdir().unwrap();
+        let writer = DevTraceWriter::new(dir.path());
+        assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
     }
 }

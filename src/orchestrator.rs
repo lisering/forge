@@ -31,6 +31,7 @@ use crate::interaction::AutoApprove;
 use crate::loop_detector::LoopDetector;
 use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
 use crate::prompt_builder::SystemPrompt;
+use crate::response_handler::{HandlerChain, TaskContext};
 use crate::slash_command::{self, SlashCommand, SlashCommandAction};
 use crate::steer_reminder::SteerReminder;
 use crate::task_graph::TaskGraph;
@@ -435,6 +436,16 @@ where
     /// 恢复成功后从 Memory 断点续传。
     /// None 表示禁用 (默认, 向后兼容)。
     pub auto_recovery: Option<AutoRecovery>,
+
+    /// 回调处理器链 — 借鉴 MediaCrawler callback 模式 (Session 69)
+    ///
+    /// 启用后, 在每次 AI 回复后通过 handler 链处理:
+    /// - CodeExtractorHandler: 提取代码文件
+    /// - TraceWriterHandler: 记录开发追踪
+    /// - MemoryUpdaterHandler: 更新项目记忆
+    ///
+    /// None 表示禁用 (默认, 向后兼容, 使用原有的直接提取逻辑)。
+    pub handler_chain: Option<HandlerChain>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -474,6 +485,7 @@ where
             slash_commands_enabled: false,
             connection_monitor: None,
             auto_recovery: None,
+            handler_chain: None,
         }
     }
 }
@@ -529,6 +541,7 @@ where
             slash_commands_enabled: self.slash_commands_enabled,
             connection_monitor: self.connection_monitor,
             auto_recovery: self.auto_recovery,
+            handler_chain: self.handler_chain,
         }
     }
 
@@ -605,6 +618,20 @@ where
         self
     }
 
+    /// 启用结构化开发追踪并指定存储后端 (Session 69: 工厂模式集成)
+    ///
+    /// 根据后端类型选择 trace 文件格式:
+    /// - `Jsonl` → JSONL 追加模式 (默认, 高效)
+    /// - `Json` → JSON 数组模式 (便于整体读取)
+    /// - `Sqlite`/`Postgres` → 回退到 JSONL (未实现)
+    pub fn with_dev_trace_backend(mut self, backend: crate::trace_store::StorageBackend) -> Self {
+        self.dev_trace = Some(DevTraceWriter::new_with_backend(
+            &self.workspace.root,
+            backend,
+        ));
+        self
+    }
+
     /// 启用 AI 自主指令 (Slash Commands) (借鉴方向 5)
     ///
     /// 启用后, 在 AI 回复中检测特殊的指令标记 (如 `/compact`、`/skip`、`/refocus`),
@@ -630,6 +657,20 @@ where
     pub fn with_auto_recovery(mut self, port: u16, max_retries: u32) -> Self {
         self.connection_monitor = Some(ConnectionMonitor::new(port));
         self.auto_recovery = Some(AutoRecovery::new(RecoveryConfig::new(port, max_retries)));
+        self
+    }
+
+    /// 启用回调处理器链 — 借鉴 MediaCrawler callback 模式 (Session 69)
+    ///
+    /// 启用后, 在每次 AI 回复后通过 handler 链处理:
+    /// - CodeExtractorHandler: 从 AI 回复提取代码文件
+    /// - TraceWriterHandler: 记录开发追踪 (轻量计数)
+    /// - MemoryUpdaterHandler: 更新项目记忆
+    ///
+    /// 处理器链按顺序执行, 某个 handler 返回 stop_chain 时中断后续。
+    /// 如果未启用, 则使用原有的直接提取逻辑 (向后兼容)。
+    pub fn with_response_handlers(mut self, chain: HandlerChain) -> Self {
+        self.handler_chain = Some(chain);
         self
     }
 
@@ -2283,9 +2324,29 @@ where
                 return Ok(false);
             }
 
-            // 提取代码文件 (DIP: 通过 FileExtractor trait)
-            // 注意: 使用 strip_commands 清理后的文本提取代码 (避免指令标记干扰)
+            // === 回调处理器链 — 借鉴 MediaCrawler callback 模式 (Session 69) ===
+            // 如果启用了 handler_chain, 先通过 handler 链处理 AI 回复:
+            // - CodeExtractorHandler: 提取代码文件 (统计)
+            // - TraceWriterHandler: 记录 trace (轻量计数)
+            // - MemoryUpdaterHandler: 更新记忆 (计数)
+            //
+            // handler_chain 只做预处理和统计, 实际的代码提取仍由 FileExtractor 完成
+            // (保持 DIP 架构: handler_chain 是可选增强, 不替代核心提取逻辑)
             let clean_text = slash_command::strip_commands(&final_text);
+            if let Some(ref chain) = self.handler_chain {
+                let task_name = &self.memory.phases[phase_idx].tasks[task_idx].name;
+                let ctx = TaskContext::new(
+                    if attempt == 1 { "develop" } else { "fix" },
+                    task_name,
+                    &self.workspace.root.to_string_lossy(),
+                )
+                .with_turn(self.memory.conversations.len());
+                if let Err(e) = chain.execute(&clean_text, &ctx).await {
+                    debug!("HandlerChain 执行失败 (非致命): {}", e);
+                }
+            }
+
+            // 提取代码文件 (DIP: 通过 FileExtractor trait)
             let files = self.extractor.extract(&clean_text);
             if files.is_empty() {
                 warn!("    AI 回复中没有代码文件");

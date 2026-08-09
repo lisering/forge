@@ -340,6 +340,10 @@ pub struct OllamaClient {
     model: String,
     client: reqwest::Client,
     timeout: Duration,
+    /// 代理池 (Session 69: ProxyPool 集成)
+    ///
+    /// None 表示不使用代理, Some 表示使用代理池轮询代理
+    proxy_pool: Option<std::sync::Arc<crate::proxy_pool::ProxyPool>>,
 }
 
 impl OllamaClient {
@@ -357,6 +361,7 @@ impl OllamaClient {
             model: model.to_string(),
             client,
             timeout: Duration::from_secs(30),
+            proxy_pool: None,
         }
     }
 
@@ -367,6 +372,45 @@ impl OllamaClient {
             .timeout(self.timeout)
             .build()
             .unwrap_or_default();
+        self
+    }
+
+    /// 设置代理池 (Session 69: ProxyPool 集成)
+    ///
+    /// 启用后, OllamaClient 的 HTTP 请求将通过代理池发送。
+    /// 每次请求前自动检查代理是否过期, 过期则刷新。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::llm_clarify::OllamaClient;
+    /// use forge::proxy_pool::{ProxyConfig, ProxyPool};
+    ///
+    /// let pool = std::sync::Arc::new(ProxyPool::new(ProxyConfig::default()));
+    /// let client = OllamaClient::new("http://localhost:11434", "qwen2.5:3b")
+    ///     .with_proxy_pool(pool);
+    /// ```
+    pub fn with_proxy_pool(mut self, pool: std::sync::Arc<crate::proxy_pool::ProxyPool>) -> Self {
+        // 刷新代理 (如果可用)
+        let _ = pool.refresh_if_expired();
+
+        // 构建带代理的 reqwest 客户端
+        if let Some(proxy_url) = pool.current() {
+            match crate::proxy_pool::build_reqwest_proxy(&proxy_url) {
+                Ok(proxy) => {
+                    self.client = reqwest::Client::builder()
+                        .timeout(self.timeout)
+                        .proxy(proxy)
+                        .build()
+                        .unwrap_or_default();
+                    debug!("OllamaClient 已启用代理: {}", proxy_url);
+                }
+                Err(e) => {
+                    warn!("OllamaClient 代理设置失败: {}, 使用直连", e);
+                }
+            }
+        }
+        self.proxy_pool = Some(pool);
         self
     }
 
@@ -1886,5 +1930,40 @@ mod tests {
     fn test_ollama_client_no_trailing_slash() {
         let client = OllamaClient::new("http://localhost:11434", "llama2");
         assert_eq!(client.endpoint, "http://localhost:11434");
+    }
+
+    // ===== Session 69: OllamaClient ProxyPool 集成测试 =====
+
+    #[test]
+    fn test_ollama_client_with_empty_proxy_pool() {
+        // 空代理池不应影响客户端创建
+        let pool = std::sync::Arc::new(crate::proxy_pool::ProxyPool::new(
+            crate::proxy_pool::ProxyConfig::default(),
+        ));
+        let client =
+            OllamaClient::new("http://localhost:11434", "qwen2.5:3b").with_proxy_pool(pool);
+        assert_eq!(client.endpoint, "http://localhost:11434");
+        assert_eq!(client.model, "qwen2.5:3b");
+        assert!(client.proxy_pool.is_some());
+    }
+
+    #[test]
+    fn test_ollama_client_with_proxy_pool() {
+        let config = crate::proxy_pool::ProxyConfig {
+            proxies: vec!["http://proxy:8080".to_string()],
+            ttl_secs: 300,
+            max_retries: 3,
+        };
+        let pool = std::sync::Arc::new(crate::proxy_pool::ProxyPool::new(config));
+        let client =
+            OllamaClient::new("http://localhost:11434", "qwen2.5:3b").with_proxy_pool(pool);
+        assert_eq!(client.endpoint, "http://localhost:11434");
+        assert!(client.proxy_pool.is_some());
+    }
+
+    #[test]
+    fn test_ollama_client_proxy_pool_none_by_default() {
+        let client = OllamaClient::new("http://localhost:11434", "qwen2.5:3b");
+        assert!(client.proxy_pool.is_none());
     }
 }

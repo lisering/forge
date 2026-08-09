@@ -259,6 +259,11 @@ pub struct BrowserLauncher {
     child: Option<Child>,
     /// 浏览器可执行文件路径
     browser_path: Option<PathBuf>,
+    /// 实际使用的 CDP 端口 (启动后存在)
+    ///
+    /// Session 69: 用于将实际端口传递给 BrowserManager,
+    /// 解决 find_available_port 可能返回不同于 cli.port 的问题。
+    port: Option<u16>,
 }
 
 impl BrowserLauncher {
@@ -267,6 +272,7 @@ impl BrowserLauncher {
         Self {
             child: None,
             browser_path: None,
+            port: None,
         }
     }
 
@@ -358,6 +364,7 @@ impl BrowserLauncher {
 
         info!("浏览器进程已启动 (PID: {})", child.id());
         self.child = Some(child);
+        self.port = Some(port);
         Ok(())
     }
 
@@ -441,6 +448,50 @@ impl BrowserLauncher {
     /// 浏览器是否正在运行
     pub fn is_running(&self) -> bool {
         self.child.is_some()
+    }
+
+    /// 获取实际使用的 CDP 端口
+    ///
+    /// Session 69: 当 `find_available_port` 找到的端口与 `cli.port` 不同时,
+    /// 调用方需要通过此方法获取实际端口, 传递给 `BrowserManager`。
+    ///
+    /// # 返回
+    ///
+    /// - `Some(port)`: 浏览器已启动, 返回实际端口
+    /// - `None`: 浏览器未启动
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// 自动打开默认聊天网页
+    ///
+    /// Session 69: 当 `--auto-launch` 启动浏览器后, 自动打开默认聊天网页,
+    /// 用户无需手动在浏览器中输入 URL。
+    ///
+    /// # 参数
+    ///
+    /// - `urls`: 要打开的 URL 列表 (如 `["https://chat.deepseek.com"]`)
+    ///
+    /// # 错误
+    ///
+    /// 如果 CDP 端口不可达或创建标签页失败, 返回错误。
+    pub async fn auto_open_chats(&self, urls: &[&str]) -> Result<()> {
+        let port = self
+            .port
+            .ok_or_else(|| anyhow::anyhow!("浏览器未启动, 无法自动打开聊天网页"))?;
+
+        for url in urls {
+            info!("自动打开聊天网页: {}", url);
+            match crate::cdp::create_tab(port, url).await {
+                Ok(tab) => {
+                    info!("已打开: {} ({})", tab.title, tab.url);
+                }
+                Err(e) => {
+                    warn!("打开 {} 失败: {}", url, e);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -919,5 +970,23 @@ mod tests {
         let result = connect_existing_browser(1, Duration::from_millis(100)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("超时"));
+    }
+
+    // ===== Session 69: port() / auto_open_chats() 测试 =====
+
+    #[test]
+    fn test_port_none_before_launch() {
+        let launcher = BrowserLauncher::new();
+        assert_eq!(launcher.port(), None);
+    }
+
+    #[tokio::test]
+    async fn test_auto_open_chats_fails_when_not_launched() {
+        let launcher = BrowserLauncher::new();
+        let result = launcher
+            .auto_open_chats(&["https://chat.deepseek.com"])
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("浏览器未启动"));
     }
 }

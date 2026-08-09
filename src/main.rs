@@ -7,6 +7,7 @@ use forge::browser_launcher::{self, BrowserLauncher};
 use forge::cdp;
 use forge::chat::TimeoutConfig;
 use forge::clarify::HeuristicClarificationChecker;
+use forge::config::{load_config, ForgeConfig};
 use forge::error_diagnosis::{ErrorDiagnoser, HeuristicErrorDiagnoser, HybridErrorDiagnoser};
 use forge::extract::{extract_files, DefaultExtractor};
 use forge::failover_chat::FailoverChatClient;
@@ -14,8 +15,13 @@ use forge::interaction::{AutoApprove, CliInteraction};
 use forge::language::MultiLanguageTestRunner;
 use forge::llm_clarify::{HybridClarificationChecker, LlmClient, OllamaClient};
 use forge::package::package;
+use forge::proxy_pool::{load_proxies_from_env, ProxyConfig, ProxyPool};
+use forge::response_handler::{
+    CodeExtractorHandler, HandlerChain, MemoryUpdaterHandler, TraceWriterHandler,
+};
 use forge::site_health::SiteHealthChecker;
 use forge::testrunner;
+use forge::trace_store::StorageBackend;
 use forge::traits::{
     ChatClient, ClarificationChecker, FileExtractor, HumanInteraction, TestRunner,
 };
@@ -23,6 +29,7 @@ use forge::workspace::Workspace;
 use forge::BrowserManager;
 use forge::Orchestrator;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -274,7 +281,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // === Session 69: 加载配置文件 (~/.forge/config.toml + 环境变量覆盖) ===
+    //
+    // 优先级: CLI 参数 > 环境变量 > 配置文件 > 默认值
+    // 配置文件中的值作为 CLI 参数的默认值, CLI 参数显式指定时覆盖配置
+    let forge_config = load_config().unwrap_or_else(|e| {
+        warn!("加载配置文件失败: {}, 使用默认配置", e);
+        ForgeConfig::default()
+    });
+    if forge_config.storage.trace_backend != "jsonl" {
+        info!(
+            "📋 配置已加载: trace_backend={}",
+            forge_config.storage.trace_backend
+        );
+    }
 
     // === 浏览器管理: 自动启动 / 连接已有 / 手动模式 ===
     //
@@ -282,6 +304,10 @@ async fn main() -> Result<()> {
     // 1. --auto-launch: Forge 自动检测并启动浏览器 (子进程, 退出时关闭)
     // 2. --connect-existing: 等待连接用户已有浏览器 (复用登录态)
     // 3. 默认: 假设用户已手动启动浏览器, 直接连接
+    //
+    // Session 69: 深度集成 BrowserLauncher → BrowserManager
+    // - 自动启动后使用实际端口 (find_available_port 可能返回不同端口)
+    // - 自动打开默认聊天网页 (用户无需手动输入 URL)
     let _launcher = if cli.auto_launch {
         let mut launcher = BrowserLauncher::new();
         launcher.detect_browser()?;
@@ -291,7 +317,27 @@ async fn main() -> Result<()> {
             .wait_for_ready(port, Duration::from_secs(15))
             .await?;
         info!("🌐 浏览器已自动启动 (端口 {})", port);
-        // 覆盖 CLI 端口为实际使用的端口
+
+        // Session 69: 自动打开默认聊天网页
+        // 用户使用 --auto-launch 时无需手动在浏览器中输入 URL
+        let default_chats = match forge_config.chat.default_site.as_str() {
+            "zai" | "z.ai" => vec!["https://chat.z.ai"],
+            "kimi" => vec!["https://kimi.moonshot.cn"],
+            "tongyi" => vec!["https://tongyi.aliyun.com"],
+            "claude" => vec!["https://claude.ai"],
+            _ => vec!["https://chat.deepseek.com"],
+        };
+        if let Err(e) = launcher.auto_open_chats(&default_chats).await {
+            warn!("自动打开聊天网页失败 (非致命): {}", e);
+        }
+
+        // Session 69: 使用实际端口覆盖 CLI 端口
+        // find_available_port 可能返回不同于 cli.port 的端口
+        if port != cli.port {
+            info!("📋 实际使用端口 {} (CLI 指定 {})", port, cli.port);
+        }
+        cli.port = port;
+
         Some(launcher)
     } else if cli.connect_existing {
         info!("⏳ 等待已有浏览器开启远程调试 (端口 {})...", cli.port);
@@ -320,7 +366,7 @@ async fn main() -> Result<()> {
     // 借鉴 MediaCrawler app_runner.py 的双重中断设计:
     // - 第一次 Ctrl+C → 触发清理 (15 秒超时)
     // - 第二次 Ctrl+C → 强制退出
-    let main_result = run_command(cli).await;
+    let main_result = run_command(cli, forge_config).await;
 
     // 如果有自动启动的浏览器, 在退出前清理
     if let Some(ref launcher) = _launcher {
@@ -338,8 +384,17 @@ async fn main() -> Result<()> {
 /// 借鉴 MediaCrawler app_runner.py 的双重中断设计:
 /// - 第一次 Ctrl+C → 触发清理 (15 秒超时)
 /// - 第二次 Ctrl+C → 强制退出
-async fn run_command(cli: Cli) -> Result<()> {
+async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
     let port = cli.port;
+    // === Session 69: 从配置文件解析 trace 后端类型 ===
+    //
+    // 配置文件中 trace_backend 是字符串 (如 "jsonl"/"json"),
+    // 这里转换为 StorageBackend 枚举供 run_with_clarifier 使用。
+    let trace_backend: StorageBackend = config.storage.trace_backend.parse().unwrap_or_else(|e| {
+        warn!("解析 trace_backend 失败: {}, 回退到默认 JSONL", e);
+        StorageBackend::default()
+    });
+
     match cli.command {
         Commands::List => {
             let mut manager = BrowserManager::new(port);
@@ -756,11 +811,26 @@ async fn run_command(cli: Cli) -> Result<()> {
                 println!("🔄 并行任务执行已启用 (TaskGraph 依赖分析 + 并行分组)");
             }
 
+            // === Session 69: 初始化 ProxyPool (从环境变量加载代理列表) ===
+            //
+            // ProxyPool 为 Forge 自身的 HTTP 请求 (如 Ollama LLM 调用) 提供代理支持。
+            // 环境变量 FORGE_PROXIES 可配置代理列表 (逗号分隔)。
+            // 使用 Arc 共享给 OllamaClient 和 HybridErrorDiagnoser。
+            let proxies = load_proxies_from_env();
+            if !proxies.is_empty() {
+                info!("🌐 代理池已加载: {} 个代理", proxies.len());
+            }
+            let proxy_pool = Arc::new(ProxyPool::new(ProxyConfig {
+                proxies,
+                ..Default::default()
+            }));
+
             // 智能错误诊断 (方向 F)
             let error_diagnoser: Option<Box<dyn ErrorDiagnoser>> = if error_diagnosis {
                 if llm_clarify {
-                    // LLM 增强模式: 复用 Ollama 客户端
-                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model);
+                    // LLM 增强模式: 复用 Ollama 客户端, 注入 ProxyPool
+                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model)
+                        .with_proxy_pool(proxy_pool.clone());
                     println!("🔍 智能错误诊断已启用 (Hybrid: 启发式 + LLM + 历史学习)");
                     Some(Box::new(HybridErrorDiagnoser::new(ollama)))
                 } else {
@@ -786,6 +856,20 @@ async fn run_command(cli: Cli) -> Result<()> {
                 }
             }
 
+            // === Session 69: 构建回调处理器链 (HandlerChain) ===
+            //
+            // HandlerChain 将 AI 回复处理流程解耦为独立的 handler:
+            // 1. CodeExtractorHandler — 提取代码文件
+            // 2. TraceWriterHandler — 记录开发追踪
+            // 3. MemoryUpdaterHandler — 更新项目记忆
+            //
+            // 通过 handler 链顺序执行, 某个 handler 返回 stop_chain 时中断后续。
+            let mut handler_chain = HandlerChain::new();
+            handler_chain.add(Box::new(CodeExtractorHandler::new()));
+            handler_chain.add(Box::new(TraceWriterHandler::new()));
+            handler_chain.add(Box::new(MemoryUpdaterHandler::new()));
+            let handler_chain = Some(handler_chain);
+
             // 构建聊天客户端: 单标签页或多网站自动切换
             if auto_failover && manager.tabs.len() >= 2 {
                 // === 多网站自动切换模式 ===
@@ -800,7 +884,8 @@ async fn run_command(cli: Cli) -> Result<()> {
 
                 if llm_clarify {
                     // LLM 增强模式
-                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model);
+                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model)
+                        .with_proxy_pool(proxy_pool.clone());
                     if ollama.is_available().await {
                         println!(
                             "✅ Ollama 可用 (模型: {}, 端点: {})",
@@ -833,6 +918,8 @@ async fn run_command(cli: Cli) -> Result<()> {
                         port,
                         recovery_retries,
                         requirement_file.as_deref(),
+                        handler_chain,
+                        trace_backend,
                     )
                     .await?;
 
@@ -861,6 +948,8 @@ async fn run_command(cli: Cli) -> Result<()> {
                         port,
                         recovery_retries,
                         requirement_file.as_deref(),
+                        handler_chain,
+                        trace_backend,
                     )
                     .await?;
 
@@ -873,7 +962,8 @@ async fn run_command(cli: Cli) -> Result<()> {
 
                 if llm_clarify {
                     // LLM 增强模式
-                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model);
+                    let ollama = OllamaClient::new(&ollama_endpoint, &ollama_model)
+                        .with_proxy_pool(proxy_pool.clone());
                     if ollama.is_available().await {
                         println!(
                             "✅ Ollama 可用 (模型: {}, 端点: {})",
@@ -906,6 +996,8 @@ async fn run_command(cli: Cli) -> Result<()> {
                         port,
                         recovery_retries,
                         requirement_file.as_deref(),
+                        handler_chain,
+                        trace_backend,
                     )
                     .await?;
                 } else {
@@ -931,6 +1023,8 @@ async fn run_command(cli: Cli) -> Result<()> {
                         port,
                         recovery_retries,
                         requirement_file.as_deref(),
+                        handler_chain,
+                        trace_backend,
                     )
                     .await?;
                 }
@@ -1043,6 +1137,8 @@ async fn run_with_clarifier<C, Q>(
     port: u16,
     recovery_retries: u32,
     requirement_file: Option<&std::path::Path>,
+    handler_chain: Option<HandlerChain>,
+    trace_backend: StorageBackend,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1067,8 +1163,21 @@ where
     .with_context_handoff(max_context_turns)
     .with_steer_reminder(steer_interval)
     .with_loop_detection(loop_detection)
-    .with_dev_trace(dev_trace)
     .with_slash_commands(slash_commands);
+
+    // Session 69: 根据配置选择 trace 后端
+    if dev_trace {
+        if trace_backend == StorageBackend::Jsonl {
+            orch = orch.with_dev_trace(true);
+        } else {
+            orch = orch.with_dev_trace_backend(trace_backend);
+        }
+    }
+
+    // Session 69: 集成 HandlerChain 回调处理器链
+    if let Some(chain) = handler_chain {
+        orch = orch.with_response_handlers(chain);
+    }
 
     if auto_recovery {
         println!(
