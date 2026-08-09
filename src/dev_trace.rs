@@ -229,6 +229,29 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 }
 
 // ============================================================================
+//  纯逻辑函数 — 统计计算
+// ============================================================================
+
+/// 计算成功率 (0.0 ~ 1.0)。
+///
+/// 当 `total` 为 0 时返回 0.0。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::calculate_success_rate;
+/// assert_eq!(calculate_success_rate(0, 0), 0.0);
+/// assert_eq!(calculate_success_rate(10, 10), 1.0);
+/// assert!((calculate_success_rate(3, 2) - 2.0 / 3.0).abs() < 0.001);
+/// ```
+pub fn calculate_success_rate(total: usize, success_count: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    success_count as f64 / total as f64
+}
+
+// ============================================================================
 //  ActionStats — 操作统计
 // ============================================================================
 
@@ -251,10 +274,7 @@ impl ActionStats {
 
     /// 成功率 (0.0 ~ 1.0)
     pub fn success_rate(&self) -> f64 {
-        if self.count == 0 {
-            return 0.0;
-        }
-        self.success_count as f64 / self.count as f64
+        calculate_success_rate(self.count, self.success_count)
     }
 
     /// 平均耗时 (毫秒)
@@ -273,6 +293,42 @@ impl ActionStats {
         }
         self.total_duration_ms += duration_ms;
     }
+}
+
+// ============================================================================
+//  纯逻辑函数 — 格式化
+// ============================================================================
+
+/// 将毫秒格式化为人类可读的时长字符串。
+///
+/// 格式: `"5.0s (0.1m)"`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::format_duration_human;
+/// assert_eq!(format_duration_human(0), "0.0s (0.0m)");
+/// assert_eq!(format_duration_human(5000), "5.0s (0.1m)");
+/// assert_eq!(format_duration_human(60000), "60.0s (1.0m)");
+/// ```
+pub fn format_duration_human(ms: u64) -> String {
+    format!("{:.1}s ({:.1}m)", ms as f64 / 1000.0, ms as f64 / 60000.0)
+}
+
+/// 将成功率 (0.0 ~ 1.0) 格式化为百分比字符串。
+///
+/// 格式: `"85.7%"`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::format_success_rate_percent;
+/// assert_eq!(format_success_rate_percent(0.0), "0.0%");
+/// assert_eq!(format_success_rate_percent(1.0), "100.0%");
+/// assert_eq!(format_success_rate_percent(0.5), "50.0%");
+/// ```
+pub fn format_success_rate_percent(rate: f64) -> String {
+    format!("{:.1}%", rate * 100.0)
 }
 
 // ============================================================================
@@ -306,6 +362,41 @@ impl TimelineEntry {
             duration_ms: entry.duration_ms,
         }
     }
+}
+
+/// 格式化单条时间线条目为可读字符串。
+///
+/// 格式: `"  HH:MM:SS ✅ 任务执行  task (1000ms)\n"`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{TimelineEntry, TraceAction, format_timeline_line};
+/// # use chrono::Utc;
+/// let entry = TimelineEntry {
+///     timestamp: Utc::now(),
+///     action: TraceAction::TaskExecution,
+///     task_name: Some("初始化".to_string()),
+///     success: true,
+///     duration_ms: 3000,
+/// };
+/// let line = format_timeline_line(&entry);
+/// assert!(line.contains("✅"));
+/// assert!(line.contains("任务执行"));
+/// assert!(line.contains("初始化"));
+/// assert!(line.contains("3000ms"));
+/// ```
+pub fn format_timeline_line(entry: &TimelineEntry) -> String {
+    let status = if entry.success { "✅" } else { "❌" };
+    let task = entry.task_name.as_deref().unwrap_or("-");
+    format!(
+        "  {} {} {:20} {} ({}ms)\n",
+        entry.timestamp.format("%H:%M:%S"),
+        status,
+        entry.action.description(),
+        task,
+        entry.duration_ms
+    )
 }
 
 // ============================================================================
@@ -346,28 +437,9 @@ impl DevTraceSummary {
         let total_entries = entries.len();
         let total_duration_ms: u64 = entries.iter().map(|e| e.duration_ms).sum();
         let success_count = entries.iter().filter(|e| e.success).count();
-        let success_rate = if total_entries == 0 {
-            0.0
-        } else {
-            success_count as f64 / total_entries as f64
-        };
-
-        // 按操作类型统计
-        let mut by_action: HashMap<TraceAction, ActionStats> = HashMap::new();
-        for entry in entries {
-            let stats = by_action.entry(entry.action).or_default();
-            stats.record(entry.duration_ms, entry.success);
-        }
-
-        // 时间线: 最近 100 条
-        let timeline: Vec<TimelineEntry> = if entries.len() <= 100 {
-            entries.iter().map(TimelineEntry::from_entry).collect()
-        } else {
-            entries[entries.len() - 100..]
-                .iter()
-                .map(TimelineEntry::from_entry)
-                .collect()
-        };
+        let success_rate = calculate_success_rate(total_entries, success_count);
+        let by_action = group_entries_by_action(entries);
+        let timeline = build_timeline(entries, 100);
 
         Self {
             total_entries,
@@ -392,44 +464,114 @@ impl DevTraceSummary {
 
         report.push_str(&format!("  总条目: {}\n", self.total_entries));
         report.push_str(&format!(
-            "  总耗时: {:.1}s ({:.1}m)\n",
-            self.total_duration_ms as f64 / 1000.0,
-            self.total_duration_ms as f64 / 60000.0
+            "  总耗时: {}\n",
+            format_duration_human(self.total_duration_ms)
         ));
-        report.push_str(&format!("  成功率: {:.1}%\n\n", self.success_rate * 100.0));
+        report.push_str(&format!(
+            "  成功率: {}\n\n",
+            format_success_rate_percent(self.success_rate)
+        ));
 
         report.push_str("  ── 按操作类型统计 ──\n");
         for action in TraceAction::all() {
             if let Some(stats) = self.by_action.get(&action) {
-                report.push_str(&format!(
-                    "  {:20} 次数: {:4}  成功: {:4} ({:5.1}%)  平均: {:5}ms\n",
-                    action.description(),
-                    stats.count,
-                    stats.success_count,
-                    stats.success_rate() * 100.0,
-                    stats.avg_duration_ms()
-                ));
+                report.push_str(&format_action_stats_line(action, stats));
             }
         }
 
         if !self.timeline.is_empty() {
             report.push_str("\n  ── 时间线 (最近 100 条) ──\n");
             for entry in &self.timeline {
-                let status = if entry.success { "✅" } else { "❌" };
-                let task = entry.task_name.as_deref().unwrap_or("-");
-                report.push_str(&format!(
-                    "  {} {} {:20} {} ({}ms)\n",
-                    entry.timestamp.format("%H:%M:%S"),
-                    status,
-                    entry.action.description(),
-                    task,
-                    entry.duration_ms
-                ));
+                report.push_str(&format_timeline_line(entry));
             }
         }
 
         report
     }
+}
+
+// ============================================================================
+//  纯逻辑函数 — 时间线/统计/格式化
+// ============================================================================
+
+/// 从 trace 条目列表构建时间线, 限制为最近 `max_entries` 条。
+///
+/// 当条目数不超过 `max_entries` 时返回全部条目的时间线;
+/// 否则只返回最后 `max_entries` 条。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceEntry, TraceAction, build_timeline};
+/// let entries: Vec<DevTraceEntry> = (0..5).map(|i| {
+///     DevTraceEntry::new(TraceAction::TaskExecution, Some(0), Some(i), Some("task"), "in", "out", 100, true, None)
+/// }).collect();
+/// let timeline = build_timeline(&entries, 3);
+/// assert_eq!(timeline.len(), 3); // 只保留最后 3 条
+/// ```
+pub fn build_timeline(entries: &[DevTraceEntry], max_entries: usize) -> Vec<TimelineEntry> {
+    if entries.len() <= max_entries {
+        entries.iter().map(TimelineEntry::from_entry).collect()
+    } else {
+        entries[entries.len() - max_entries..]
+            .iter()
+            .map(TimelineEntry::from_entry)
+            .collect()
+    }
+}
+
+/// 按操作类型分组统计 trace 条目。
+///
+/// 返回 `HashMap<TraceAction, ActionStats>`, 每种操作类型的统计信息。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceEntry, TraceAction, group_entries_by_action};
+/// let entries = vec![
+///     DevTraceEntry::new(TraceAction::TaskExecution, None, None, None, "in", "out", 100, true, None),
+///     DevTraceEntry::new(TraceAction::TaskExecution, None, None, None, "in", "out", 200, false, None),
+///     DevTraceEntry::new(TraceAction::CompileCheck, None, None, None, "in", "out", 50, true, None),
+/// ];
+/// let grouped = group_entries_by_action(&entries);
+/// assert_eq!(grouped.len(), 2);
+/// let task_stats = grouped.get(&TraceAction::TaskExecution).unwrap();
+/// assert_eq!(task_stats.count, 2);
+/// ```
+pub fn group_entries_by_action(entries: &[DevTraceEntry]) -> HashMap<TraceAction, ActionStats> {
+    let mut by_action: HashMap<TraceAction, ActionStats> = HashMap::new();
+    for entry in entries {
+        let stats = by_action.entry(entry.action).or_default();
+        stats.record(entry.duration_ms, entry.success);
+    }
+    by_action
+}
+
+/// 格式化单条操作统计行为可读字符串。
+///
+/// 格式: `"  任务执行           次数:    2  成功:    1 ( 50.0%)  平均:  1500ms\n"`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{ActionStats, TraceAction, format_action_stats_line};
+/// let mut stats = ActionStats::new();
+/// stats.record(1000, true);
+/// stats.record(2000, false);
+/// let line = format_action_stats_line(TraceAction::TaskExecution, &stats);
+/// assert!(line.contains("任务执行"));
+/// assert!(line.contains("次数:"));
+/// assert!(line.contains("50.0%"));
+/// ```
+pub fn format_action_stats_line(action: TraceAction, stats: &ActionStats) -> String {
+    format!(
+        "  {:20} 次数: {:4}  成功: {:4} ({:5.1}%)  平均: {:5}ms\n",
+        action.description(),
+        stats.count,
+        stats.success_count,
+        stats.success_rate() * 100.0,
+        stats.avg_duration_ms()
+    )
 }
 
 // ============================================================================
@@ -527,19 +669,14 @@ impl DevTraceWriter {
 
         for (line_num, line) in reader.lines().enumerate() {
             let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match DevTraceEntry::from_jsonl(trimmed) {
-                Ok(entry) => entries.push(entry),
-                Err(e) => {
-                    warn!(
-                        "DevTrace: 跳过格式错误的行 {} ({}): {}",
-                        line_num + 1,
-                        e,
-                        &trimmed[..trimmed.len().min(100)]
-                    );
+            match parse_jsonl_line(&line) {
+                Some(entry) => entries.push(entry),
+                None => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        let preview: String = trimmed.chars().take(100).collect();
+                        warn!("DevTrace: 跳过格式错误的行 {}: {}", line_num + 1, preview);
+                    }
                 }
             }
         }
@@ -572,6 +709,38 @@ impl DevTraceWriter {
     pub fn entry_count(&self) -> usize {
         self.read_all().map(|entries| entries.len()).unwrap_or(0)
     }
+}
+
+// ============================================================================
+//  纯逻辑函数 — JSONL 行解析
+// ============================================================================
+
+/// 解析单行 JSONL 为 `DevTraceEntry`。
+///
+/// 空行或格式错误的行返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{parse_jsonl_line, TraceAction};
+/// // 空行返回 None
+/// assert!(parse_jsonl_line("").is_none());
+/// assert!(parse_jsonl_line("   ").is_none());
+///
+/// // 格式错误的 JSON 返回 None
+/// assert!(parse_jsonl_line("not json").is_none());
+///
+/// // 有效 JSON 返回 Some
+/// let json = r#"{"timestamp":"2024-01-01T00:00:00Z","action":"Planning","input_summary":"in","output_summary":"out","duration_ms":100,"success":true}"#;
+/// let entry = parse_jsonl_line(json).unwrap();
+/// assert_eq!(entry.action, TraceAction::Planning);
+/// ```
+pub fn parse_jsonl_line(line: &str) -> Option<DevTraceEntry> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    DevTraceEntry::from_jsonl(trimmed).ok()
 }
 
 // ============================================================================
@@ -2069,5 +2238,924 @@ mod tests {
         assert!(summary
             .by_action
             .contains_key(&TraceAction::PerformanceStats));
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — calculate_success_rate 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_calculate_success_rate_zero_total() {
+        assert_eq!(calculate_success_rate(0, 0), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_all_success() {
+        assert_eq!(calculate_success_rate(10, 10), 1.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_all_failure() {
+        assert_eq!(calculate_success_rate(10, 0), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_half() {
+        assert!((calculate_success_rate(10, 5) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_one_third() {
+        assert!((calculate_success_rate(3, 1) - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_large_numbers() {
+        let total = 1_000_000;
+        let success = 999_999;
+        let rate = calculate_success_rate(total, success);
+        assert!((rate - 0.999999).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_single_success() {
+        assert_eq!(calculate_success_rate(1, 1), 1.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_single_failure() {
+        assert_eq!(calculate_success_rate(1, 0), 0.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_consistency_with_action_stats() {
+        let mut stats = ActionStats::new();
+        stats.record(100, true);
+        stats.record(200, true);
+        stats.record(300, false);
+
+        let rate_from_fn = calculate_success_rate(stats.count, stats.success_count);
+        let rate_from_method = stats.success_rate();
+        assert!((rate_from_fn - rate_from_method).abs() < 0.0001);
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — format_duration_human 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_format_duration_human_zero() {
+        assert_eq!(format_duration_human(0), "0.0s (0.0m)");
+    }
+
+    #[test]
+    fn test_format_duration_human_one_second() {
+        assert_eq!(format_duration_human(1000), "1.0s (0.0m)");
+    }
+
+    #[test]
+    fn test_format_duration_human_one_minute() {
+        assert_eq!(format_duration_human(60000), "60.0s (1.0m)");
+    }
+
+    #[test]
+    fn test_format_duration_human_500ms() {
+        assert_eq!(format_duration_human(500), "0.5s (0.0m)");
+    }
+
+    #[test]
+    fn test_format_duration_human_hour() {
+        assert_eq!(format_duration_human(3_600_000), "3600.0s (60.0m)");
+    }
+
+    #[test]
+    fn test_format_duration_human_max() {
+        let result = format_duration_human(u64::MAX);
+        assert!(result.contains("s"));
+        assert!(result.contains("m"));
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — format_success_rate_percent 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_format_success_rate_percent_zero() {
+        assert_eq!(format_success_rate_percent(0.0), "0.0%");
+    }
+
+    #[test]
+    fn test_format_success_rate_percent_full() {
+        assert_eq!(format_success_rate_percent(1.0), "100.0%");
+    }
+
+    #[test]
+    fn test_format_success_rate_percent_half() {
+        assert_eq!(format_success_rate_percent(0.5), "50.0%");
+    }
+
+    #[test]
+    fn test_format_success_rate_percent_third() {
+        assert_eq!(format_success_rate_percent(1.0 / 3.0), "33.3%");
+    }
+
+    #[test]
+    fn test_format_success_rate_percent_two_thirds() {
+        assert_eq!(format_success_rate_percent(2.0 / 3.0), "66.7%");
+    }
+
+    #[test]
+    fn test_format_success_rate_percent_negative() {
+        // 负值虽然是异常输入, 但函数应该仍能格式化
+        let result = format_success_rate_percent(-0.5);
+        assert!(result.contains("%"));
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — format_timeline_line 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_format_timeline_line_success() {
+        let entry = TimelineEntry {
+            timestamp: Utc::now(),
+            action: TraceAction::TaskExecution,
+            task_name: Some("测试任务".to_string()),
+            success: true,
+            duration_ms: 3000,
+        };
+        let line = format_timeline_line(&entry);
+        assert!(line.contains("✅"));
+        assert!(!line.contains("❌"));
+        assert!(line.contains("任务执行"));
+        assert!(line.contains("测试任务"));
+        assert!(line.contains("3000ms"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_timeline_line_failure() {
+        let entry = TimelineEntry {
+            timestamp: Utc::now(),
+            action: TraceAction::FixAttempt,
+            task_name: Some("修复".to_string()),
+            success: false,
+            duration_ms: 500,
+        };
+        let line = format_timeline_line(&entry);
+        assert!(line.contains("❌"));
+        assert!(!line.contains("✅"));
+        assert!(line.contains("修复尝试"));
+        assert!(line.contains("500ms"));
+    }
+
+    #[test]
+    fn test_format_timeline_line_no_task_name() {
+        let entry = TimelineEntry {
+            timestamp: Utc::now(),
+            action: TraceAction::Planning,
+            task_name: None,
+            success: true,
+            duration_ms: 100,
+        };
+        let line = format_timeline_line(&entry);
+        assert!(line.contains("-")); // None → "-"
+        assert!(line.contains("阶段规划"));
+    }
+
+    #[test]
+    fn test_format_timeline_line_zero_duration() {
+        let entry = TimelineEntry {
+            timestamp: Utc::now(),
+            action: TraceAction::HealthCheck,
+            task_name: None,
+            success: true,
+            duration_ms: 0,
+        };
+        let line = format_timeline_line(&entry);
+        assert!(line.contains("0ms"));
+    }
+
+    #[test]
+    fn test_format_timeline_line_all_action_types() {
+        for action in TraceAction::all() {
+            let entry = TimelineEntry {
+                timestamp: Utc::now(),
+                action,
+                task_name: Some("test".to_string()),
+                success: true,
+                duration_ms: 100,
+            };
+            let line = format_timeline_line(&entry);
+            assert!(
+                line.contains(action.description()),
+                "format_timeline_line should contain action description for {:?}",
+                action
+            );
+        }
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — build_timeline 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_build_timeline_empty() {
+        let timeline = build_timeline(&[], 100);
+        assert!(timeline.is_empty());
+    }
+
+    #[test]
+    fn test_build_timeline_fewer_than_max() {
+        let entries: Vec<DevTraceEntry> = (0..5)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some("task"),
+                    "in",
+                    "out",
+                    100,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let timeline = build_timeline(&entries, 100);
+        assert_eq!(timeline.len(), 5);
+    }
+
+    #[test]
+    fn test_build_timeline_exactly_max() {
+        let entries: Vec<DevTraceEntry> = (0..10)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some("task"),
+                    "in",
+                    "out",
+                    100,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let timeline = build_timeline(&entries, 10);
+        assert_eq!(timeline.len(), 10);
+    }
+
+    #[test]
+    fn test_build_timeline_more_than_max() {
+        let entries: Vec<DevTraceEntry> = (0..20)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some(&format!("task{}", i)),
+                    "in",
+                    "out",
+                    100,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let timeline = build_timeline(&entries, 10);
+        assert_eq!(timeline.len(), 10);
+        // 应该返回最后 10 条
+        assert_eq!(timeline[0].task_name, Some("task10".to_string()));
+        assert_eq!(timeline[9].task_name, Some("task19".to_string()));
+    }
+
+    #[test]
+    fn test_build_timeline_max_zero() {
+        let entries: Vec<DevTraceEntry> = (0..5)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some("task"),
+                    "in",
+                    "out",
+                    100,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let timeline = build_timeline(&entries, 0);
+        assert!(timeline.is_empty());
+    }
+
+    #[test]
+    fn test_build_timeline_single_entry() {
+        let entry = DevTraceEntry::new(
+            TraceAction::Planning,
+            None,
+            None,
+            None,
+            "in",
+            "out",
+            100,
+            true,
+            None,
+        );
+        let timeline = build_timeline(&[entry], 100);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].action, TraceAction::Planning);
+    }
+
+    #[test]
+    fn test_build_timeline_max_one() {
+        let entries: Vec<DevTraceEntry> = (0..5)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some(&format!("task{}", i)),
+                    "in",
+                    "out",
+                    100,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let timeline = build_timeline(&entries, 1);
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].task_name, Some("task4".to_string()));
+    }
+
+    #[test]
+    fn test_build_timeline_consistency_with_summary() {
+        let entries: Vec<DevTraceEntry> = (0..150)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some(&format!("task{}", i)),
+                    "in",
+                    "out",
+                    100,
+                    i % 2 == 0,
+                    None,
+                )
+            })
+            .collect();
+
+        let timeline_fn = build_timeline(&entries, 100);
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert_eq!(timeline_fn.len(), summary.timeline.len());
+        assert_eq!(timeline_fn.len(), 100);
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — group_entries_by_action 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_group_entries_empty() {
+        let grouped = group_entries_by_action(&[]);
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn test_group_entries_single_action() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            None,
+            None,
+            None,
+            "in",
+            "out",
+            100,
+            true,
+            None,
+        )];
+        let grouped = group_entries_by_action(&entries);
+        assert_eq!(grouped.len(), 1);
+        let stats = grouped.get(&TraceAction::TaskExecution).unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.success_count, 1);
+    }
+
+    #[test]
+    fn test_group_entries_multiple_actions() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                200,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::TestRun,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                300,
+                true,
+                None,
+            ),
+        ];
+        let grouped = group_entries_by_action(&entries);
+        assert_eq!(grouped.len(), 3);
+        assert!(grouped.contains_key(&TraceAction::TaskExecution));
+        assert!(grouped.contains_key(&TraceAction::CompileCheck));
+        assert!(grouped.contains_key(&TraceAction::TestRun));
+    }
+
+    #[test]
+    fn test_group_entries_repeated_action_aggregated() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                200,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                300,
+                false,
+                None,
+            ),
+        ];
+        let grouped = group_entries_by_action(&entries);
+        assert_eq!(grouped.len(), 1);
+        let stats = grouped.get(&TraceAction::TaskExecution).unwrap();
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.success_count, 2);
+        assert_eq!(stats.total_duration_ms, 600);
+    }
+
+    #[test]
+    fn test_group_entries_all_action_types() {
+        let entries: Vec<DevTraceEntry> = TraceAction::all()
+            .iter()
+            .map(|action| {
+                DevTraceEntry::new(*action, None, None, None, "in", "out", 100, true, None)
+            })
+            .collect();
+        let grouped = group_entries_by_action(&entries);
+        assert_eq!(grouped.len(), 16);
+        for action in TraceAction::all() {
+            assert!(grouped.contains_key(&action));
+        }
+    }
+
+    #[test]
+    fn test_group_entries_consistency_with_summary() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                200,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                None,
+                None,
+                None,
+                "in",
+                "out",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let grouped = group_entries_by_action(&entries);
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert_eq!(grouped.len(), summary.by_action.len());
+        for (action, stats) in &grouped {
+            let summary_stats = summary.by_action.get(action).unwrap();
+            assert_eq!(stats.count, summary_stats.count);
+            assert_eq!(stats.success_count, summary_stats.success_count);
+        }
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — format_action_stats_line 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_format_action_stats_line_zero_count() {
+        let stats = ActionStats::new();
+        let line = format_action_stats_line(TraceAction::Planning, &stats);
+        assert!(line.contains("阶段规划"));
+        assert!(line.contains("次数:"));
+        assert!(line.contains("成功:"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_action_stats_line_all_success() {
+        let mut stats = ActionStats::new();
+        stats.record(1000, true);
+        stats.record(2000, true);
+        let line = format_action_stats_line(TraceAction::TaskExecution, &stats);
+        assert!(line.contains("任务执行"));
+        assert!(line.contains("100.0%"));
+        assert!(line.contains("1500ms")); // (1000+2000)/2 = 1500
+                                          // 验证计数和成功数通过格式化后的字段包含
+        let count_str = format!("{:4}", 2);
+        assert!(line.contains(&format!("次数: {}", count_str)));
+        assert!(line.contains(&format!("成功: {}", count_str)));
+    }
+
+    #[test]
+    fn test_format_action_stats_line_all_failure() {
+        let mut stats = ActionStats::new();
+        stats.record(500, false);
+        stats.record(700, false);
+        let line = format_action_stats_line(TraceAction::FixAttempt, &stats);
+        assert!(line.contains("修复尝试"));
+        assert!(line.contains("0.0%"));
+        assert!(line.contains("600ms")); // (500+700)/2 = 600
+        let count_str = format!("{:4}", 2);
+        let success_str = format!("{:4}", 0);
+        assert!(line.contains(&format!("次数: {}", count_str)));
+        assert!(line.contains(&format!("成功: {}", success_str)));
+    }
+
+    #[test]
+    fn test_format_action_stats_line_mixed() {
+        let mut stats = ActionStats::new();
+        stats.record(1000, true);
+        stats.record(2000, false);
+        let line = format_action_stats_line(TraceAction::CompileCheck, &stats);
+        assert!(line.contains("编译检查"));
+        assert!(line.contains("50.0%"));
+        assert!(line.contains("1500ms"));
+        let count_str = format!("{:4}", 2);
+        let success_str = format!("{:4}", 1);
+        assert!(line.contains(&format!("次数: {}", count_str)));
+        assert!(line.contains(&format!("成功: {}", success_str)));
+    }
+
+    #[test]
+    fn test_format_action_stats_line_all_action_types() {
+        let stats = ActionStats::new();
+        for action in TraceAction::all() {
+            let line = format_action_stats_line(action, &stats);
+            assert!(
+                line.contains(action.description()),
+                "format_action_stats_line should contain description for {:?}",
+                action
+            );
+        }
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — parse_jsonl_line 边界测试
+    // ======================================================================
+
+    #[test]
+    fn test_parse_jsonl_line_empty() {
+        assert!(parse_jsonl_line("").is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_whitespace_only() {
+        assert!(parse_jsonl_line("   ").is_none());
+        assert!(parse_jsonl_line("\t").is_none());
+        assert!(parse_jsonl_line(" \n ").is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_malformed_json() {
+        assert!(parse_jsonl_line("not json").is_none());
+        assert!(parse_jsonl_line("{broken").is_none());
+        assert!(parse_jsonl_line("12345").is_none());
+        assert!(parse_jsonl_line("null").is_none());
+        assert!(parse_jsonl_line("[]").is_none());
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_valid_json() {
+        let json = r#"{"timestamp":"2024-01-01T00:00:00Z","action":"Planning","input_summary":"in","output_summary":"out","duration_ms":100,"success":true}"#;
+        let entry = parse_jsonl_line(json).unwrap();
+        assert_eq!(entry.action, TraceAction::Planning);
+        assert_eq!(entry.input_summary, "in");
+        assert_eq!(entry.output_summary, "out");
+        assert_eq!(entry.duration_ms, 100);
+        assert!(entry.success);
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_with_whitespace_padding() {
+        let json = r#"  {"timestamp":"2024-01-01T00:00:00Z","action":"TaskExecution","input_summary":"in","output_summary":"out","duration_ms":200,"success":false}  "#;
+        let entry = parse_jsonl_line(json).unwrap();
+        assert_eq!(entry.action, TraceAction::TaskExecution);
+        assert!(!entry.success);
+        assert_eq!(entry.duration_ms, 200);
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_with_optional_fields() {
+        let json = r#"{"timestamp":"2024-01-01T00:00:00Z","action":"TaskExecution","phase_idx":0,"task_idx":1,"task_name":"测试","input_summary":"in","output_summary":"out","duration_ms":500,"success":true,"error":null}"#;
+        let entry = parse_jsonl_line(json).unwrap();
+        assert_eq!(entry.phase_idx, Some(0));
+        assert_eq!(entry.task_idx, Some(1));
+        assert_eq!(entry.task_name, Some("测试".to_string()));
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_unicode_content() {
+        let json = r#"{"timestamp":"2024-01-01T00:00:00Z","action":"TaskExecution","input_summary":"请创建一个 Hello World 程序","output_summary":"已创建 src/main.rs","duration_ms":3000,"success":true}"#;
+        let entry = parse_jsonl_line(json).unwrap();
+        assert!(entry.input_summary.contains("Hello World"));
+        assert!(entry.output_summary.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_all_action_types() {
+        for action in TraceAction::all() {
+            let json = format!(
+                r#"{{"timestamp":"2024-01-01T00:00:00Z","action":"{}","input_summary":"in","output_summary":"out","duration_ms":100,"success":true}}"#,
+                action
+            );
+            let entry = parse_jsonl_line(&json)
+                .unwrap_or_else(|| panic!("parse_jsonl_line failed for action: {}", action));
+            assert_eq!(entry.action, action);
+        }
+    }
+
+    #[test]
+    fn test_parse_jsonl_line_consistency_with_read_all() {
+        let (_dir, writer) = make_writer();
+        // 写入一条有效条目
+        writer
+            .write_entry(&make_entry(TraceAction::Planning, true))
+            .unwrap();
+        // 追加一个空行
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&writer.trace_path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        // 追加一条格式错误的行
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&writer.trace_path)
+            .unwrap()
+            .write_all(b"bad json\n")
+            .unwrap();
+        // 再写一条有效条目
+        writer
+            .write_entry(&make_entry(TraceAction::TaskExecution, true))
+            .unwrap();
+
+        // read_all 应该和 parse_jsonl_line 一致: 跳过空行和错误行
+        let entries = writer.read_all().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // 验证 parse_jsonl_line 对每行的行为一致
+        let file = std::fs::File::open(&writer.trace_path).unwrap();
+        let reader = BufReader::new(file);
+        let mut parsed_count = 0;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if parse_jsonl_line(&line).is_some() {
+                parsed_count += 1;
+            }
+        }
+        assert_eq!(parsed_count, 2);
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — to_report 一致性验证
+    // ======================================================================
+
+    #[test]
+    fn test_to_report_uses_format_duration_human() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            None,
+            None,
+            None,
+            "in",
+            "out",
+            5000,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+        assert!(
+            report.contains(&format_duration_human(5000)),
+            "to_report should use format_duration_human"
+        );
+    }
+
+    #[test]
+    fn test_to_report_uses_format_success_rate_percent() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            None,
+            None,
+            None,
+            "in",
+            "out",
+            100,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+        assert!(
+            report.contains(&format_success_rate_percent(1.0)),
+            "to_report should use format_success_rate_percent"
+        );
+    }
+
+    #[test]
+    fn test_to_report_uses_format_action_stats_line() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            None,
+            None,
+            None,
+            "in",
+            "out",
+            1000,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+        let stats = summary
+            .get_action_stats(TraceAction::TaskExecution)
+            .unwrap();
+        let stats_line = format_action_stats_line(TraceAction::TaskExecution, stats);
+        assert!(
+            report.contains(&stats_line),
+            "to_report should use format_action_stats_line"
+        );
+    }
+
+    #[test]
+    fn test_to_report_uses_format_timeline_line() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::Planning,
+            None,
+            None,
+            Some("测试"),
+            "in",
+            "out",
+            100,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+        let timeline_line = format_timeline_line(&summary.timeline[0]);
+        assert!(
+            report.contains(&timeline_line),
+            "to_report should use format_timeline_line"
+        );
+    }
+
+    // ======================================================================
+    //  纯逻辑函数 — 大规模集成测试
+    // ======================================================================
+
+    #[test]
+    fn test_pure_functions_large_scale_24h_simulation() {
+        // 模拟 24h 运行: 500 条 trace 条目
+        let entries: Vec<DevTraceEntry> = (0..500)
+            .map(|i| {
+                let action = match i % 5 {
+                    0 => TraceAction::TaskExecution,
+                    1 => TraceAction::FixAttempt,
+                    2 => TraceAction::CompileCheck,
+                    3 => TraceAction::TestRun,
+                    _ => TraceAction::Clarification,
+                };
+                DevTraceEntry::new(
+                    action,
+                    Some(i / 50),
+                    Some(i % 50),
+                    Some(&format!("任务{}", i)),
+                    &format!("输入{}", i),
+                    &format!("输出{}", i),
+                    (i + 1) as u64 * 100,
+                    i % 3 != 0,
+                    if i % 3 == 0 { Some("失败") } else { None },
+                )
+            })
+            .collect();
+
+        // 验证所有纯函数协同工作
+        let total_duration: u64 = entries.iter().map(|e| e.duration_ms).sum();
+        let success_count = entries.iter().filter(|e| e.success).count();
+        let rate = calculate_success_rate(entries.len(), success_count);
+        let grouped = group_entries_by_action(&entries);
+        let timeline = build_timeline(&entries, 100);
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        // 验证一致性
+        assert_eq!(summary.total_entries, entries.len());
+        assert_eq!(summary.total_duration_ms, total_duration);
+        assert!((summary.success_rate - rate).abs() < 0.0001);
+        assert_eq!(grouped.len(), summary.by_action.len());
+        assert_eq!(timeline.len(), summary.timeline.len());
+        assert_eq!(timeline.len(), 100); // 限制为最近 100 条
+
+        // 验证报告可读
+        let report = summary.to_report();
+        assert!(report.contains("DevTrace 开发追踪报告"));
+        assert!(report.contains(&format!("总条目: {}", entries.len())));
+        assert!(report.contains(&format_duration_human(total_duration)));
+        assert!(report.contains(&format_success_rate_percent(rate)));
+    }
+
+    #[test]
+    fn test_pure_functions_empty_entries_all_consistent() {
+        let entries: Vec<DevTraceEntry> = vec![];
+
+        let rate = calculate_success_rate(0, 0);
+        let grouped = group_entries_by_action(&entries);
+        let timeline = build_timeline(&entries, 100);
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        // 所有函数对空输入应返回空/默认值
+        assert_eq!(rate, 0.0);
+        assert!(grouped.is_empty());
+        assert!(timeline.is_empty());
+        assert_eq!(summary.total_entries, 0);
+        assert_eq!(summary.total_duration_ms, 0);
+        assert_eq!(summary.success_rate, 0.0);
+        assert!(summary.timeline.is_empty());
+        assert!(summary.by_action.is_empty());
+
+        // 报告仍可生成
+        let report = summary.to_report();
+        assert!(report.contains("DevTrace 开发追踪报告"));
+        assert!(report.contains("总条目: 0"));
     }
 }
