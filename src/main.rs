@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use forge::browser_launcher::{self, BrowserLauncher};
 use forge::cdp;
 use forge::chat::TimeoutConfig;
 use forge::clarify::HeuristicClarificationChecker;
@@ -22,7 +23,8 @@ use forge::workspace::Workspace;
 use forge::BrowserManager;
 use forge::Orchestrator;
 use std::path::PathBuf;
-use tracing::{error, warn};
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "forge")]
@@ -31,6 +33,21 @@ struct Cli {
     /// Chrome 调试端口
     #[arg(short, long, default_value = "9222")]
     port: u16,
+
+    /// 自动启动浏览器 (Forge 自动检测并启动 Chrome/Edge)
+    ///
+    /// 启用后, Forge 自动检测系统中的 Chrome/Edge, 寻找可用端口,
+    /// 启动浏览器进程并等待 CDP 端口就绪。退出时自动关闭浏览器。
+    #[arg(long)]
+    auto_launch: bool,
+
+    /// 连接已有浏览器 (复用用户已打开的浏览器, 包括登录态)
+    ///
+    /// 启用后, Forge 等待用户已有浏览器开启远程调试端口,
+    /// 直接复用已有的登录态和标签页, 大幅降低使用门槛。
+    /// 需要用户在 Chrome 中手动开启远程调试。
+    #[arg(long)]
+    connect_existing: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -259,9 +276,73 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // === 浏览器管理: 自动启动 / 连接已有 / 手动模式 ===
+    //
+    // 三种模式 (按优先级):
+    // 1. --auto-launch: Forge 自动检测并启动浏览器 (子进程, 退出时关闭)
+    // 2. --connect-existing: 等待连接用户已有浏览器 (复用登录态)
+    // 3. 默认: 假设用户已手动启动浏览器, 直接连接
+    let _launcher = if cli.auto_launch {
+        let mut launcher = BrowserLauncher::new();
+        launcher.detect_browser()?;
+        let port = launcher.find_available_port(cli.port)?;
+        launcher.launch(port, None, &[])?;
+        launcher
+            .wait_for_ready(port, Duration::from_secs(15))
+            .await?;
+        info!("🌐 浏览器已自动启动 (端口 {})", port);
+        // 覆盖 CLI 端口为实际使用的端口
+        Some(launcher)
+    } else if cli.connect_existing {
+        info!("⏳ 等待已有浏览器开启远程调试 (端口 {})...", cli.port);
+        browser_launcher::connect_existing_browser(cli.port, Duration::from_secs(120)).await?;
+        info!("✅ 已连接到已有浏览器 (端口 {})", cli.port);
+        None
+    } else {
+        // 默认模式: 检查端口是否可达, 不可达时提示用户
+        if cdp::check_reachable(cli.port).await.is_err() {
+            warn!("Chrome 调试端口 {} 不可达", cli.port);
+            println!("Chrome 调试端口 {} 不可达。你可以:", cli.port);
+            println!("  1. 使用 --auto-launch 让 Forge 自动启动浏览器");
+            println!("  2. 使用 --connect-existing 连接已有浏览器");
+            println!(
+                "  3. 手动启动: {} --remote-debugging-port={} --user-data-dir={}",
+                chrome_path(),
+                cli.port,
+                chrome_user_data_dir()
+            );
+        }
+        None
+    };
+
+    // === 优雅退出 + 双重中断机制 ===
+    //
+    // 借鉴 MediaCrawler app_runner.py 的双重中断设计:
+    // - 第一次 Ctrl+C → 触发清理 (15 秒超时)
+    // - 第二次 Ctrl+C → 强制退出
+    let main_result = run_command(cli).await;
+
+    // 如果有自动启动的浏览器, 在退出前清理
+    if let Some(ref launcher) = _launcher {
+        if launcher.is_running() {
+            info!("正在关闭浏览器...");
+        }
+    }
+    // BrowserLauncher 的 Drop 会自动 cleanup
+
+    main_result
+}
+
+/// 执行 CLI 命令 — 从 main 函数中提取, 支持优雅退出
+///
+/// 借鉴 MediaCrawler app_runner.py 的双重中断设计:
+/// - 第一次 Ctrl+C → 触发清理 (15 秒超时)
+/// - 第二次 Ctrl+C → 强制退出
+async fn run_command(cli: Cli) -> Result<()> {
+    let port = cli.port;
     match cli.command {
         Commands::List => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             match manager.discover_and_connect().await {
                 Ok(_) => {
                     println!("\n找到 {} 个聊天标签页:", manager.tabs.len());
@@ -277,7 +358,7 @@ async fn main() -> Result<()> {
                     println!(
                         "  2. 启动: {} --remote-debugging-port={} --user-data-dir={}",
                         chrome_path(),
-                        cli.port,
+                        port,
                         chrome_user_data_dir()
                     );
                     println!("  3. 在 Chrome 中打开聊天网页并登录");
@@ -288,7 +369,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Health { tab } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
 
             if manager.tabs.is_empty() {
@@ -344,7 +425,7 @@ async fn main() -> Result<()> {
 
         Commands::Open { url } => {
             println!("正在打开: {}", url);
-            match cdp::create_tab(cli.port, &url).await {
+            match cdp::create_tab(port, &url).await {
                 Ok(tab) => println!("✅ 已打开: {} ({})", tab.title, tab.url),
                 Err(e) => error!("打开失败: {}", e),
             }
@@ -355,7 +436,7 @@ async fn main() -> Result<()> {
             timeout,
             tab,
         } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
             if tab >= manager.tabs.len() {
                 anyhow::bail!(
@@ -390,7 +471,7 @@ async fn main() -> Result<()> {
             tab,
             timeout,
         } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
             if tab >= manager.tabs.len() {
                 anyhow::bail!(
@@ -454,7 +535,7 @@ async fn main() -> Result<()> {
             timeout,
             tab,
         } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
             if tab >= manager.tabs.len() {
                 anyhow::bail!(
@@ -502,7 +583,7 @@ async fn main() -> Result<()> {
             timeout,
             tab,
         } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
             if tab >= manager.tabs.len() {
                 anyhow::bail!(
@@ -629,7 +710,7 @@ async fn main() -> Result<()> {
             failover_max_failures,
             failover_cooldown,
         } => {
-            let mut manager = BrowserManager::new(cli.port);
+            let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
             if tab >= manager.tabs.len() {
                 anyhow::bail!(
@@ -749,7 +830,7 @@ async fn main() -> Result<()> {
                         dev_trace,
                         slash_commands,
                         auto_recovery,
-                        cli.port,
+                        port,
                         recovery_retries,
                         requirement_file.as_deref(),
                     )
@@ -777,7 +858,7 @@ async fn main() -> Result<()> {
                         dev_trace,
                         slash_commands,
                         auto_recovery,
-                        cli.port,
+                        port,
                         recovery_retries,
                         requirement_file.as_deref(),
                     )
@@ -822,7 +903,7 @@ async fn main() -> Result<()> {
                         dev_trace,
                         slash_commands,
                         auto_recovery,
-                        cli.port,
+                        port,
                         recovery_retries,
                         requirement_file.as_deref(),
                     )
@@ -847,7 +928,7 @@ async fn main() -> Result<()> {
                         dev_trace,
                         slash_commands,
                         auto_recovery,
-                        cli.port,
+                        port,
                         recovery_retries,
                         requirement_file.as_deref(),
                     )

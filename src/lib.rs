@@ -20,12 +20,17 @@
 //! | [`cdp`] | CDP WebSocket low-level connection |
 //! | [`chat`] | Chat page operations (send/wait/streaming) |
 //! | [`browser`] | Browser manager (tab discovery, site detection) |
+//! | [`browser_launcher`] | Browser auto-detection, launch, and lifecycle management |
+//! | [`config`] | TOML configuration + environment variable override |
 //! | [`workspace`] | Workspace management (files/snapshots) |
 //! | [`extract`] | Code extraction from AI responses |
 //! | [`clarify`] | Heuristic autonomous clarification |
 //! | [`llm_clarify`] | LLM-enhanced clarification (Ollama) |
 //! | [`failover_chat`] | Multi-site automatic failover |
-//! | [`site_health`] | Website health checking |
+//! | [`site_health`] | Website health checking (triple-check mechanism) |
+//! | [`proxy_pool`] | Proxy IP pool with auto-refresh (Mixin pattern) |
+//! | [`response_handler`] | Handler chain for AI response processing (callback pattern) |
+//! | [`trace_store`] | Pluggable trace storage backend (factory pattern) |
 //! | [`task_graph`] | Task dependency graph (DAG parallelism) |
 //! | [`error_diagnosis`] | Intelligent error diagnosis |
 //! | [`context_handoff`] | Context handoff for long conversations |
@@ -55,9 +60,11 @@
 
 pub mod auto_recovery;
 pub mod browser;
+pub mod browser_launcher;
 pub mod cdp;
 pub mod chat;
 pub mod clarify;
+pub mod config;
 pub mod connection_monitor;
 pub mod context_handoff;
 pub mod dev_trace;
@@ -72,11 +79,14 @@ pub mod memory;
 pub mod orchestrator;
 pub mod package;
 pub mod prompt_builder;
+pub mod proxy_pool;
+pub mod response_handler;
 pub mod site_health;
 pub mod slash_command;
 pub mod steer_reminder;
 pub mod task_graph;
 pub mod testrunner;
+pub mod trace_store;
 pub mod traits;
 pub mod workspace;
 
@@ -88,8 +98,18 @@ pub use auto_recovery::{
     RecoveryConfig, RecoveryResult, RecoveryStrategy, RecoveryUrgency,
 };
 pub use browser::{BrowserManager, ChatTab, SiteType};
+pub use browser_launcher::{
+    browser_exists, browser_from_env, browser_name, build_launch_args, connect_existing_browser,
+    default_user_data_dir, detect_browser_paths, find_available_port_sync, find_browser,
+    is_browser_running, is_port_available_sync, BrowserLauncher,
+};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
 pub use clarify::HeuristicClarificationChecker;
+pub use config::{
+    apply_env_overrides, default_config_path, expand_tilde, load_config, load_from_file,
+    parse_bool, BrowserConfig, ChatConfig, ForgeConfig, RecoveryConfig as ConfigRecovery,
+    StorageConfig as ConfigStorage,
+};
 pub use connection_monitor::{
     calculate_monitor_success_rate, classify_connection_severity, compute_next_check_delay,
     determine_health_level, format_monitor_success_rate, format_recovery_event_line, format_uptime,
@@ -132,10 +152,19 @@ pub use loop_detector::{
 pub use memory::{Memory, RequirementChange};
 pub use orchestrator::Orchestrator;
 pub use prompt_builder::SystemPrompt;
+pub use proxy_pool::{
+    build_reqwest_proxy, is_valid_proxy_url, load_proxies_from_env, ProxyConfig, ProxyPool,
+    ProxyRefresh,
+};
+pub use response_handler::{
+    CodeExtractorHandler, HandlerChain, HandlerResult, MemoryUpdaterHandler, ResponseHandler,
+    TaskContext, TraceWriterHandler,
+};
 pub use site_health::{
-    calculate_health_rate, check_all_tabs, check_and_log, classify_health_severity,
-    compute_health_check_interval, determine_failover_priority, format_health_rate,
-    format_health_result_line, interpret_health_json, select_best_healthy_tab, should_skip_tab,
+    build_detailed_check_js, calculate_health_rate, check_all_tabs, check_and_log,
+    classify_health_severity, compute_health_check_interval, determine_failover_priority,
+    format_health_rate, format_health_result_line, interpret_detailed_result,
+    interpret_health_json, select_best_healthy_tab, should_skip_tab, DetailedHealthStatus,
     HealthCheckJson, HealthCheckResult, HealthSeverity, SiteFailover, SiteHealthChecker,
     SiteHealthStatus,
 };
@@ -151,6 +180,10 @@ pub use steer_reminder::{
 };
 pub use task_graph::{TaskGraph, TaskGraphError};
 pub use testrunner::{CargoTestRunner, E2ETestCase, E2ETestResult, E2ETestSummary};
+pub use trace_store::{
+    create_trace_store, JsonTraceStore, JsonlTraceStore, StorageBackend,
+    StorageConfig as TraceStorageConfig, TraceEntry, TraceStore,
+};
 pub use traits::{
     ChatClient, ChatResult, ClarificationChecker, ClarificationContext, ClarificationResult,
     Failoverable, FileExtractor, FixContext, HumanInteraction, Language, LanguageAdapter,

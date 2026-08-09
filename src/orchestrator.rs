@@ -313,8 +313,8 @@ fn repair_truncated_json(json_str: &str) -> String {
 
     if let Some(end) = last_complete_end {
         let mut repaired = trimmed[..end].to_string();
-        // 关闭未闭合的数组
-        if !repaired.ends_with(']') {
+        // 只在输入是数组时关闭未闭合的数组
+        if repaired.starts_with('[') && !repaired.ends_with(']') {
             repaired.push(']');
         }
         // 尝试再次修复: 移除末尾的逗号
@@ -322,7 +322,12 @@ fn repair_truncated_json(json_str: &str) -> String {
             repaired = repaired.trim_end_matches(",]").to_string();
             repaired.push(']');
         }
-        repaired
+        // 验证修复后的 JSON 是否有效, 无效则回退到空数组
+        if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+            repaired
+        } else {
+            "[]".to_string()
+        }
     } else {
         // 无法找到完整对象, 返回空数组
         "[]".to_string()
@@ -2851,6 +2856,7 @@ where
 mod tests {
     use super::*;
     use crate::testrunner::CompileError;
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     /// 创建临时工作区并初始化
@@ -3467,5 +3473,126 @@ mod tests {
         // 只出现一次
         let count = prompt.matches("--- src/main.rs").count();
         assert_eq!(count, 1);
+    }
+
+    // ========================================================================
+    //  proptest 属性测试 (Session 68)
+    // ========================================================================
+
+    /// 构建 JSON 对象字符串的策略
+    fn json_obj_strategy() -> impl Strategy<Value = String> {
+        (r"[a-z]{1,8}", r"[a-z]{1,8}").prop_map(|(k, v)| format!(r#"{{"{}":"{}"}}"#, k, v))
+    }
+
+    #[test]
+    fn prop_valid_json_unchanged() {
+        proptest!(|(ref input in json_obj_strategy())| {
+            let repaired = repair_truncated_json(input);
+            let original_parsed: serde_json::Value = serde_json::from_str(input).unwrap();
+            let repaired_parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+            prop_assert_eq!(original_parsed, repaired_parsed);
+        });
+    }
+
+    #[test]
+    fn prop_valid_json_array_unchanged() {
+        proptest!(|(objs in prop::collection::vec(json_obj_strategy(), 0..10))| {
+            let input = format!("[{}]", objs.join(","));
+            let repaired = repair_truncated_json(&input);
+            let original: serde_json::Value = serde_json::from_str(&input).unwrap();
+            let repaired_parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+            prop_assert_eq!(original, repaired_parsed);
+        });
+    }
+
+    #[test]
+    fn prop_output_always_valid_json() {
+        proptest!(|(ref s in r".{0,200}")| {
+            let repaired = repair_truncated_json(s);
+            prop_assert!(
+                serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+                "output not valid JSON: input={:?}, output={:?}",
+                s,
+                repaired
+            );
+        });
+    }
+
+    #[test]
+    fn prop_empty_input_returns_empty_array() {
+        proptest!(|(ref s in r"\s*")| {
+            let repaired = repair_truncated_json(s);
+            if s.trim().is_empty() {
+                prop_assert_eq!(repaired, "[]");
+            }
+        });
+    }
+
+    #[test]
+    fn prop_repaired_never_more_elements() {
+        proptest!(|(
+            objs in prop::collection::vec(json_obj_strategy(), 1..10),
+            trailing in r"[a-z:, ]{0,50}"
+        )| {
+            let input = format!("[{},{}", objs.join(","), trailing);
+            let repaired = repair_truncated_json(&input);
+            let repaired_arr: Vec<serde_json::Value> =
+                serde_json::from_str(&repaired).unwrap_or_default();
+            prop_assert!(
+                repaired_arr.len() <= objs.len(),
+                "repaired has {} elements but input has {} complete objects: input={:?}",
+                repaired_arr.len(),
+                objs.len(),
+                input
+            );
+        });
+    }
+
+    #[test]
+    fn prop_normalize_empty_returns_none() {
+        proptest!(|(ref s in r"\s*")| {
+            let (_dir, ws) = make_ws();
+            let result = FixPromptBuilder::normalize_error_path(&ws, s);
+            if s.trim().is_empty() {
+                prop_assert!(result.is_none(), "empty path should return None: input={:?}", s);
+            }
+        });
+    }
+
+    #[test]
+    fn prop_normalize_relative_returns_some() {
+        proptest!(|(path in r"[a-zA-Z0-9_.][a-zA-Z0-9_./-]{0,49}")| {
+            let (_dir, ws) = make_ws();
+            let path = if path.starts_with('/') || path.starts_with('\\') {
+                &path[1..]
+            } else {
+                &path
+            };
+            if !path.trim().is_empty() {
+                let result = FixPromptBuilder::normalize_error_path(&ws, path);
+                prop_assert!(result.is_some(), "relative path should return Some: input={:?}", path);
+                prop_assert_eq!(result.unwrap(), path);
+            }
+        });
+    }
+
+    #[test]
+    fn prop_get_files_nonexistent_includes_marker() {
+        proptest!(|(paths in prop::collection::vec(r"[a-zA-Z0-9_./-]{1,30}\.rs", 1..5))| {
+            let (_dir, ws) = make_ws();
+            let content = FixPromptBuilder::get_files_full_content(&ws, &paths);
+            prop_assert!(
+                content.contains("not exist") || content.contains("不存在"),
+                "nonexistent files should include marker: paths={:?}",
+                paths
+            );
+        });
+    }
+
+    #[test]
+    fn prop_get_files_empty_returns_placeholder() {
+        let (_dir, ws) = make_ws();
+        let content = FixPromptBuilder::get_files_full_content(&ws, &[]);
+        assert_eq!(content, "(无文件)");
     }
 }

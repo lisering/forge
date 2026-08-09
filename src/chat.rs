@@ -2107,6 +2107,7 @@ impl Failoverable for ChatTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ===== TimeoutConfig 基本测试 =====
 
@@ -3809,6 +3810,135 @@ mod tests {
         assert!(code.contains("focus_and_clear_input"), "方案 B 应清空输入");
         assert!(code.contains("insert_text"), "方案 B 应重新插入文本");
         assert!(code.contains("btn_ready3"), "方案 B 应等待发送按钮");
+    }
+
+    // ========================================================================
+    //  proptest 属性测试 (Session 68)
+    // ========================================================================
+
+    #[test]
+    fn prop_is_meaningful_empty_returns_false() {
+        proptest!(|(ref s in r"\s*")| {
+            if s.trim().is_empty() {
+                prop_assert!(!is_meaningful_content(s),
+                    "empty text should return false: input={:?}", s);
+            }
+        });
+    }
+
+    #[test]
+    fn prop_is_meaningful_ui_only_returns_false() {
+        proptest!(|(lines in prop::collection::vec(
+            r"(思考过程|跳过|正在思考|复制|下载|重新生成|点赞|踩|深度思考 最高)",
+            1..5
+        ))| {
+            let text = lines.join("\n");
+            prop_assert!(!is_meaningful_content(&text),
+                "UI-only text should return false: input={:?}", text);
+        });
+    }
+
+    #[test]
+    fn prop_is_meaningful_with_content_returns_true() {
+        proptest!(|(content in r"[a-zA-Z0-9]{2,50}")| {
+            prop_assert!(is_meaningful_content(&content),
+                "content text should return true: input={:?}", content);
+        });
+    }
+
+    #[test]
+    fn prop_is_meaningful_deterministic() {
+        proptest!(|(ref s in r".{0,100}")| {
+            let result1 = is_meaningful_content(s);
+            let result2 = is_meaningful_content(s);
+            prop_assert_eq!(result1, result2,
+                "same input should return same result: input={:?}", s);
+        });
+    }
+
+    #[test]
+    fn prop_stability_target_always_valid() {
+        proptest!(|(len in 0usize..100000)| {
+            let target = calculate_stability_target(len);
+            prop_assert!(target == 3 || target == 5 || target == 6,
+                "target should be 3/5/6: len={}, target={}", len, target);
+        });
+    }
+
+    #[test]
+    fn prop_stability_target_short() {
+        proptest!(|(len in 0usize..499)| {
+            prop_assert_eq!(calculate_stability_target(len), 3);
+        });
+    }
+
+    #[test]
+    fn prop_stability_target_medium() {
+        proptest!(|(len in 500usize..4999)| {
+            prop_assert_eq!(calculate_stability_target(len), 5);
+        });
+    }
+
+    #[test]
+    fn prop_stability_target_long() {
+        proptest!(|(len in 5000usize..100000)| {
+            prop_assert_eq!(calculate_stability_target(len), 6);
+        });
+    }
+
+    #[test]
+    fn prop_for_site_type_deepseek_min_30() {
+        proptest!(|(phase1 in 0u64..200)| {
+            let config = TimeoutConfig::new(phase1, 60, 45);
+            let adjusted = config.for_site_type(SiteType::DeepSeek);
+            prop_assert!(adjusted.phase1_secs >= 30,
+                "DeepSeek phase1 should be >= 30: phase1={}, adjusted={}",
+                phase1, adjusted.phase1_secs);
+        });
+    }
+
+    #[test]
+    fn prop_for_site_type_zai_min_30() {
+        proptest!(|(phase1 in 0u64..200)| {
+            let config = TimeoutConfig::new(phase1, 60, 45);
+            let adjusted = config.for_site_type(SiteType::Zai);
+            prop_assert!(adjusted.phase1_secs >= 30,
+                "Zai phase1 should be >= 30: phase1={}, adjusted={}",
+                phase1, adjusted.phase1_secs);
+        });
+    }
+
+    #[test]
+    fn prop_for_site_type_does_not_modify_original() {
+        proptest!(|(phase1 in 0u64..200)| {
+            let config = TimeoutConfig::new(phase1, 60, 45);
+            let _adjusted = config.for_site_type(SiteType::DeepSeek);
+            prop_assert_eq!(config.phase1_secs, phase1,
+                "original config should not be modified");
+        });
+    }
+
+    #[test]
+    fn prop_calculate_page_state_count_non_negative() {
+        proptest!(|(
+            assistant in 0usize..100,
+            markdown in 0usize..100,
+            kimi in 0usize..100,
+            tongyi in 0usize..100,
+            claude in 0usize..100,
+            text_len in 0usize..10000
+        )| {
+            let (count, hash) = calculate_page_state(
+                assistant, markdown, kimi, tongyi, claude, text_len
+            );
+            let expected = if assistant > 0 { assistant }
+                else if markdown > 0 { markdown }
+                else if kimi > 0 { kimi }
+                else if tongyi > 0 { tongyi }
+                else { claude };
+            prop_assert_eq!(count, expected);
+            prop_assert_eq!(hash, text_len as u64);
+        });
     }
 
     #[test]

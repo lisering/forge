@@ -120,6 +120,290 @@ impl std::fmt::Display for SiteHealthStatus {
 }
 
 // ============================================================================
+//  DetailedHealthStatus — 细粒度健康状态 (借鉴 MediaCrawler 三重检测)
+// ============================================================================
+
+/// 细粒度网站健康状态 — 借鉴 MediaCrawler check_login_state() 三重检测设计
+///
+/// 比 [`SiteHealthStatus`] 更细粒度, 区分:
+/// - 需要登录 (检测到登录按钮/弹窗)
+/// - 需要验证码 (检测到验证码/人机验证)
+/// - 会话过期 (Cookie/Session 失效)
+/// - 限流 (检测到限流提示)
+///
+/// 这样 [`crate::auto_recovery::AutoRecovery`] 可以根据不同状态采取不同恢复策略:
+/// - `NeedsLogin` → 通知用户手动登录
+/// - `CaptchaRequired` → 等待用户处理验证码
+/// - `SessionExpired` → 刷新页面
+/// - `RateLimited` → 等待冷却后重试
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DetailedHealthStatus {
+    /// 健康 — 页面正常, 输入框可用
+    Healthy,
+    /// 需要登录 — 检测到登录按钮/登录弹窗
+    NeedsLogin,
+    /// 需要验证码 — 检测到验证码/人机验证
+    CaptchaRequired,
+    /// 被限流 —$请求过于频繁
+    RateLimited,
+    /// 会话过期 — Cookie/Session 失效 (输入框不可用但非登录页)
+    SessionExpired,
+    /// 维护中 — 网站正在维护
+    UnderMaintenance,
+    /// 网络错误 — 页面加载失败
+    NetworkError(String),
+    /// 未知状态 — 无法判断
+    #[default]
+    Unknown,
+}
+
+impl DetailedHealthStatus {
+    /// 是否健康
+    pub fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    /// 是否需要人工干预 (登录/验证码)
+    pub fn needs_human_intervention(&self) -> bool {
+        matches!(self, Self::NeedsLogin | Self::CaptchaRequired)
+    }
+
+    /// 是否可以自动恢复 (刷新页面/等待冷却)
+    pub fn can_auto_recover(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionExpired | Self::RateLimited | Self::UnderMaintenance
+        )
+    }
+
+    /// 转换为基本的 [`SiteHealthStatus`]
+    pub fn to_basic_status(&self) -> SiteHealthStatus {
+        match self {
+            Self::Healthy => SiteHealthStatus::Healthy,
+            Self::NeedsLogin | Self::SessionExpired => SiteHealthStatus::NotLoggedIn,
+            Self::CaptchaRequired => SiteHealthStatus::NotLoggedIn,
+            Self::RateLimited => SiteHealthStatus::RateLimited,
+            Self::UnderMaintenance => SiteHealthStatus::UnderMaintenance,
+            Self::NetworkError(_) => SiteHealthStatus::NetworkError,
+            Self::Unknown => SiteHealthStatus::Unknown,
+        }
+    }
+
+    /// 人类可读的描述
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Healthy => "健康 — 页面正常",
+            Self::NeedsLogin => "需要登录 — 检测到登录提示",
+            Self::CaptchaRequired => "需要验证码 — 检测到人机验证",
+            Self::RateLimited => "被限流 — 请求过于频繁",
+            Self::SessionExpired => "会话过期 — 需要刷新或重新登录",
+            Self::UnderMaintenance => "维护中 — 网站不可用",
+            Self::NetworkError(msg) => msg,
+            Self::Unknown => "未知状态 — 无法判断",
+        }
+    }
+
+    /// 推荐的恢复策略描述
+    pub fn recovery_hint(&self) -> &str {
+        match self {
+            Self::Healthy => "无需恢复",
+            Self::NeedsLogin => "请在浏览器中手动登录",
+            Self::CaptchaRequired => "请在浏览器中完成验证码",
+            Self::RateLimited => "等待冷却后自动重试",
+            Self::SessionExpired => "刷新页面可能恢复",
+            Self::UnderMaintenance => "等待维护结束后重试",
+            Self::NetworkError(_) => "检查网络连接",
+            Self::Unknown => "建议手动检查页面状态",
+        }
+    }
+}
+
+impl std::fmt::Display for DetailedHealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.description())
+    }
+}
+
+/// 构建细粒度检测的 JS 代码 — 三重检测
+///
+/// 借鉴 MediaCrawler check_login_state() 的三重检测设计:
+/// 1. UI 元素检测 (登录按钮/弹窗)
+/// 2. 验证码检测 (人机验证/滑块验证)
+/// 3. 输入框可用性检测 (健康/会话过期)
+pub fn build_detailed_check_js(site_type: SiteType) -> String {
+    let input_selector = match site_type {
+        SiteType::Zai => "#chat-input, textarea",
+        SiteType::DeepSeek => "textarea",
+        SiteType::Claude => ".ProseMirror, [contenteditable='true']",
+        _ => "textarea",
+    };
+
+    format!(
+        r#"
+        (() => {{
+            const result = {{
+                url: window.location.href,
+                hasInput: false,
+                hasLoginButton: false,
+                hasCaptcha: false,
+                hasRateLimit: false,
+                hasMaintenance: false,
+                loginText: '',
+                captchaText: '',
+                message: '',
+            }};
+
+            // === 1. 登录检测 ===
+            // 检测登录按钮/弹窗/链接
+            const loginSelectors = [
+                'button:has-text("登录")',
+                'a:has-text("登录")',
+                '[class*="login"]',
+                '[class*="sign-in"]',
+                '[class*="Login"]',
+                '#login-button',
+                'button[aria-label*="login" i]',
+            ];
+            for (const sel of loginSelectors) {{
+                try {{
+                    const el = document.querySelector(sel);
+                    if (el && el.getBoundingClientRect().height > 0) {{
+                        result.hasLoginButton = true;
+                        result.loginText = (el.textContent || '').trim().slice(0, 50);
+                        break;
+                    }}
+                }} catch(e) {{}}
+            }}
+            // 检测页面文本中的登录提示
+            if (!result.hasLoginButton) {{
+                const bodyText = document.body ? document.body.innerText.slice(0, 5000) : '';
+                const loginPatterns = ['请登录', '请先登录', '登录后', 'Sign in', 'Please log in', 'Log in to'];
+                for (const pat of loginPatterns) {{
+                    if (bodyText.includes(pat)) {{
+                        result.hasLoginButton = true;
+                        result.loginText = pat;
+                        break;
+                    }}
+                }}
+            }}
+
+            // === 2. 验证码检测 ===
+            const captchaSelectors = [
+                '[class*="captcha"]',
+                '[class*="verify"]',
+                '[class*="Captcha"]',
+                'iframe[src*="captcha"]',
+                'iframe[src*="recaptcha"]',
+                '#captcha',
+                '.geetest',
+                '.slider-verify',
+            ];
+            for (const sel of captchaSelectors) {{
+                try {{
+                    const el = document.querySelector(sel);
+                    if (el && el.getBoundingClientRect().height > 0) {{
+                        result.hasCaptcha = true;
+                        result.captchaText = sel;
+                        break;
+                    }}
+                }} catch(e) {{}}
+            }}
+            // 检测验证码文本
+            if (!result.hasCaptcha) {{
+                const bodyText = document.body ? document.body.innerText.slice(0, 5000) : '';
+                const captchaPatterns = ['请通过验证', '请完成验证', '人机验证', '安全验证', 'Verify you are human'];
+                for (const pat of captchaPatterns) {{
+                    if (bodyText.includes(pat)) {{
+                        result.hasCaptcha = true;
+                        result.captchaText = pat;
+                        break;
+                    }}
+                }}
+            }}
+
+            // === 3. 输入框可用性检测 ===
+            const input = document.querySelector('{}');
+            if (input) {{
+                const rect = input.getBoundingClientRect();
+                const style = window.getComputedStyle(input);
+                result.hasInput = rect.width > 50 && rect.height > 15 &&
+                    style.display !== 'none' && style.visibility !== 'hidden';
+            }}
+
+            // === 4. 限流检测 ===
+            const bodyText = document.body ? document.body.innerText.slice(0, 5000) : '';
+            const rateLimitPatterns = ['请求过于频繁', '请稍后再试', 'Too many requests', 'Rate limit', '频率过快'];
+            for (const pat of rateLimitPatterns) {{
+                if (bodyText.includes(pat)) {{
+                    result.hasRateLimit = true;
+                    result.message = pat;
+                    break;
+                }}
+            }}
+
+            // === 5. 维护检测 ===
+            const maintenancePatterns = ['维护中', '系统维护', 'Under maintenance', 'Service unavailable'];
+            for (const pat of maintenancePatterns) {{
+                if (bodyText.includes(pat)) {{
+                    result.hasMaintenance = true;
+                    result.message = pat;
+                    break;
+                }}
+            }}
+
+            return JSON.stringify(result);
+        }})()
+        "#,
+        input_selector
+    )
+}
+
+/// 从检测结果解析细粒度健康状态
+///
+/// 检测优先级: 维护 > 限流 > 需要登录 > 需要验证码 > 输入框可用 > 会话过期
+pub fn interpret_detailed_result(json: &serde_json::Value) -> DetailedHealthStatus {
+    let has_maintenance = json
+        .get("hasMaintenance")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_rate_limit = json
+        .get("hasRateLimit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_login = json
+        .get("hasLoginButton")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_captcha = json
+        .get("hasCaptcha")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_input = json
+        .get("hasInput")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 按优先级判断
+    if has_maintenance {
+        return DetailedHealthStatus::UnderMaintenance;
+    }
+    if has_rate_limit {
+        return DetailedHealthStatus::RateLimited;
+    }
+    if has_login {
+        return DetailedHealthStatus::NeedsLogin;
+    }
+    if has_captcha {
+        return DetailedHealthStatus::CaptchaRequired;
+    }
+    if has_input {
+        return DetailedHealthStatus::Healthy;
+    }
+    // 输入框不可用, 但也不是登录/验证码/限流/维护 → 会话过期
+    DetailedHealthStatus::SessionExpired
+}
+
+// ============================================================================
 //  HealthCheckResult — 健康检查结果
 // ============================================================================
 
