@@ -21,7 +21,162 @@
 //! 推荐配置: `steer_interval < max_context_turns` (如 10 < 30)。
 //! 交接后对话轮数清零, 转向提醒也随之重新计数。
 
-use crate::memory::Memory;
+use crate::memory::{Memory, Phase};
+
+// ============================================================================
+//  纯逻辑函数 — 无副作用, 可独立测试
+// ============================================================================
+
+/// 从阶段列表中提取当前阶段的名称
+///
+/// 如果索引越界或阶段列表为空, 返回空字符串。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::extract_phase_name;
+/// # use forge::memory::{Phase, PhaseStatus};
+/// let phases = vec![
+///     Phase { id: 0, name: "阶段A".into(), description: "".into(),
+///            status: PhaseStatus::Completed, tasks: vec![] },
+/// ];
+/// assert_eq!(extract_phase_name(&phases, 0), "阶段A");
+/// assert_eq!(extract_phase_name(&phases, 99), "");  // 越界
+/// assert_eq!(extract_phase_name(&[], 0), "");        // 空列表
+/// ```
+pub fn extract_phase_name(phases: &[Phase], current_phase_idx: usize) -> String {
+    phases
+        .get(current_phase_idx)
+        .map(|p| p.name.clone())
+        .unwrap_or_default()
+}
+
+/// 从阶段列表中提取当前任务的名称
+///
+/// 遍历所有阶段的所有任务, 查找 ID 匹配的任务。
+/// 如果 `current_task_id` 为 None 或未找到匹配任务, 返回空字符串。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::extract_task_name;
+/// # use forge::memory::{Phase, PhaseStatus, Task, TaskStatus};
+/// let phases = vec![
+///     Phase { id: 0, name: "阶段A".into(), description: "".into(),
+///            status: PhaseStatus::InProgress, tasks: vec![
+///         Task { id: "0-0".into(), phase_id: 0, name: "任务X".into(),
+///               prompt: "".into(), status: TaskStatus::Pending,
+///               result: None, attempts: 0, files_written: vec![],
+///               test_result: None, last_good_snapshot: None,
+///               clarifications: vec![], depends_on: vec![] },
+///     ] },
+/// ];
+/// assert_eq!(extract_task_name(&phases, &Some("0-0".into())), "任务X");
+/// assert_eq!(extract_task_name(&phases, &None), "");
+/// assert_eq!(extract_task_name(&phases, &Some("不存在".into())), "");
+/// ```
+pub fn extract_task_name(phases: &[Phase], current_task_id: &Option<String>) -> String {
+    current_task_id
+        .as_ref()
+        .and_then(|task_id| {
+            phases
+                .iter()
+                .flat_map(|p| &p.tasks)
+                .find(|t| &t.id == task_id)
+                .map(|t| t.name.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// 格式化目标行
+///
+/// 生成 `📌 项目目标: {goal}\n` 格式的字符串。
+/// 即使 goal 为空也会生成该行 (空目标也是一种状态)。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::format_goal_line;
+/// assert_eq!(format_goal_line("构建计算器"), "📌 项目目标: 构建计算器\n");
+/// assert_eq!(format_goal_line(""), "📌 项目目标: \n");
+/// ```
+pub fn format_goal_line(goal: &str) -> String {
+    format!("📌 项目目标: {}\n", goal)
+}
+
+/// 格式化阶段/任务行
+///
+/// - 如果阶段名为空, 返回 `None` (不输出此行)
+/// - 如果阶段名非空但任务名为空, 只输出阶段
+/// - 如果两者都非空, 输出 `📋 当前阶段: {phase} | 任务: {task}\n`
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::format_phase_task_line;
+/// assert_eq!(format_phase_task_line("阶段A", "任务B"),
+///     Some("📋 当前阶段: 阶段A | 任务: 任务B\n".to_string()));
+/// assert_eq!(format_phase_task_line("阶段A", ""),
+///     Some("📋 当前阶段: 阶段A\n".to_string()));
+/// assert_eq!(format_phase_task_line("", "任务B"), None);
+/// assert_eq!(format_phase_task_line("", ""), None);
+/// ```
+pub fn format_phase_task_line(phase: &str, task: &str) -> Option<String> {
+    if phase.is_empty() {
+        return None;
+    }
+    if task.is_empty() {
+        return Some(format!("📋 当前阶段: {}\n", phase));
+    }
+    Some(format!("📋 当前阶段: {} | 任务: {}\n", phase, task))
+}
+
+/// 格式化约束区块
+///
+/// 如果约束列表为空, 返回空字符串。
+/// 否则生成 `🔧 约束:\n  - {constraint}\n` 格式的多行字符串。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::format_constraints_section;
+/// assert_eq!(format_constraints_section(&[]), "");
+/// let s = format_constraints_section(&["约束A".into(), "约束B".into()]);
+/// assert!(s.contains("🔧 约束:"));
+/// assert!(s.contains("  - 约束A"));
+/// assert!(s.contains("  - 约束B"));
+/// ```
+pub fn format_constraints_section(constraints: &[String]) -> String {
+    if constraints.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("🔧 约束:\n");
+    for c in constraints {
+        section.push_str(&format!("  - {}\n", c));
+    }
+    section
+}
+
+/// 判断当前对话轮数是否需要注入提醒 (纯逻辑)
+///
+/// 触发条件 (全部满足):
+/// - `interval > 0` (已启用)
+/// - `turn_count > 0` (不是第 0 轮)
+/// - `turn_count % interval == 0` (恰好是 interval 的倍数)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::steer_reminder::check_remind_needed;
+/// assert!(!check_remind_needed(0, 10));   // 禁用
+/// assert!(!check_remind_needed(10, 0));    // 第 0 轮
+/// assert!(check_remind_needed(10, 10));    // 第 10 轮
+/// assert!(!check_remind_needed(10, 15));   // 非倍数
+/// assert!(check_remind_needed(1, 1));      // 每轮触发
+/// ```
+pub fn check_remind_needed(interval: usize, turn_count: usize) -> bool {
+    interval > 0 && turn_count > 0 && turn_count.is_multiple_of(interval)
+}
 
 // ============================================================================
 //  SteerReminder — 转向提醒
@@ -57,25 +212,8 @@ impl SteerReminder {
     /// 提取当前阶段/任务名称和项目目标, 搭配默认架构约束。
     /// 如果 Memory 中没有阶段 (planning 阶段), 阶段/任务名称为空字符串。
     pub fn build_from_memory(memory: &Memory) -> Self {
-        // 当前阶段名称
-        let current_phase = memory
-            .current_phase()
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-
-        // 当前任务名称
-        let current_task = memory
-            .current_task
-            .as_ref()
-            .and_then(|task_id| {
-                memory
-                    .phases
-                    .iter()
-                    .flat_map(|p| &p.tasks)
-                    .find(|t| &t.id == task_id)
-                    .map(|t| t.name.clone())
-            })
-            .unwrap_or_default();
+        let current_phase = extract_phase_name(&memory.phases, memory.current_phase);
+        let current_task = extract_task_name(&memory.phases, &memory.current_task);
 
         Self {
             goal: memory.goal.clone(),
@@ -96,7 +234,7 @@ impl SteerReminder {
     /// 例如 interval=10: 第 10、20、30... 轮触发。
     /// 第 0 轮不触发 (对话刚开始不需要提醒)。
     pub fn should_remind(&self, turn_count: usize) -> bool {
-        self.interval > 0 && turn_count > 0 && turn_count.is_multiple_of(self.interval)
+        check_remind_needed(self.interval, turn_count)
     }
 
     /// 构建简短的提醒 prompt
@@ -112,22 +250,13 @@ impl SteerReminder {
         let mut prompt = String::new();
 
         prompt.push_str("─── 🧭 转向提醒 ───\n");
-        prompt.push_str(&format!("📌 项目目标: {}\n", self.goal));
+        prompt.push_str(&format_goal_line(&self.goal));
 
-        if !self.current_phase.is_empty() {
-            prompt.push_str(&format!("📋 当前阶段: {}", self.current_phase));
-            if !self.current_task.is_empty() {
-                prompt.push_str(&format!(" | 任务: {}", self.current_task));
-            }
-            prompt.push('\n');
+        if let Some(phase_line) = format_phase_task_line(&self.current_phase, &self.current_task) {
+            prompt.push_str(&phase_line);
         }
 
-        if !self.constraints.is_empty() {
-            prompt.push_str("🔧 约束:\n");
-            for c in &self.constraints {
-                prompt.push_str(&format!("  - {}\n", c));
-            }
-        }
+        prompt.push_str(&format_constraints_section(&self.constraints));
 
         prompt.push_str("⚠ 请继续专注于当前任务, 不要偏离目标。\n");
         prompt.push_str("─── 提醒结束 ───\n");
@@ -214,7 +343,444 @@ mod tests {
         mem
     }
 
-    // ===== build_from_memory 测试 =====
+    // ========================================================================
+    //  纯函数: extract_phase_name 测试
+    // ========================================================================
+
+    #[test]
+    fn test_extract_phase_name_normal() {
+        let phases = vec![
+            Phase {
+                id: 0,
+                name: "阶段A".to_string(),
+                description: "".to_string(),
+                status: PhaseStatus::Pending,
+                tasks: vec![],
+            },
+            Phase {
+                id: 1,
+                name: "阶段B".to_string(),
+                description: "".to_string(),
+                status: PhaseStatus::InProgress,
+                tasks: vec![],
+            },
+        ];
+        assert_eq!(extract_phase_name(&phases, 0), "阶段A");
+        assert_eq!(extract_phase_name(&phases, 1), "阶段B");
+    }
+
+    #[test]
+    fn test_extract_phase_name_empty_phases() {
+        assert_eq!(extract_phase_name(&[], 0), "");
+        assert_eq!(extract_phase_name(&[], 100), "");
+    }
+
+    #[test]
+    fn test_extract_phase_name_index_out_of_bounds() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "唯一阶段".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![],
+        }];
+        assert_eq!(extract_phase_name(&phases, 1), "");
+        assert_eq!(extract_phase_name(&phases, usize::MAX), "");
+    }
+
+    #[test]
+    fn test_extract_phase_name_empty_name() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![],
+        }];
+        assert_eq!(extract_phase_name(&phases, 0), "");
+    }
+
+    #[test]
+    fn test_extract_phase_name_unicode() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "🚀 初次迭代 — 架构设计".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![],
+        }];
+        assert_eq!(extract_phase_name(&phases, 0), "🚀 初次迭代 — 架构设计");
+    }
+
+    // ========================================================================
+    //  纯函数: extract_task_name 测试
+    // ========================================================================
+
+    #[test]
+    fn test_extract_task_name_found() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "阶段A".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::InProgress,
+            tasks: vec![Task {
+                id: "0-0".to_string(),
+                phase_id: 0,
+                name: "任务X".to_string(),
+                prompt: "".to_string(),
+                status: TaskStatus::Pending,
+                result: None,
+                attempts: 0,
+                files_written: vec![],
+                test_result: None,
+                last_good_snapshot: None,
+                clarifications: vec![],
+                depends_on: vec![],
+            }],
+        }];
+        assert_eq!(
+            extract_task_name(&phases, &Some("0-0".to_string())),
+            "任务X"
+        );
+    }
+
+    #[test]
+    fn test_extract_task_name_none() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "阶段A".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![],
+        }];
+        assert_eq!(extract_task_name(&phases, &None), "");
+    }
+
+    #[test]
+    fn test_extract_task_name_not_found() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "阶段A".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![Task {
+                id: "0-0".to_string(),
+                phase_id: 0,
+                name: "任务X".to_string(),
+                prompt: "".to_string(),
+                status: TaskStatus::Pending,
+                result: None,
+                attempts: 0,
+                files_written: vec![],
+                test_result: None,
+                last_good_snapshot: None,
+                clarifications: vec![],
+                depends_on: vec![],
+            }],
+        }];
+        assert_eq!(extract_task_name(&phases, &Some("不存在".to_string())), "");
+    }
+
+    #[test]
+    fn test_extract_task_name_empty_phases() {
+        assert_eq!(extract_task_name(&[], &Some("0-0".to_string())), "");
+        assert_eq!(extract_task_name(&[], &None), "");
+    }
+
+    #[test]
+    fn test_extract_task_name_cross_phase_search() {
+        // 任务在不同阶段中, 应跨阶段搜索
+        let phases = vec![
+            Phase {
+                id: 0,
+                name: "阶段A".to_string(),
+                description: "".to_string(),
+                status: PhaseStatus::Completed,
+                tasks: vec![Task {
+                    id: "0-0".to_string(),
+                    phase_id: 0,
+                    name: "任务A0".to_string(),
+                    prompt: "".to_string(),
+                    status: TaskStatus::Completed,
+                    result: None,
+                    attempts: 1,
+                    files_written: vec![],
+                    test_result: None,
+                    last_good_snapshot: None,
+                    clarifications: vec![],
+                    depends_on: vec![],
+                }],
+            },
+            Phase {
+                id: 1,
+                name: "阶段B".to_string(),
+                description: "".to_string(),
+                status: PhaseStatus::InProgress,
+                tasks: vec![Task {
+                    id: "1-2".to_string(),
+                    phase_id: 1,
+                    name: "任务B2".to_string(),
+                    prompt: "".to_string(),
+                    status: TaskStatus::InProgress,
+                    result: None,
+                    attempts: 0,
+                    files_written: vec![],
+                    test_result: None,
+                    last_good_snapshot: None,
+                    clarifications: vec![],
+                    depends_on: vec![],
+                }],
+            },
+        ];
+        // 应在阶段B中找到 1-2
+        assert_eq!(
+            extract_task_name(&phases, &Some("1-2".to_string())),
+            "任务B2"
+        );
+        // 应在阶段A中找到 0-0
+        assert_eq!(
+            extract_task_name(&phases, &Some("0-0".to_string())),
+            "任务A0"
+        );
+    }
+
+    #[test]
+    fn test_extract_task_name_empty_task_name() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "阶段A".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![Task {
+                id: "0-0".to_string(),
+                phase_id: 0,
+                name: "".to_string(),
+                prompt: "".to_string(),
+                status: TaskStatus::Pending,
+                result: None,
+                attempts: 0,
+                files_written: vec![],
+                test_result: None,
+                last_good_snapshot: None,
+                clarifications: vec![],
+                depends_on: vec![],
+            }],
+        }];
+        // 空任务名 → 返回空字符串
+        assert_eq!(extract_task_name(&phases, &Some("0-0".to_string())), "");
+    }
+
+    #[test]
+    fn test_extract_task_name_unicode_id() {
+        let phases = vec![Phase {
+            id: 0,
+            name: "阶段".to_string(),
+            description: "".to_string(),
+            status: PhaseStatus::Pending,
+            tasks: vec![Task {
+                id: "任务-α".to_string(),
+                phase_id: 0,
+                name: "Unicode 任务".to_string(),
+                prompt: "".to_string(),
+                status: TaskStatus::Pending,
+                result: None,
+                attempts: 0,
+                files_written: vec![],
+                test_result: None,
+                last_good_snapshot: None,
+                clarifications: vec![],
+                depends_on: vec![],
+            }],
+        }];
+        assert_eq!(
+            extract_task_name(&phases, &Some("任务-α".to_string())),
+            "Unicode 任务"
+        );
+    }
+
+    // ========================================================================
+    //  纯函数: format_goal_line 测试
+    // ========================================================================
+
+    #[test]
+    fn test_format_goal_line_normal() {
+        assert_eq!(format_goal_line("构建计算器"), "📌 项目目标: 构建计算器\n");
+    }
+
+    #[test]
+    fn test_format_goal_line_empty() {
+        assert_eq!(format_goal_line(""), "📌 项目目标: \n");
+    }
+
+    #[test]
+    fn test_format_goal_line_unicode() {
+        let result = format_goal_line("🚀 目标 α & β");
+        assert!(result.contains("🚀 目标 α & β"));
+        assert!(result.starts_with("📌"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_goal_line_with_newlines() {
+        // goal 包含换行符, 应原样保留 (调用方负责清理)
+        let result = format_goal_line("第一行\n第二行");
+        assert!(result.contains("第一行\n第二行"));
+    }
+
+    // ========================================================================
+    //  纯函数: format_phase_task_line 测试
+    // ========================================================================
+
+    #[test]
+    fn test_format_phase_task_line_both_present() {
+        let result = format_phase_task_line("阶段A", "任务B").unwrap();
+        assert_eq!(result, "📋 当前阶段: 阶段A | 任务: 任务B\n");
+    }
+
+    #[test]
+    fn test_format_phase_task_line_phase_only() {
+        let result = format_phase_task_line("阶段A", "").unwrap();
+        assert_eq!(result, "📋 当前阶段: 阶段A\n");
+    }
+
+    #[test]
+    fn test_format_phase_task_line_phase_empty() {
+        // 阶段为空时返回 None (即使任务非空)
+        assert_eq!(format_phase_task_line("", "任务B"), None);
+    }
+
+    #[test]
+    fn test_format_phase_task_line_both_empty() {
+        assert_eq!(format_phase_task_line("", ""), None);
+    }
+
+    #[test]
+    fn test_format_phase_task_line_unicode() {
+        let result = format_phase_task_line("阶段🚀", "任务🌟").unwrap();
+        assert!(result.contains("阶段🚀"));
+        assert!(result.contains("任务🌟"));
+    }
+
+    // ========================================================================
+    //  纯函数: format_constraints_section 测试
+    // ========================================================================
+
+    #[test]
+    fn test_format_constraints_section_empty() {
+        assert_eq!(format_constraints_section(&[]), "");
+    }
+
+    #[test]
+    fn test_format_constraints_section_single() {
+        let result = format_constraints_section(&["约束A".to_string()]);
+        assert!(result.contains("🔧 约束:"));
+        assert!(result.contains("  - 约束A"));
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_constraints_section_multiple() {
+        let result = format_constraints_section(&[
+            "约束A".to_string(),
+            "约束B".to_string(),
+            "约束C".to_string(),
+        ]);
+        assert!(result.contains("  - 约束A"));
+        assert!(result.contains("  - 约束B"));
+        assert!(result.contains("  - 约束C"));
+        // 应只有一行标题
+        assert_eq!(result.matches("🔧 约束:").count(), 1);
+    }
+
+    #[test]
+    fn test_format_constraints_section_empty_string_item() {
+        // 空字符串约束也应被格式化 (边缘情况)
+        let result = format_constraints_section(&["".to_string()]);
+        assert!(result.contains("  - \n"));
+    }
+
+    #[test]
+    fn test_format_constraints_section_unicode() {
+        let result = format_constraints_section(&["🔒 安全: 不硬编码密钥".to_string()]);
+        assert!(result.contains("🔒 安全: 不硬编码密钥"));
+    }
+
+    #[test]
+    fn test_format_constraints_section_many_items() {
+        // 大量约束项 (边界测试)
+        let constraints: Vec<String> = (0..100).map(|i| format!("约束{}", i)).collect();
+        let result = format_constraints_section(&constraints);
+        // 每个约束都应出现
+        for i in 0..100 {
+            assert!(result.contains(&format!("约束{}", i)));
+        }
+    }
+
+    // ========================================================================
+    //  纯函数: check_remind_needed 测试
+    // ========================================================================
+
+    #[test]
+    fn test_check_remind_needed_disabled() {
+        assert!(!check_remind_needed(0, 0));
+        assert!(!check_remind_needed(0, 10));
+        assert!(!check_remind_needed(0, 100));
+    }
+
+    #[test]
+    fn test_check_remind_needed_zero_turn() {
+        assert!(!check_remind_needed(10, 0));
+        assert!(!check_remind_needed(1, 0));
+    }
+
+    #[test]
+    fn test_check_remind_needed_at_multiples() {
+        assert!(check_remind_needed(10, 10));
+        assert!(check_remind_needed(10, 20));
+        assert!(check_remind_needed(10, 100));
+    }
+
+    #[test]
+    fn test_check_remind_needed_not_at_multiples() {
+        assert!(!check_remind_needed(10, 1));
+        assert!(!check_remind_needed(10, 9));
+        assert!(!check_remind_needed(10, 11));
+        assert!(!check_remind_needed(10, 15));
+    }
+
+    #[test]
+    fn test_check_remind_needed_interval_1() {
+        // 每轮都触发 (除第 0 轮)
+        assert!(!check_remind_needed(1, 0));
+        assert!(check_remind_needed(1, 1));
+        assert!(check_remind_needed(1, 2));
+        assert!(check_remind_needed(1, 100));
+    }
+
+    #[test]
+    fn test_check_remind_needed_usize_max() {
+        // 极端值: interval = usize::MAX
+        assert!(!check_remind_needed(usize::MAX, 0));
+        assert!(!check_remind_needed(usize::MAX, 1)); // 1 不是 usize::MAX 的倍数
+                                                      // usize::MAX 是 usize::MAX 的倍数 (1 倍)
+        assert!(check_remind_needed(usize::MAX, usize::MAX));
+
+        // 极端值: turn_count = usize::MAX, interval = 10
+        // usize::MAX % 10 不一定为 0, 只测试不 panic
+        let _ = check_remind_needed(10, usize::MAX);
+    }
+
+    #[test]
+    fn test_check_remind_needed_large_interval() {
+        // interval = 1000
+        assert!(!check_remind_needed(1000, 999));
+        assert!(check_remind_needed(1000, 1000));
+        assert!(check_remind_needed(1000, 2000));
+    }
+
+    // ========================================================================
+    //  build_from_memory 测试
+    // ========================================================================
 
     #[test]
     fn test_build_from_memory_full() {
@@ -260,6 +826,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_from_memory_phase_index_out_of_bounds() {
+        // current_phase 超出 phases 范围 → 阶段名为空
+        let mut mem = make_full_memory();
+        mem.current_phase = 999; // 只有 2 个阶段 (0, 1)
+        let reminder = SteerReminder::build_from_memory(&mem);
+        assert_eq!(reminder.current_phase, "");
+        // current_task 仍可跨阶段搜索到
+        assert_eq!(reminder.current_task, "计算逻辑");
+    }
+
+    #[test]
+    fn test_build_from_memory_task_id_not_found() {
+        let mut mem = make_full_memory();
+        mem.current_task = Some("nonexistent-id".to_string());
+        let reminder = SteerReminder::build_from_memory(&mem);
+        assert_eq!(reminder.current_phase, "功能实现");
+        assert_eq!(reminder.current_task, "");
+    }
+
+    #[test]
     fn test_constraints_not_empty() {
         let mem = Memory::new("test");
         let reminder = SteerReminder::build_from_memory(&mem);
@@ -271,7 +857,25 @@ mod tests {
             .any(|c| c.contains(".cursorrules") || c.contains("SYSTEM_CONSTRAINTS.md")));
     }
 
-    // ===== should_remind 测试 =====
+    #[test]
+    fn test_build_from_memory_empty_goal() {
+        let mem = Memory::new("");
+        let reminder = SteerReminder::build_from_memory(&mem);
+        assert_eq!(reminder.goal, "");
+        assert_eq!(reminder.current_phase, "");
+        assert_eq!(reminder.current_task, "");
+    }
+
+    #[test]
+    fn test_build_from_memory_unicode_goal() {
+        let mem = Memory::new("🚀 构建 α & β 系统 — 测试用");
+        let reminder = SteerReminder::build_from_memory(&mem);
+        assert_eq!(reminder.goal, "🚀 构建 α & β 系统 — 测试用");
+    }
+
+    // ========================================================================
+    //  should_remind 测试 (通过 SteerReminder 方法, 内部调用纯函数)
+    // ========================================================================
 
     #[test]
     fn test_should_remind_disabled() {
@@ -348,7 +952,22 @@ mod tests {
         assert!(reminder.should_remind(15));
     }
 
-    // ===== to_prompt 测试 =====
+    #[test]
+    fn test_should_remind_large_turn_count() {
+        let mem = Memory::new("test");
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+        reminder.interval = 100;
+
+        assert!(reminder.should_remind(100));
+        assert!(reminder.should_remind(200));
+        assert!(reminder.should_remind(1000));
+        assert!(!reminder.should_remind(99));
+        assert!(!reminder.should_remind(101));
+    }
+
+    // ========================================================================
+    //  to_prompt 测试
+    // ========================================================================
 
     #[test]
     fn test_to_prompt_contains_goal() {
@@ -431,7 +1050,51 @@ mod tests {
         assert!(len <= 2000, "提醒 prompt 过长: {} 字符", len);
     }
 
-    // ===== inject 测试 =====
+    #[test]
+    fn test_to_prompt_with_custom_constraints() {
+        let mut reminder = SteerReminder::build_from_memory(&Memory::new("test"));
+        reminder.constraints = vec!["自定义约束A".to_string(), "自定义约束B".to_string()];
+        let prompt = reminder.to_prompt();
+        assert!(prompt.contains("自定义约束A"));
+        assert!(prompt.contains("自定义约束B"));
+    }
+
+    #[test]
+    fn test_to_prompt_with_empty_constraints() {
+        let mut reminder = SteerReminder::build_from_memory(&Memory::new("test"));
+        reminder.constraints = vec![];
+        let prompt = reminder.to_prompt();
+        // 空约束不应出现约束区块
+        assert!(!prompt.contains("🔧 约束:"));
+        // 但其他部分应正常
+        assert!(prompt.contains("转向提醒"));
+        assert!(prompt.contains("test"));
+    }
+
+    #[test]
+    fn test_to_prompt_structure_order() {
+        // 验证 prompt 中各部分的顺序
+        let mem = make_full_memory();
+        let reminder = SteerReminder::build_from_memory(&mem);
+        let prompt = reminder.to_prompt();
+
+        let header_pos = prompt.find("转向提醒").unwrap();
+        let goal_pos = prompt.find("项目目标").unwrap();
+        let phase_pos = prompt.find("当前阶段").unwrap();
+        let constraint_pos = prompt.find("约束").unwrap();
+        let focus_pos = prompt.find("专注于当前任务").unwrap();
+        let end_pos = prompt.find("提醒结束").unwrap();
+
+        assert!(header_pos < goal_pos, "标题应在目标前");
+        assert!(goal_pos < phase_pos, "目标应在阶段前");
+        assert!(phase_pos < constraint_pos, "阶段应在约束前");
+        assert!(constraint_pos < focus_pos, "约束应在提醒前");
+        assert!(focus_pos < end_pos, "提醒应在结束前");
+    }
+
+    // ========================================================================
+    //  inject 测试
+    // ========================================================================
 
     #[test]
     fn test_inject_when_should_remind() {
@@ -505,7 +1168,69 @@ mod tests {
         assert!(result.contains("fn main() {}"));
     }
 
-    // ===== 与上下文衔接的关系测试 =====
+    #[test]
+    fn test_inject_empty_original() {
+        let mem = make_full_memory();
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+        reminder.interval = 1;
+
+        let result = reminder.inject(1, "");
+        // 空原始消息注入后应只有提醒部分 + 两个换行
+        assert!(result.contains("转向提醒"));
+        assert!(result.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_inject_very_long_original() {
+        let mem = make_full_memory();
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+        reminder.interval = 1;
+
+        let original = "x".repeat(10000);
+        let result = reminder.inject(1, &original);
+        assert!(result.contains("转向提醒"));
+        assert!(result.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn test_inject_unicode_original() {
+        let mem = make_full_memory();
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+        reminder.interval = 1;
+
+        let original = "实现 🚀 功能 — 中文测试";
+        let result = reminder.inject(1, original);
+        assert!(result.contains("🚀"));
+        assert!(result.contains("中文测试"));
+    }
+
+    #[test]
+    fn test_inject_multiple_turns_only_fires_at_multiples() {
+        let mem = make_full_memory();
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+        reminder.interval = 5;
+
+        // 第 1-4 轮: 不注入
+        for turn in 1..=4 {
+            let result = reminder.inject(turn, "msg");
+            assert_eq!(result, "msg", "第 {} 轮不应注入", turn);
+        }
+        // 第 5 轮: 注入
+        let result5 = reminder.inject(5, "msg");
+        assert!(result5.contains("转向提醒"));
+        // 第 6-9 轮: 不注入
+        for turn in 6..=9 {
+            let result = reminder.inject(turn, "msg");
+            assert_eq!(result, "msg", "第 {} 轮不应注入", turn);
+        }
+        // 第 10 轮: 注入
+        let result10 = reminder.inject(10, "msg");
+        assert!(result10.contains("转向提醒"));
+    }
+
+    // ========================================================================
+    //  与上下文衔接的关系测试
+    // ========================================================================
 
     #[test]
     fn test_steer_resets_after_handoff() {
@@ -542,7 +1267,9 @@ mod tests {
         assert_eq!(max_context_turns, 30);
     }
 
-    // ===== 多次调用稳定性 =====
+    // ========================================================================
+    //  多次调用稳定性
+    // ========================================================================
 
     #[test]
     fn test_to_prompt_deterministic() {
@@ -566,5 +1293,44 @@ mod tests {
         assert_eq!(r1.current_phase, r2.current_phase);
         assert_eq!(r1.current_task, r2.current_task);
         assert_eq!(r1.constraints, r2.constraints);
+    }
+
+    // ========================================================================
+    //  纯函数与方法的集成一致性测试
+    // ========================================================================
+
+    #[test]
+    fn test_should_remind_matches_pure_function() {
+        let mem = Memory::new("test");
+        let mut reminder = SteerReminder::build_from_memory(&mem);
+
+        for interval in [0usize, 1, 5, 10, 100] {
+            reminder.interval = interval;
+            for turn in [0usize, 1, 4, 5, 9, 10, 15, 20, 99, 100] {
+                assert_eq!(
+                    reminder.should_remind(turn),
+                    check_remind_needed(interval, turn),
+                    "不一致: interval={}, turn={}",
+                    interval,
+                    turn
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_from_memory_uses_pure_extractors() {
+        let mem = make_full_memory();
+        let reminder = SteerReminder::build_from_memory(&mem);
+
+        // build_from_memory 内部调用的纯函数结果应一致
+        assert_eq!(
+            reminder.current_phase,
+            extract_phase_name(&mem.phases, mem.current_phase)
+        );
+        assert_eq!(
+            reminder.current_task,
+            extract_task_name(&mem.phases, &mem.current_task)
+        );
     }
 }

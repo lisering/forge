@@ -131,7 +131,10 @@ pub use slash_command::{
     is_prefix_boundary, strip_command_from_text, SlashCommand, SlashCommandAction,
     SlashCommandSummary,
 };
-pub use steer_reminder::SteerReminder;
+pub use steer_reminder::{
+    check_remind_needed, extract_phase_name, extract_task_name, format_constraints_section,
+    format_goal_line, format_phase_task_line, SteerReminder,
+};
 pub use task_graph::{TaskGraph, TaskGraphError};
 pub use testrunner::{CargoTestRunner, E2ETestCase, E2ETestResult, E2ETestSummary};
 pub use traits::{
