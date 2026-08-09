@@ -17,6 +17,54 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 // ============================================================================
+//  HealthSeverity — 健康状态严重程度 (与 connection_monitor::ConnectionSeverity 协同)
+// ============================================================================
+
+/// 网站健康状态的严重程度分类
+///
+/// 由 [`classify_health_severity`] 根据 [`SiteHealthStatus`] 计算。
+/// 与 [`crate::connection_monitor::ConnectionSeverity`] 的区别:
+/// - `ConnectionSeverity` 只看 CDP 连接层面 (Connected / TabClosed / ChromeUnreachable)
+/// - `HealthSeverity` 看网站层面 (Healthy / RateLimited / UnderMaintenance)
+///
+/// 两者协同构成完整的 24h 可靠性链路:
+/// `ConnectionSeverity` (CDP层) → `HealthSeverity` (网站层) → `RecoveryUrgency` (恢复层)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthSeverity {
+    /// 信息 — 网站正常
+    Info,
+    /// 警告 — 可自动恢复的异常 (限流、未登录)
+    Warning,
+    /// 严重 — 需要人工干预的异常 (维护中、网络错误)
+    Critical,
+    /// 未知 — 无法判断, 需进一步检查
+    Unknown,
+}
+
+impl HealthSeverity {
+    /// 中文描述
+    pub fn description(&self) -> &'static str {
+        match self {
+            HealthSeverity::Info => "信息",
+            HealthSeverity::Warning => "警告",
+            HealthSeverity::Critical => "严重",
+            HealthSeverity::Unknown => "未知",
+        }
+    }
+
+    /// 是否需要立即故障转移
+    pub fn requires_immediate_failover(&self) -> bool {
+        matches!(self, HealthSeverity::Critical)
+    }
+}
+
+impl std::fmt::Display for HealthSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.description())
+    }
+}
+
+// ============================================================================
 //  SiteHealthStatus — 网站健康状态
 // ============================================================================
 
@@ -255,33 +303,9 @@ impl SiteHealthChecker {
         )
     }
 
-    /// 解释检测结果 — 根据各项指标判断健康状态
+    /// 解释检测结果 — 委托纯函数 [`interpret_health_json`]
     fn interpret_result(parsed: &HealthCheckJson, _site_type: SiteType) -> SiteHealthStatus {
-        // 优先级: 维护 > 限流 > 未登录 > 有输入框(健康) > 未知
-
-        if parsed.has_maintenance {
-            return SiteHealthStatus::UnderMaintenance;
-        }
-
-        if parsed.has_rate_limit {
-            return SiteHealthStatus::RateLimited;
-        }
-
-        if parsed.has_login_button {
-            // 如果有登录提示但输入框也存在, 可能只是页面有登录按钮 (不影响使用)
-            if parsed.has_input {
-                return SiteHealthStatus::Healthy;
-            }
-            return SiteHealthStatus::NotLoggedIn;
-        }
-
-        // 如果输入框存在且可用, 认为健康
-        if parsed.has_input {
-            return SiteHealthStatus::Healthy;
-        }
-
-        // 没有输入框, 也没有明确的异常标志
-        SiteHealthStatus::Unknown
+        interpret_health_json(parsed)
     }
 
     // ===== 网站特定配置 =====
@@ -402,21 +426,398 @@ impl SiteHealthChecker {
     }
 }
 
-/// 健康检查 JS 返回的 JSON 结构 (内部使用)
-#[derive(Debug, Default, Deserialize)]
-struct HealthCheckJson {
+// ============================================================================
+//  纯逻辑函数 — 健康检查核心算法 (无副作用, 可独立测试)
+// ============================================================================
+//
+// 以下函数将健康检查的核心决策逻辑提取为纯函数, 使得:
+// 1. 可以在无 Chrome 环境下完全测试
+// 2. 决策逻辑集中管理, 修改策略时只需改一处
+// 3. 与 connection_monitor.rs / auto_recovery.rs 的纯函数协同, 形成完整 24h 可靠性链路
+
+/// 健康检查 JS 返回的 JSON 结构
+///
+/// 由 `SiteHealthChecker::build_check_js` 生成的 JS 代码返回,
+/// 用于解析 CDP evaluate 结果。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct HealthCheckJson {
+    /// 当前页面 URL
     #[serde(default)]
-    url: String,
+    pub url: String,
+    /// 输入框是否存在且可用
     #[serde(default, rename = "hasInput")]
-    has_input: bool,
+    pub has_input: bool,
+    /// 是否检测到登录按钮/登录提示
     #[serde(default, rename = "hasLoginButton")]
-    has_login_button: bool,
+    pub has_login_button: bool,
+    /// 是否检测到限流提示
     #[serde(default, rename = "hasRateLimit")]
-    has_rate_limit: bool,
+    pub has_rate_limit: bool,
+    /// 是否检测到维护提示
     #[serde(default, rename = "hasMaintenance")]
-    has_maintenance: bool,
+    pub has_maintenance: bool,
+    /// 检测到的提示信息
     #[serde(default)]
-    message: String,
+    pub message: String,
+}
+
+impl HealthCheckJson {
+    /// 创建一个新的 `HealthCheckJson` (所有字段为默认值)
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 设置 URL
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = url.into();
+        self
+    }
+
+    /// 设置输入框是否可用
+    pub fn with_input(mut self, has_input: bool) -> Self {
+        self.has_input = has_input;
+        self
+    }
+
+    /// 设置是否有登录提示
+    pub fn with_login_button(mut self, has_login_button: bool) -> Self {
+        self.has_login_button = has_login_button;
+        self
+    }
+
+    /// 设置是否有限流提示
+    pub fn with_rate_limit(mut self, has_rate_limit: bool) -> Self {
+        self.has_rate_limit = has_rate_limit;
+        self
+    }
+
+    /// 设置是否有维护提示
+    pub fn with_maintenance(mut self, has_maintenance: bool) -> Self {
+        self.has_maintenance = has_maintenance;
+        self
+    }
+
+    /// 设置消息
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+}
+
+/// 解释健康检查 JSON 结果 — 根据各项指标判断健康状态
+///
+/// 这是 `SiteHealthChecker::interpret_result` 的纯函数版本, 可独立测试。
+///
+/// # 优先级
+/// 维护 > 限流 > 未登录 > 有输入框(健康) > 未知
+///
+/// # 参数
+/// - `parsed`: 健康检查 JS 返回的 JSON 结构
+///
+/// # 返回值
+/// 健康状态
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{interpret_health_json, HealthCheckJson, SiteHealthStatus};
+///
+/// // 有输入框 → 健康
+/// let json = HealthCheckJson::default().with_input(true);
+/// assert_eq!(interpret_health_json(&json), SiteHealthStatus::Healthy);
+///
+/// // 维护中 (最高优先级)
+/// let json = HealthCheckJson::default().with_maintenance(true).with_input(true);
+/// assert_eq!(interpret_health_json(&json), SiteHealthStatus::UnderMaintenance);
+/// ```
+pub fn interpret_health_json(parsed: &HealthCheckJson) -> SiteHealthStatus {
+    // 优先级: 维护 > 限流 > 未登录 > 有输入框(健康) > 未知
+    if parsed.has_maintenance {
+        return SiteHealthStatus::UnderMaintenance;
+    }
+
+    if parsed.has_rate_limit {
+        return SiteHealthStatus::RateLimited;
+    }
+
+    if parsed.has_login_button {
+        // 如果有登录提示但输入框也存在, 可能只是页面有登录按钮 (不影响使用)
+        if parsed.has_input {
+            return SiteHealthStatus::Healthy;
+        }
+        return SiteHealthStatus::NotLoggedIn;
+    }
+
+    // 如果输入框存在且可用, 认为健康
+    if parsed.has_input {
+        return SiteHealthStatus::Healthy;
+    }
+
+    // 没有输入框, 也没有明确的异常标志
+    SiteHealthStatus::Unknown
+}
+
+/// 分类健康状态的严重程度
+///
+/// 根据网站健康状态返回严重程度, 用于日志和决策。
+///
+/// # 映射
+/// - `Healthy` → `Info`
+/// - `RateLimited`, `NotLoggedIn` → `Warning` (可自动恢复)
+/// - `UnderMaintenance`, `NetworkError` → `Critical` (需人工干预)
+/// - `Unknown` → `Unknown`
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{classify_health_severity, HealthSeverity, SiteHealthStatus};
+///
+/// assert_eq!(
+///     classify_health_severity(&SiteHealthStatus::Healthy),
+///     HealthSeverity::Info
+/// );
+/// assert_eq!(
+///     classify_health_severity(&SiteHealthStatus::RateLimited),
+///     HealthSeverity::Warning
+/// );
+/// assert_eq!(
+///     classify_health_severity(&SiteHealthStatus::UnderMaintenance),
+///     HealthSeverity::Critical
+/// );
+/// ```
+pub fn classify_health_severity(status: &SiteHealthStatus) -> HealthSeverity {
+    match status {
+        SiteHealthStatus::Healthy => HealthSeverity::Info,
+        SiteHealthStatus::RateLimited | SiteHealthStatus::NotLoggedIn => HealthSeverity::Warning,
+        SiteHealthStatus::UnderMaintenance | SiteHealthStatus::NetworkError => {
+            HealthSeverity::Critical
+        }
+        SiteHealthStatus::Unknown => HealthSeverity::Unknown,
+    }
+}
+
+/// 计算下次健康检查的延迟 (秒)
+///
+/// 根据当前健康状态决定下次检查间隔:
+/// - `Healthy` → 使用基础间隔 (默认 60s)
+/// - `RateLimited` → 缩短到基础间隔的 1/4 (快速恢复检测)
+/// - `NotLoggedIn` → 缩短到基础间隔的 1/2
+/// - `UnderMaintenance` → 延长到基础间隔的 2 倍 (维护通常需要时间)
+/// - `NetworkError` → 缩短到基础间隔的 1/4 (快速重试)
+/// - `Unknown` → 缩短到基础间隔的 1/2 (需要尽快确认状态)
+///
+/// # 参数
+/// - `status`: 当前健康状态
+/// - `base_interval_secs`: 基础检查间隔 (秒)
+///
+/// # 返回值
+/// 下次检查延迟 (秒), 最小 1 秒
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{compute_health_check_interval, SiteHealthStatus};
+///
+/// // 健康 → 60s
+/// assert_eq!(compute_health_check_interval(&SiteHealthStatus::Healthy, 60), 60);
+///
+/// // 限流 → 15s (60/4)
+/// assert_eq!(compute_health_check_interval(&SiteHealthStatus::RateLimited, 60), 15);
+///
+/// // 维护 → 120s (60*2)
+/// assert_eq!(compute_health_check_interval(&SiteHealthStatus::UnderMaintenance, 60), 120);
+/// ```
+pub fn compute_health_check_interval(status: &SiteHealthStatus, base_interval_secs: u64) -> u64 {
+    let multiplier = match status {
+        SiteHealthStatus::Healthy => 1.0,
+        SiteHealthStatus::RateLimited => 0.25,
+        SiteHealthStatus::NotLoggedIn => 0.5,
+        SiteHealthStatus::UnderMaintenance => 2.0,
+        SiteHealthStatus::NetworkError => 0.25,
+        SiteHealthStatus::Unknown => 0.5,
+    };
+    let result = (base_interval_secs as f64 * multiplier).round() as u64;
+    result.max(1)
+}
+
+/// 格式化健康检查结果为单行文本 (用于日志和 DevTrace)
+///
+/// 生成如 `"[0] Z.ai: 健康 — 页面正常 (120ms)"` 的格式。
+///
+/// # 参数
+/// - `tab_idx`: 标签页索引
+/// - `site_type`: 网站类型
+/// - `result`: 健康检查结果
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{format_health_result_line, HealthCheckResult, SiteHealthStatus};
+/// use forge::browser::SiteType;
+///
+/// let result = HealthCheckResult::new(SiteHealthStatus::Healthy);
+/// let line = format_health_result_line(0, SiteType::Zai, &result);
+/// assert!(line.contains("[0]"));
+/// assert!(line.contains("Z.ai"));
+/// assert!(line.contains("健康"));
+/// ```
+pub fn format_health_result_line(
+    tab_idx: usize,
+    site_type: SiteType,
+    result: &HealthCheckResult,
+) -> String {
+    let msg = result
+        .message
+        .as_deref()
+        .unwrap_or(result.status.description());
+    format!(
+        "[{}] {}: {} ({}ms)",
+        tab_idx, site_type, msg, result.check_duration_ms
+    )
+}
+
+/// 确定标签页的故障转移优先级
+///
+/// 根据健康状态返回一个数值, 数值越小优先级越高 (越应该被选中)。
+///
+/// # 优先级映射
+/// - `Healthy` → 0 (最高优先级)
+/// - `Unknown` → 1
+/// - `NotLoggedIn` → 2
+/// - `RateLimited` → 3
+/// - `NetworkError` → 4
+/// - `UnderMaintenance` → 5 (最低优先级)
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{determine_failover_priority, SiteHealthStatus};
+///
+/// assert_eq!(determine_failover_priority(&SiteHealthStatus::Healthy), 0);
+/// assert_eq!(determine_failover_priority(&SiteHealthStatus::RateLimited), 3);
+/// assert_eq!(determine_failover_priority(&SiteHealthStatus::UnderMaintenance), 5);
+/// ```
+pub fn determine_failover_priority(status: &SiteHealthStatus) -> u8 {
+    match status {
+        SiteHealthStatus::Healthy => 0,
+        SiteHealthStatus::Unknown => 1,
+        SiteHealthStatus::NotLoggedIn => 2,
+        SiteHealthStatus::RateLimited => 3,
+        SiteHealthStatus::NetworkError => 4,
+        SiteHealthStatus::UnderMaintenance => 5,
+    }
+}
+
+/// 从多个健康检查结果中选择最佳健康标签页
+///
+/// 返回第一个健康标签页的索引。如果没有健康标签页,
+/// 返回故障转移优先级最低的标签页索引。
+/// 如果列表为空, 返回 `None`。
+///
+/// # 参数
+/// - `results`: (标签页索引, 健康检查结果) 列表
+///
+/// # 返回值
+/// `Some(best_tab_idx)` 或 `None`
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::{select_best_healthy_tab, HealthCheckResult, SiteHealthStatus};
+///
+/// let results = vec![
+///     (0, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+///     (1, HealthCheckResult::new(SiteHealthStatus::Healthy)),
+///     (2, HealthCheckResult::new(SiteHealthStatus::Unknown)),
+/// ];
+/// assert_eq!(select_best_healthy_tab(&results), Some(1));
+///
+/// // 无健康标签页 → 返回优先级最低的
+/// let results = vec![
+///     (0, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+///     (1, HealthCheckResult::new(SiteHealthStatus::UnderMaintenance)),
+/// ];
+/// assert_eq!(select_best_healthy_tab(&results), Some(0));
+/// ```
+pub fn select_best_healthy_tab(results: &[(usize, HealthCheckResult)]) -> Option<usize> {
+    if results.is_empty() {
+        return None;
+    }
+
+    // 优先返回第一个健康的标签页
+    for (idx, result) in results {
+        if result.is_healthy() {
+            return Some(*idx);
+        }
+    }
+
+    // 没有健康的, 返回故障转移优先级最低的
+    results
+        .iter()
+        .min_by_key(|(_, r)| determine_failover_priority(&r.status))
+        .map(|(idx, _)| *idx)
+}
+
+/// 判断是否应该跳过当前标签页 (基于健康历史)
+///
+/// 当连续不健康次数超过阈值时, 应跳过该标签页。
+///
+/// # 参数
+/// - `consecutive_unhealthy`: 连续不健康次数
+/// - `threshold`: 跳过阈值
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::should_skip_tab;
+///
+/// assert!(!should_skip_tab(0, 3));
+/// assert!(!should_skip_tab(2, 3));
+/// assert!(should_skip_tab(3, 3));
+/// assert!(should_skip_tab(5, 3));
+/// ```
+pub fn should_skip_tab(consecutive_unhealthy: u32, threshold: u32) -> bool {
+    consecutive_unhealthy >= threshold
+}
+
+/// 计算健康率
+///
+/// 健康率 = 健康检查次数 / 总健康检查次数。
+/// 当总检查次数为 0 时, 返回 1.0 (视为完全健康)。
+///
+/// # 参数
+/// - `total_checks`: 总健康检查次数
+/// - `healthy_checks`: 健康检查通过次数
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::calculate_health_rate;
+///
+/// assert!((calculate_health_rate(0, 0) - 1.0).abs() < 0.001);
+/// assert!((calculate_health_rate(100, 80) - 0.8).abs() < 0.001);
+/// assert!((calculate_health_rate(100, 0) - 0.0).abs() < 0.001);
+/// ```
+pub fn calculate_health_rate(total_checks: u64, healthy_checks: u64) -> f64 {
+    if total_checks == 0 {
+        return 1.0;
+    }
+    (healthy_checks as f64 / total_checks as f64).clamp(0.0, 1.0)
+}
+
+/// 格式化健康率为百分比字符串
+///
+/// # 示例
+///
+/// ```
+/// use forge::site_health::format_health_rate;
+///
+/// assert_eq!(format_health_rate(1.0), "100.0%");
+/// assert_eq!(format_health_rate(0.8), "80.0%");
+/// assert_eq!(format_health_rate(0.0), "0.0%");
+/// ```
+pub fn format_health_rate(rate: f64) -> String {
+    format!("{:.1}%", rate * 100.0)
 }
 
 // ============================================================================
@@ -1206,5 +1607,787 @@ mod tests {
         let parsed: HealthCheckJson = serde_json::from_str(json_str).unwrap();
         assert_eq!(parsed.url, "test");
         assert!(!parsed.has_input);
+    }
+
+    // ===== HealthCheckJson builder 测试 =====
+
+    #[test]
+    fn test_health_check_json_new() {
+        let json = HealthCheckJson::new();
+        assert!(!json.has_input);
+        assert!(json.url.is_empty());
+    }
+
+    #[test]
+    fn test_health_check_json_builder_chain() {
+        let json = HealthCheckJson::new()
+            .with_url("https://chat.z.ai/")
+            .with_input(true)
+            .with_login_button(false)
+            .with_rate_limit(false)
+            .with_maintenance(false)
+            .with_message("ok");
+        assert_eq!(json.url, "https://chat.z.ai/");
+        assert!(json.has_input);
+        assert_eq!(json.message, "ok");
+    }
+
+    #[test]
+    fn test_health_check_json_clone() {
+        let json = HealthCheckJson::new().with_input(true).with_url("test");
+        let cloned = json.clone();
+        assert_eq!(json, cloned);
+    }
+
+    #[test]
+    fn test_health_check_json_partial_eq() {
+        let a = HealthCheckJson::new().with_input(true);
+        let b = HealthCheckJson::new().with_input(true);
+        let c = HealthCheckJson::new().with_input(false);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    // ===== interpret_health_json 纯函数测试 =====
+
+    #[test]
+    fn test_interpret_health_json_healthy_with_input() {
+        let json = HealthCheckJson::new().with_input(true);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_interpret_health_json_maintenance_highest_priority() {
+        let json = HealthCheckJson::new()
+            .with_maintenance(true)
+            .with_rate_limit(true)
+            .with_login_button(true)
+            .with_input(true);
+        assert_eq!(
+            interpret_health_json(&json),
+            SiteHealthStatus::UnderMaintenance
+        );
+    }
+
+    #[test]
+    fn test_interpret_health_json_rate_limit_over_login() {
+        let json = HealthCheckJson::new()
+            .with_rate_limit(true)
+            .with_login_button(true)
+            .with_input(false);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::RateLimited);
+    }
+
+    #[test]
+    fn test_interpret_health_json_not_logged_in_no_input() {
+        let json = HealthCheckJson::new()
+            .with_login_button(true)
+            .with_input(false);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::NotLoggedIn);
+    }
+
+    #[test]
+    fn test_interpret_health_json_login_with_input_healthy() {
+        let json = HealthCheckJson::new()
+            .with_login_button(true)
+            .with_input(true);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_interpret_health_json_unknown_no_indicators() {
+        let json = HealthCheckJson::new();
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::Unknown);
+    }
+
+    #[test]
+    fn test_interpret_health_json_empty_url() {
+        let json = HealthCheckJson::new().with_url("").with_input(true);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::Healthy);
+    }
+
+    #[test]
+    fn test_interpret_health_json_all_false() {
+        let json = HealthCheckJson::new()
+            .with_input(false)
+            .with_login_button(false)
+            .with_rate_limit(false)
+            .with_maintenance(false);
+        assert_eq!(interpret_health_json(&json), SiteHealthStatus::Unknown);
+    }
+
+    #[test]
+    fn test_interpret_health_json_consistent_with_interpret_result() {
+        // 验证纯函数与 SiteHealthChecker::interpret_result 一致
+        for has_input in [true, false] {
+            for has_login in [true, false] {
+                for has_rate in [true, false] {
+                    for has_maint in [true, false] {
+                        let json = HealthCheckJson::new()
+                            .with_input(has_input)
+                            .with_login_button(has_login)
+                            .with_rate_limit(has_rate)
+                            .with_maintenance(has_maint);
+                        let pure = interpret_health_json(&json);
+                        let method = SiteHealthChecker::interpret_result(&json, SiteType::Zai);
+                        assert_eq!(
+                            pure, method,
+                            "不一致: input={}, login={}, rate={}, maint={}",
+                            has_input, has_login, has_rate, has_maint
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== HealthSeverity 测试 =====
+
+    #[test]
+    fn test_health_severity_description() {
+        assert_eq!(HealthSeverity::Info.description(), "信息");
+        assert_eq!(HealthSeverity::Warning.description(), "警告");
+        assert_eq!(HealthSeverity::Critical.description(), "严重");
+        assert_eq!(HealthSeverity::Unknown.description(), "未知");
+    }
+
+    #[test]
+    fn test_health_severity_requires_immediate_failover() {
+        assert!(!HealthSeverity::Info.requires_immediate_failover());
+        assert!(!HealthSeverity::Warning.requires_immediate_failover());
+        assert!(HealthSeverity::Critical.requires_immediate_failover());
+        assert!(!HealthSeverity::Unknown.requires_immediate_failover());
+    }
+
+    #[test]
+    fn test_health_severity_display() {
+        assert_eq!(HealthSeverity::Info.to_string(), "信息");
+        assert_eq!(HealthSeverity::Warning.to_string(), "警告");
+        assert_eq!(HealthSeverity::Critical.to_string(), "严重");
+        assert_eq!(HealthSeverity::Unknown.to_string(), "未知");
+    }
+
+    #[test]
+    fn test_health_severity_serde() {
+        let sev = HealthSeverity::Critical;
+        let json = serde_json::to_string(&sev).unwrap();
+        let parsed: HealthSeverity = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, sev);
+    }
+
+    // ===== classify_health_severity 测试 =====
+
+    #[test]
+    fn test_classify_health_severity_healthy() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::Healthy),
+            HealthSeverity::Info
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_rate_limited() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::RateLimited),
+            HealthSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_not_logged_in() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::NotLoggedIn),
+            HealthSeverity::Warning
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_under_maintenance() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::UnderMaintenance),
+            HealthSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_network_error() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::NetworkError),
+            HealthSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_unknown() {
+        assert_eq!(
+            classify_health_severity(&SiteHealthStatus::Unknown),
+            HealthSeverity::Unknown
+        );
+    }
+
+    #[test]
+    fn test_classify_health_severity_all_variants() {
+        // 遍历所有变体, 确保无 panic
+        for status in [
+            SiteHealthStatus::Healthy,
+            SiteHealthStatus::NotLoggedIn,
+            SiteHealthStatus::RateLimited,
+            SiteHealthStatus::UnderMaintenance,
+            SiteHealthStatus::NetworkError,
+            SiteHealthStatus::Unknown,
+        ] {
+            let sev = classify_health_severity(&status);
+            assert!(!sev.description().is_empty());
+        }
+    }
+
+    // ===== compute_health_check_interval 测试 =====
+
+    #[test]
+    fn test_compute_health_check_interval_healthy() {
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::Healthy, 60),
+            60
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_rate_limited() {
+        // 60 * 0.25 = 15
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::RateLimited, 60),
+            15
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_not_logged_in() {
+        // 60 * 0.5 = 30
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::NotLoggedIn, 60),
+            30
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_under_maintenance() {
+        // 60 * 2.0 = 120
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::UnderMaintenance, 60),
+            120
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_network_error() {
+        // 60 * 0.25 = 15
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::NetworkError, 60),
+            15
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_unknown() {
+        // 60 * 0.5 = 30
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::Unknown, 60),
+            30
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_min_1_second() {
+        // 即使 base_interval 很小, 最小返回 1
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::RateLimited, 1),
+            1
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_zero_base() {
+        // base=0 → 0*0.25=0 → max(0,1)=1
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::Healthy, 0),
+            1
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_large_base() {
+        // base=3600, maintenance → 7200
+        assert_eq!(
+            compute_health_check_interval(&SiteHealthStatus::UnderMaintenance, 3600),
+            7200
+        );
+    }
+
+    #[test]
+    fn test_compute_health_check_interval_ordering() {
+        // 维护 > 健康 > 未登录/未知 > 限流/网络错误
+        let base = 60u64;
+        let maintenance = compute_health_check_interval(&SiteHealthStatus::UnderMaintenance, base);
+        let healthy = compute_health_check_interval(&SiteHealthStatus::Healthy, base);
+        let rate_limited = compute_health_check_interval(&SiteHealthStatus::RateLimited, base);
+
+        assert!(maintenance > healthy);
+        assert!(healthy > rate_limited);
+    }
+
+    // ===== format_health_result_line 测试 =====
+
+    #[test]
+    fn test_format_health_result_line_healthy() {
+        let result = HealthCheckResult::new(SiteHealthStatus::Healthy);
+        let line = format_health_result_line(0, SiteType::Zai, &result);
+        assert!(line.contains("[0]"));
+        assert!(line.contains("Z.ai"));
+        assert!(line.contains("健康"));
+        assert!(line.contains("0ms"));
+    }
+
+    #[test]
+    fn test_format_health_result_line_with_message() {
+        let result = HealthCheckResult {
+            status: SiteHealthStatus::RateLimited,
+            timestamp: 0,
+            message: Some("请求过于频繁".to_string()),
+            current_url: Some("https://chat.z.ai".to_string()),
+            check_duration_ms: 150,
+        };
+        let line = format_health_result_line(1, SiteType::DeepSeek, &result);
+        assert!(line.contains("[1]"));
+        assert!(line.contains("DeepSeek"));
+        assert!(line.contains("请求过于频繁"));
+        assert!(line.contains("150ms"));
+    }
+
+    #[test]
+    fn test_format_health_result_line_no_message() {
+        let result = HealthCheckResult::new(SiteHealthStatus::Unknown);
+        let line = format_health_result_line(2, SiteType::Kimi, &result);
+        // 无 message 时使用 description
+        assert!(line.contains("未知"));
+    }
+
+    #[test]
+    fn test_format_health_result_line_large_index() {
+        let result = HealthCheckResult::new(SiteHealthStatus::Healthy);
+        let line = format_health_result_line(999, SiteType::Claude, &result);
+        assert!(line.contains("[999]"));
+    }
+
+    #[test]
+    fn test_format_health_result_line_all_site_types() {
+        let result = HealthCheckResult::new(SiteHealthStatus::Healthy);
+        for (idx, site) in [
+            SiteType::Zai,
+            SiteType::DeepSeek,
+            SiteType::Kimi,
+            SiteType::Tongyi,
+            SiteType::Claude,
+            SiteType::Unknown,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let line = format_health_result_line(idx, *site, &result);
+            assert!(!line.is_empty());
+            assert!(line.contains(&format!("[{}]", idx)));
+        }
+    }
+
+    // ===== determine_failover_priority 测试 =====
+
+    #[test]
+    fn test_determine_failover_priority_healthy() {
+        assert_eq!(determine_failover_priority(&SiteHealthStatus::Healthy), 0);
+    }
+
+    #[test]
+    fn test_determine_failover_priority_unknown() {
+        assert_eq!(determine_failover_priority(&SiteHealthStatus::Unknown), 1);
+    }
+
+    #[test]
+    fn test_determine_failover_priority_not_logged_in() {
+        assert_eq!(
+            determine_failover_priority(&SiteHealthStatus::NotLoggedIn),
+            2
+        );
+    }
+
+    #[test]
+    fn test_determine_failover_priority_rate_limited() {
+        assert_eq!(
+            determine_failover_priority(&SiteHealthStatus::RateLimited),
+            3
+        );
+    }
+
+    #[test]
+    fn test_determine_failover_priority_network_error() {
+        assert_eq!(
+            determine_failover_priority(&SiteHealthStatus::NetworkError),
+            4
+        );
+    }
+
+    #[test]
+    fn test_determine_failover_priority_under_maintenance() {
+        assert_eq!(
+            determine_failover_priority(&SiteHealthStatus::UnderMaintenance),
+            5
+        );
+    }
+
+    #[test]
+    fn test_determine_failover_priority_ordering() {
+        // Healthy < Unknown < NotLoggedIn < RateLimited < NetworkError < UnderMaintenance
+        let healthy = determine_failover_priority(&SiteHealthStatus::Healthy);
+        let unknown = determine_failover_priority(&SiteHealthStatus::Unknown);
+        let not_logged = determine_failover_priority(&SiteHealthStatus::NotLoggedIn);
+        let rate = determine_failover_priority(&SiteHealthStatus::RateLimited);
+        let network = determine_failover_priority(&SiteHealthStatus::NetworkError);
+        let maintenance = determine_failover_priority(&SiteHealthStatus::UnderMaintenance);
+
+        assert!(healthy < unknown);
+        assert!(unknown < not_logged);
+        assert!(not_logged < rate);
+        assert!(rate < network);
+        assert!(network < maintenance);
+    }
+
+    // ===== select_best_healthy_tab 测试 =====
+
+    #[test]
+    fn test_select_best_healthy_tab_empty() {
+        let results: Vec<(usize, HealthCheckResult)> = vec![];
+        assert_eq!(select_best_healthy_tab(&results), None);
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_first_healthy() {
+        let results = vec![
+            (0, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+            (1, HealthCheckResult::new(SiteHealthStatus::Healthy)),
+            (2, HealthCheckResult::new(SiteHealthStatus::Healthy)),
+        ];
+        assert_eq!(select_best_healthy_tab(&results), Some(1));
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_no_healthy_returns_lowest_priority() {
+        let results = vec![
+            (
+                0,
+                HealthCheckResult::new(SiteHealthStatus::UnderMaintenance),
+            ),
+            (1, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+            (2, HealthCheckResult::new(SiteHealthStatus::NetworkError)),
+        ];
+        // RateLimited (priority 3) < NetworkError (4) < UnderMaintenance (5)
+        assert_eq!(select_best_healthy_tab(&results), Some(1));
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_single_healthy() {
+        let results = vec![(5, HealthCheckResult::new(SiteHealthStatus::Healthy))];
+        assert_eq!(select_best_healthy_tab(&results), Some(5));
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_single_unhealthy() {
+        let results = vec![(3, HealthCheckResult::new(SiteHealthStatus::RateLimited))];
+        assert_eq!(select_best_healthy_tab(&results), Some(3));
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_all_unknown() {
+        let results = vec![
+            (0, HealthCheckResult::new(SiteHealthStatus::Unknown)),
+            (1, HealthCheckResult::new(SiteHealthStatus::Unknown)),
+        ];
+        // 所有优先级相同, 返回第一个 (min_by_key 在相等时返回第一个)
+        assert_eq!(select_best_healthy_tab(&results), Some(0));
+    }
+
+    #[test]
+    fn test_select_best_healthy_tab_mixed() {
+        let results = vec![
+            (0, HealthCheckResult::new(SiteHealthStatus::NotLoggedIn)),
+            (1, HealthCheckResult::new(SiteHealthStatus::Unknown)),
+            (2, HealthCheckResult::new(SiteHealthStatus::Healthy)),
+            (3, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+        ];
+        // 有健康的 → 返回 2
+        assert_eq!(select_best_healthy_tab(&results), Some(2));
+    }
+
+    // ===== should_skip_tab 测试 =====
+
+    #[test]
+    fn test_should_skip_tab_below_threshold() {
+        assert!(!should_skip_tab(0, 3));
+        assert!(!should_skip_tab(1, 3));
+        assert!(!should_skip_tab(2, 3));
+    }
+
+    #[test]
+    fn test_should_skip_tab_at_threshold() {
+        assert!(should_skip_tab(3, 3));
+    }
+
+    #[test]
+    fn test_should_skip_tab_above_threshold() {
+        assert!(should_skip_tab(4, 3));
+        assert!(should_skip_tab(10, 3));
+        assert!(should_skip_tab(100, 3));
+    }
+
+    #[test]
+    fn test_should_skip_tab_zero_threshold() {
+        // threshold=0: 0 >= 0 → true
+        assert!(should_skip_tab(0, 0));
+    }
+
+    #[test]
+    fn test_should_skip_tab_u32_max() {
+        assert!(!should_skip_tab(0, u32::MAX));
+        assert!(should_skip_tab(u32::MAX, u32::MAX));
+    }
+
+    // ===== calculate_health_rate 测试 =====
+
+    #[test]
+    fn test_calculate_health_rate_zero_checks() {
+        assert!((calculate_health_rate(0, 0) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_health_rate_all_healthy() {
+        assert!((calculate_health_rate(100, 100) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_health_rate_half_healthy() {
+        assert!((calculate_health_rate(100, 50) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_health_rate_none_healthy() {
+        assert!((calculate_health_rate(100, 0) - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_health_rate_more_healthy_than_checks() {
+        // healthy > total → clamped to 1.0
+        assert!((calculate_health_rate(10, 20) - 1.0).abs() < 0.001);
+    }
+
+    // ===== format_health_rate 测试 =====
+
+    #[test]
+    fn test_format_health_rate_full() {
+        assert_eq!(format_health_rate(1.0), "100.0%");
+    }
+
+    #[test]
+    fn test_format_health_rate_zero() {
+        assert_eq!(format_health_rate(0.0), "0.0%");
+    }
+
+    #[test]
+    fn test_format_health_rate_half() {
+        assert_eq!(format_health_rate(0.5), "50.0%");
+    }
+
+    #[test]
+    fn test_format_health_rate_decimal() {
+        assert_eq!(format_health_rate(0.833), "83.3%");
+    }
+
+    // ===== 协同测试: site_health ↔ connection_monitor ↔ auto_recovery =====
+
+    #[test]
+    fn test_synergy_severity_mapping() {
+        // 网站健康状态 → 健康严重程度 → 与连接严重程度协同
+        use crate::connection_monitor::{classify_connection_severity, ConnectionSeverity};
+
+        // 网站健康 → HealthSeverity::Info
+        // 对应 CDP 连接正常 → ConnectionSeverity::Info
+        let site_healthy = classify_health_severity(&SiteHealthStatus::Healthy);
+        let conn_healthy = ConnectionSeverity::Info;
+        assert_eq!(site_healthy, HealthSeverity::Info);
+        assert_eq!(
+            conn_healthy,
+            classify_connection_severity(&crate::connection_monitor::ConnectionStatus::Connected)
+        );
+
+        // 网络错误 → HealthSeverity::Critical
+        // 对应 CDP ChromeUnreachable → ConnectionSeverity::Critical
+        let site_critical = classify_health_severity(&SiteHealthStatus::NetworkError);
+        assert_eq!(site_critical, HealthSeverity::Critical);
+        assert!(site_critical.requires_immediate_failover());
+    }
+
+    #[test]
+    fn test_synergy_health_to_recovery_pipeline() {
+        // 完整管道: SiteHealthStatus → HealthSeverity → RecoveryUrgency
+        use crate::auto_recovery::{assess_recovery_urgency, RecoveryUrgency};
+        use crate::connection_monitor::HealthLevel;
+
+        // 网站维护中 → Critical → 需要立即故障转移
+        let severity = classify_health_severity(&SiteHealthStatus::UnderMaintenance);
+        assert_eq!(severity, HealthSeverity::Critical);
+        assert!(severity.requires_immediate_failover());
+
+        // 对应连接健康等级 Critical
+        let health_level = HealthLevel::Critical;
+        let urgency = assess_recovery_urgency(&health_level);
+        assert_eq!(urgency, RecoveryUrgency::Critical);
+        assert!(urgency.requires_immediate_recovery());
+    }
+
+    #[test]
+    fn test_synergy_health_rate_with_monitor_rate() {
+        // site_health 的 health_rate 与 connection_monitor 的 success_rate 应该是协同的
+        use crate::connection_monitor::calculate_monitor_success_rate;
+
+        // 80% 健康率 (网站) = 80% 成功率 (连接)
+        let site_rate = calculate_health_rate(100, 80);
+        let conn_rate = calculate_monitor_success_rate(100, 20); // 20 failures → 80% success
+        assert!((site_rate - conn_rate).abs() < 0.001);
+        assert!((site_rate - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_synergy_failover_with_should_failover_decision() {
+        // site_health 的 should_failover 与 failover_chat 的 should_failover_decision 协同
+        use crate::failover_chat::should_failover_decision;
+
+        for status in [
+            SiteHealthStatus::Healthy,
+            SiteHealthStatus::NotLoggedIn,
+            SiteHealthStatus::RateLimited,
+            SiteHealthStatus::UnderMaintenance,
+            SiteHealthStatus::NetworkError,
+            SiteHealthStatus::Unknown,
+        ] {
+            let result = HealthCheckResult::new(status.clone());
+            let from_status = result.should_failover();
+            let from_decision = should_failover_decision(&result);
+            assert_eq!(
+                from_status, from_decision,
+                "should_failover 不一致: {:?}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_synergy_interval_with_monitor_delay() {
+        // site_health 的检查间隔与 connection_monitor 的检查延迟协同
+        use crate::connection_monitor::compute_next_check_delay;
+
+        // 网站健康 → 基础间隔 60s
+        let site_interval = compute_health_check_interval(&SiteHealthStatus::Healthy, 60);
+        // 连接正常, heartbeat=60 → 60s
+        let conn_delay = compute_next_check_delay(
+            &crate::connection_monitor::ConnectionStatus::Connected,
+            0,
+            60,
+        );
+        assert_eq!(site_interval, 60);
+        assert_eq!(conn_delay, 60);
+        assert_eq!(site_interval, conn_delay);
+    }
+
+    #[test]
+    fn test_synergy_skip_tab_with_continue_retrying() {
+        // site_health 的 should_skip_tab 与 auto_recovery 的 should_continue_retrying 协同
+        use crate::auto_recovery::should_continue_retrying;
+
+        // 跳过阈值 = 重试上限
+        let skip_threshold = 3u32;
+        let max_retries = 3u32;
+
+        // 未达到阈值 → 不跳过, 继续重试
+        for i in 0..skip_threshold {
+            assert!(!should_skip_tab(i, skip_threshold), "不应跳过: {}", i);
+            assert!(
+                should_continue_retrying(i, max_retries),
+                "应继续重试: {}",
+                i
+            );
+        }
+
+        // 达到阈值 → 跳过, 不再重试
+        assert!(should_skip_tab(skip_threshold, skip_threshold));
+        assert!(!should_continue_retrying(skip_threshold, max_retries));
+    }
+
+    #[test]
+    fn test_synergy_full_24h_pipeline() {
+        // 模拟完整的 24h 可靠性链路:
+        // 1. CDP 连接状态 → ConnectionSeverity
+        // 2. 网站健康状态 → HealthSeverity
+        // 3. 综合评估 → RecoveryUrgency
+        // 4. 故障转移决策 → select_best_healthy_tab
+        use crate::auto_recovery::{assess_recovery_urgency, RecoveryUrgency};
+        use crate::connection_monitor::{
+            classify_connection_severity, determine_health_level, ConnectionStatus, HealthLevel,
+        };
+
+        // 场景: Chrome 连接正常, 但主网站限流
+        let conn_status = ConnectionStatus::Connected;
+        let conn_severity = classify_connection_severity(&conn_status);
+        assert_eq!(conn_severity.description(), "信息"); // CDP 层正常
+
+        let site_status = SiteHealthStatus::RateLimited;
+        let site_severity = classify_health_severity(&site_status);
+        assert_eq!(site_severity, HealthSeverity::Warning); // 网站层警告
+
+        // 连接层健康 (因为 CDP 正常)
+        let health_level = determine_health_level(&conn_status, 0, 3);
+        assert_eq!(health_level, HealthLevel::Healthy);
+        let urgency = assess_recovery_urgency(&health_level);
+        assert_eq!(urgency, RecoveryUrgency::None); // 不需要恢复
+
+        // 但网站层需要故障转移
+        assert!(site_status.should_failover());
+        assert!(!site_severity.requires_immediate_failover()); // 限流不是 Critical
+
+        // 选择最佳标签页
+        let results = vec![
+            (0, HealthCheckResult::new(SiteHealthStatus::RateLimited)),
+            (1, HealthCheckResult::new(SiteHealthStatus::Healthy)),
+        ];
+        let best = select_best_healthy_tab(&results);
+        assert_eq!(best, Some(1)); // 切换到健康的标签页 1
+    }
+
+    #[test]
+    fn test_synergy_maintenance_critical_pipeline() {
+        // 场景: 网站维护中 + Chrome 不可达 → 双重 Critical
+        use crate::connection_monitor::{
+            classify_connection_severity, determine_health_level, ConnectionStatus, HealthLevel,
+        };
+
+        let conn_status = ConnectionStatus::ChromeUnreachable;
+        let site_status = SiteHealthStatus::UnderMaintenance;
+
+        // 两层都是 Critical
+        let conn_severity = classify_connection_severity(&conn_status);
+        let site_severity = classify_health_severity(&site_status);
+
+        assert_eq!(conn_severity.description(), "严重");
+        assert_eq!(site_severity, HealthSeverity::Critical);
+        assert!(site_severity.requires_immediate_failover());
+
+        // 连接层也是 Critical
+        let health_level = determine_health_level(&conn_status, 3, 3);
+        assert_eq!(health_level, HealthLevel::Critical);
     }
 }

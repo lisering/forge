@@ -133,7 +133,10 @@ pub use memory::{Memory, RequirementChange};
 pub use orchestrator::Orchestrator;
 pub use prompt_builder::SystemPrompt;
 pub use site_health::{
-    check_all_tabs, check_and_log, HealthCheckResult, SiteFailover, SiteHealthChecker,
+    calculate_health_rate, check_all_tabs, check_and_log, classify_health_severity,
+    compute_health_check_interval, determine_failover_priority, format_health_rate,
+    format_health_result_line, interpret_health_json, select_best_healthy_tab, should_skip_tab,
+    HealthCheckJson, HealthCheckResult, HealthSeverity, SiteFailover, SiteHealthChecker,
     SiteHealthStatus,
 };
 pub use slash_command::{
