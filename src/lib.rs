@@ -87,6 +87,7 @@ pub mod prompt_builder;
 pub mod proxy_pool;
 pub mod radix_tree;
 pub mod response_handler;
+pub mod search_cache;
 pub mod site_health;
 pub mod slash_command;
 pub mod stealth_patches;
@@ -187,6 +188,11 @@ pub use radix_tree::{
 pub use response_handler::{
     CodeExtractorHandler, HandlerChain, HandlerResult, MemoryUpdaterHandler, ResponseHandler,
     TaskContext, TraceWriterHandler,
+};
+pub use search_cache::{
+    build_cache_key, find_oldest_key, format_cache_stats, is_cache_expired,
+    normalize_query_for_cache, CacheStats, CachedSearchEntry, SearchCache, DEFAULT_CACHE_MAX_SIZE,
+    DEFAULT_CACHE_TTL_SECS,
 };
 pub use site_health::{
     build_detailed_check_js, calculate_health_rate, check_all_tabs, check_and_log,

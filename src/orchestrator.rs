@@ -33,6 +33,7 @@ use crate::loop_detector::LoopDetector;
 use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
 use crate::prompt_builder::SystemPrompt;
 use crate::response_handler::{HandlerChain, TaskContext};
+use crate::search_cache::{self, CachedSearchEntry, SearchCache};
 use crate::slash_command::{self, SlashCommand, SlashCommandAction};
 use crate::steer_reminder::SteerReminder;
 use crate::task_graph::TaskGraph;
@@ -482,6 +483,13 @@ where
     /// 记录每次增量发送的总消息数、实际发送数和跳过数。
     /// 在 `send_with_continuation` 方法中自动更新。
     pub incremental_stats: crate::dev_trace::IncrementalStats,
+
+    /// 搜索结果缓存 — 编译错误自动搜索结果缓存 (Session 78)
+    ///
+    /// 对相同错误代码的搜索结果进行缓存, 避免重复搜索相同错误,
+    /// 减少搜索延迟和带宽消耗。
+    /// 基于 TTL + LRU 策略, 默认 TTL=30分钟, 最大50条。
+    pub search_cache: SearchCache,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -527,6 +535,7 @@ where
             live_continuation: None,
             conversation_tracker: None,
             incremental_stats: crate::dev_trace::IncrementalStats::new(),
+            search_cache: SearchCache::default_config(),
         }
     }
 }
@@ -588,6 +597,7 @@ where
             live_continuation: self.live_continuation,
             conversation_tracker: self.conversation_tracker,
             incremental_stats: self.incremental_stats,
+            search_cache: self.search_cache,
         }
     }
 
@@ -775,6 +785,20 @@ where
     /// 查找最长公共前缀，避免重复发送相同上下文。
     pub fn with_conversation_tracker(mut self) -> Self {
         self.conversation_tracker = Some(crate::radix_tree::ConversationTracker::new());
+        self
+    }
+
+    /// 配置搜索结果缓存 — Session 78
+    ///
+    /// 自定义缓存 TTL 和最大条目数。
+    /// 默认: TTL=1800s (30分钟), max=50。
+    ///
+    /// # 参数
+    ///
+    /// - `ttl_secs`: 缓存生存时间 (秒), 0 表示立即过期
+    /// - `max_size`: 最大缓存条目数, 0 表示无限制
+    pub fn with_search_cache_config(mut self, ttl_secs: u64, max_size: usize) -> Self {
+        self.search_cache = SearchCache::new(ttl_secs, max_size);
         self
     }
 
@@ -1072,7 +1096,7 @@ where
         }
     }
 
-    /// 编译错误自动搜索 — web_tool 深度集成
+    /// 编译错误自动搜索 — web_tool 深度集成 + 搜索结果缓存 (Session 78)
     ///
     /// 当编译/测试失败时, 自动从错误信息中提取关键词,
     /// 通过 WebTool 搜索解决方案, 返回格式化的搜索结果段落。
@@ -1083,6 +1107,14 @@ where
     /// - 编译错误 → 提取关键词 → Google 搜索 → 结果注入修复 prompt
     /// - AI 获得额外上下文, 提高首次修复成功率
     /// - 与 `/search` slash command 互补: 主动搜索 vs AI 自主搜索
+    ///
+    /// ## 搜索结果缓存 (Session 78)
+    ///
+    /// 相同错误代码 (如 E0308) 的搜索结果会被缓存, 避免重复搜索:
+    /// 1. 从错误列表构建缓存键 (优先使用 error_code)
+    /// 2. 检查缓存 → 命中则直接返回 (0ms, 节省搜索时间)
+    /// 3. 未命中 → 执行 WebTool 搜索 → 结果存入缓存
+    /// 4. DevTrace 记录缓存命中/未命中
     ///
     /// ## 条件
     ///
@@ -1135,6 +1167,49 @@ where
             }
         };
 
+        // === 搜索结果缓存: 构建缓存键并检查缓存 (Session 78) ===
+        let cache_key = search_cache::build_cache_key(errors);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(ref key) = cache_key {
+            if let Some(cached) = self.search_cache.get(key, now) {
+                info!(
+                    "    🔍 自动搜索: 缓存命中 (key={}, 命中次数={})",
+                    key, cached.hit_count
+                );
+                println!("    🔍 搜索缓存命中 ({}), 跳过网络搜索", key);
+
+                // DevTrace: 记录缓存命中
+                let as_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+                self.trace_dev(
+                    TraceAction::WebSearch,
+                    Some(phase_idx),
+                    Some(task_idx),
+                    Some(&as_task_name),
+                    &query,
+                    &cached.content,
+                    0, // duration=0 for cache hit
+                    true,
+                    Some(&format!(
+                        "缓存命中 (key={}, 原始耗时={}ms, 命中次数={})",
+                        key, cached.duration_ms, cached.hit_count
+                    )),
+                );
+
+                // 格式化缓存的搜索结果段落
+                let section = error_search::format_search_results_section(
+                    &cached.query,
+                    &cached.content,
+                    cached.duration_ms,
+                );
+
+                return Ok(Some(section));
+            }
+        }
+
         info!("    🔍 自动搜索: '{}'", query);
         println!("    🔍 自动搜索错误解决方案: {}", query);
 
@@ -1154,6 +1229,18 @@ where
                     return Ok(None);
                 }
 
+                // === 搜索结果缓存: 存入缓存 (Session 78) ===
+                if let Some(ref key) = cache_key {
+                    let entry = CachedSearchEntry::with_timestamp(
+                        result.query.clone(),
+                        result.content.clone(),
+                        result.duration_ms,
+                        now,
+                    );
+                    self.search_cache.insert(key.clone(), entry, now);
+                    debug!("    🔍 自动搜索: 结果已缓存 (key={})", key);
+                }
+
                 info!(
                     "    ✅ 自动搜索完成: {}ms, {} 字符",
                     search_duration,
@@ -1163,6 +1250,11 @@ where
 
                 // DevTrace: 记录自动搜索
                 let as_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+                let cache_note = if cache_key.is_some() {
+                    Some("编译错误自动搜索 (已缓存)")
+                } else {
+                    Some("编译错误自动搜索")
+                };
                 self.trace_dev(
                     TraceAction::WebSearch,
                     Some(phase_idx),
@@ -1172,7 +1264,7 @@ where
                     &result.content,
                     search_duration,
                     true,
-                    Some("编译错误自动搜索"),
+                    cache_note,
                 );
 
                 // 格式化搜索结果段落
