@@ -270,6 +270,14 @@ enum Commands {
         /// 仅在 --auto-failover 启用时有效。
         #[arg(long, default_value = "30")]
         failover_cooldown: u64,
+
+        /// Memory 上下文注入条数 — 修复轮次中注入近期对话历史 (Session 89)
+        ///
+        /// 启用后 (>0), 在修复轮次中从 Memory 对话历史提取最近 N 条对话
+        /// 注入消息列表, 结合增量发送机制自动跳过已发送部分。
+        /// 0 表示禁用 (默认)。建议值 3~5。
+        #[arg(long, default_value = "0")]
+        memory_context: usize,
     },
 }
 
@@ -765,6 +773,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             health_check_interval,
             failover_max_failures,
             failover_cooldown,
+            memory_context,
         } => {
             let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;
@@ -921,6 +930,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         requirement_file.as_deref(),
                         handler_chain,
                         trace_backend,
+                        memory_context,
                     )
                     .await?;
 
@@ -951,6 +961,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         requirement_file.as_deref(),
                         handler_chain,
                         trace_backend,
+                        memory_context,
                     )
                     .await?;
 
@@ -999,6 +1010,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         requirement_file.as_deref(),
                         handler_chain,
                         trace_backend,
+                        memory_context,
                     )
                     .await?;
                 } else {
@@ -1026,6 +1038,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         requirement_file.as_deref(),
                         handler_chain,
                         trace_backend,
+                        memory_context,
                     )
                     .await?;
                 }
@@ -1140,6 +1153,7 @@ async fn run_with_clarifier<C, Q>(
     requirement_file: Option<&std::path::Path>,
     handler_chain: Option<HandlerChain>,
     trace_backend: StorageBackend,
+    memory_context: usize,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1164,7 +1178,8 @@ where
     .with_context_handoff(max_context_turns)
     .with_steer_reminder(steer_interval)
     .with_loop_detection(loop_detection)
-    .with_slash_commands(slash_commands);
+    .with_slash_commands(slash_commands)
+    .with_memory_context(memory_context);
 
     // Session 69: 根据配置选择 trace 后端
     if dev_trace {

@@ -190,7 +190,7 @@ pub use loop_detector::{
     should_skip_task, ErrorRound, LoopDetector,
 };
 pub use memory::{Memory, RequirementChange};
-pub use orchestrator::Orchestrator;
+pub use orchestrator::{build_fix_messages_with_memory, MemoryContextStats, Orchestrator};
 pub use prompt_builder::SystemPrompt;
 pub use proxy_pool::{
     build_reqwest_proxy, is_valid_proxy_url, load_proxies_from_env, ProxyConfig, ProxyPool,

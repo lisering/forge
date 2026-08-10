@@ -254,6 +254,176 @@ impl VersionManager {
 }
 
 // ============================================================================
+//  MemoryContextStats — Memory 上下文注入统计 (Session 89)
+// ============================================================================
+
+/// Memory 上下文注入统计 — 追踪 `build_messages_from_memory` 注入效果
+///
+/// 记录在修复轮次中从 Memory 注入对话历史的次数和消息数,
+/// 便于在 DevTrace 报告中展示注入效果。
+///
+/// # 字段
+///
+/// - `injection_count`: memory context 被注入的次数 (每次修复轮次注入算 1 次)
+/// - `total_messages_injected`: 注入的总消息数 (所有注入次数的消息数之和)
+/// - `total_messages_skipped`: 注入的消息中被增量跟踪跳过的数量
+///
+/// # 示例
+///
+/// ```
+/// # use forge::orchestrator::MemoryContextStats;
+/// let mut stats = MemoryContextStats::new();
+/// stats.record_injection(3, 2); // 注入3条, 跳过2条
+/// assert_eq!(stats.injection_count, 1);
+/// assert_eq!(stats.total_messages_injected, 3);
+/// assert_eq!(stats.total_messages_skipped, 2);
+/// assert_eq!(stats.avg_messages_per_injection(), 3.0);
+/// ```
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MemoryContextStats {
+    /// memory context 被注入的次数
+    pub injection_count: usize,
+    /// 注入的总消息数
+    pub total_messages_injected: usize,
+    /// 注入的消息中被增量跟踪跳过的数量
+    pub total_messages_skipped: usize,
+}
+
+impl MemoryContextStats {
+    /// 创建空的统计
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次 memory context 注入
+    ///
+    /// # 参数
+    /// - `messages_injected`: 本次注入的消息数
+    /// - `messages_skipped`: 本次注入中被跳过的消息数
+    pub fn record_injection(&mut self, messages_injected: usize, messages_skipped: usize) {
+        self.injection_count += 1;
+        self.total_messages_injected += messages_injected;
+        self.total_messages_skipped += messages_skipped;
+    }
+
+    /// 平均每次注入的消息数
+    pub fn avg_messages_per_injection(&self) -> f64 {
+        if self.injection_count == 0 {
+            0.0
+        } else {
+            self.total_messages_injected as f64 / self.injection_count as f64
+        }
+    }
+
+    /// 跳过率 (跳过的消息占注入消息的比例)
+    pub fn skip_rate(&self) -> f64 {
+        if self.total_messages_injected == 0 {
+            0.0
+        } else {
+            self.total_messages_skipped as f64 / self.total_messages_injected as f64
+        }
+    }
+
+    /// 是否有注入记录
+    pub fn has_data(&self) -> bool {
+        self.injection_count > 0
+    }
+
+    /// 生成摘要字符串 (用于 DevTrace 报告)
+    pub fn to_summary(&self) -> String {
+        if !self.has_data() {
+            return String::new();
+        }
+        format!(
+            "注入次数: {}, 总消息: {}, 跳过: {}, 跳过率: {:.1}%",
+            self.injection_count,
+            self.total_messages_injected,
+            self.total_messages_skipped,
+            self.skip_rate() * 100.0
+        )
+    }
+}
+
+// ============================================================================
+//  纯函数: build_fix_messages_with_memory — 构建修复轮次的消息列表
+// ============================================================================
+
+/// 构建修复轮次的消息列表 (含 Memory 上下文注入)
+///
+/// 在修复轮次中, 将 Memory 中的近期对话历史注入消息列表,
+/// 使 AI 获得更完整的上下文。结合增量发送机制,
+/// 已发送的历史消息会被自动跳过, 只发送新增的修复 prompt。
+///
+/// # 消息列表结构
+///
+/// ```text
+/// [first_prompt?, ...memory_messages, fix_prompt]
+/// ```
+///
+/// - `first_prompt`: 首次尝试的 prompt (如有, 已发送过会被跳过)
+/// - `memory_messages`: 从 Memory 提取的近期对话 (已发送过会被跳过)
+/// - `fix_prompt`: 当前修复 prompt (新增内容, 实际发送)
+///
+/// # 参数
+///
+/// - `first_prompt`: 首次尝试的 prompt (`None` 表示未存储, 如上下文衔接后)
+/// - `fix_prompt`: 当前修复 prompt
+/// - `memory_messages`: 从 Memory 提取的近期对话消息列表
+///
+/// # 返回
+///
+/// 有序的消息列表, 供 `send_with_continuation` 使用。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::orchestrator::build_fix_messages_with_memory;
+/// // 有 first_prompt + memory
+/// let msgs = build_fix_messages_with_memory(
+///     &Some("first".to_string()),
+///     "fix",
+///     &["hist1".to_string(), "hist2".to_string()],
+/// );
+/// assert_eq!(msgs, vec!["first", "hist1", "hist2", "fix"]);
+///
+/// // 无 first_prompt
+/// let msgs = build_fix_messages_with_memory(
+///     &None,
+///     "fix",
+///     &["hist1".to_string()],
+/// );
+/// assert_eq!(msgs, vec!["hist1", "fix"]);
+///
+/// // 无 memory
+/// let msgs = build_fix_messages_with_memory(
+///     &Some("first".to_string()),
+///     "fix",
+///     &[],
+/// );
+/// assert_eq!(msgs, vec!["first", "fix"]);
+/// ```
+pub fn build_fix_messages_with_memory(
+    first_prompt: &Option<String>,
+    fix_prompt: &str,
+    memory_messages: &[String],
+) -> Vec<String> {
+    let mut messages = Vec::with_capacity(memory_messages.len() + 2);
+
+    // 添加首次 prompt (如有, 已发送过会被增量跟踪跳过)
+    if let Some(ref first) = first_prompt {
+        messages.push(first.clone());
+    }
+
+    // 添加 Memory 上下文 (已发送过会被增量跟踪跳过)
+    messages.extend(memory_messages.iter().cloned());
+
+    // 添加修复 prompt (新增内容, 实际发送)
+    messages.push(fix_prompt.to_string());
+
+    messages
+}
+
+// ============================================================================
 //  截断 JSON 恢复 (AI 回复超长导致 JSON 不完整时的容错处理)
 // ============================================================================
 
@@ -509,6 +679,21 @@ where
     /// 当搜索有害时自动禁用搜索功能。
     /// None 表示禁用 (默认, 向后兼容)。
     pub search_quality_evaluator: Option<SearchQualityEvaluator>,
+
+    /// Memory 上下文注入条数 — 修复轮次中注入近期对话历史 (Session 89)
+    ///
+    /// 启用后 (>0), 在 `send_attempt_prompt` 的修复轮次中,
+    /// 从 Memory 对话历史提取最近 N 条对话注入消息列表。
+    /// 结合增量发送机制, 已发送的历史消息会被自动跳过,
+    /// 只发送新增的修复 prompt, 同时为 AI 提供更完整的上下文。
+    /// 0 表示禁用 (默认, 向后兼容)。
+    pub memory_context_count: usize,
+
+    /// Memory 上下文注入统计 — 追踪注入次数和消息数 (Session 89)
+    ///
+    /// 记录 memory context 被注入的次数和总消息数,
+    /// 用于 DevTrace 报告中展示注入效果。
+    pub memory_context_stats: MemoryContextStats,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -557,6 +742,8 @@ where
             search_cache: SearchCache::default_config(),
             cache_tuner: None,
             search_quality_evaluator: None,
+            memory_context_count: 0,
+            memory_context_stats: MemoryContextStats::new(),
         }
     }
 }
@@ -621,6 +808,8 @@ where
             search_cache: self.search_cache,
             cache_tuner: self.cache_tuner,
             search_quality_evaluator: self.search_quality_evaluator,
+            memory_context_count: self.memory_context_count,
+            memory_context_stats: self.memory_context_stats,
         }
     }
 
@@ -855,6 +1044,35 @@ where
         self
     }
 
+    /// 启用 Memory 上下文注入 — 修复轮次中注入近期对话历史 (Session 89)
+    ///
+    /// 启用后 (>0), 在 `send_attempt_prompt` 的修复轮次中,
+    /// 从 Memory 对话历史提取最近 `count` 条对话注入消息列表。
+    /// 结合增量发送机制, 已发送的历史消息会被自动跳过,
+    /// 只发送新增的修复 prompt, 同时为 AI 提供更完整的上下文。
+    ///
+    /// # 设计理念
+    ///
+    /// 在多轮修复中, AI 的对话历史已经在上下文中。
+    /// 将历史消息加入消息列表后, 增量跟踪会自动跳过已发送的部分,
+    /// 避免重复发送相同的上下文, 同时确保 AI 有足够的上下文进行修复。
+    ///
+    /// # 参数
+    ///
+    /// - `count`: 提取最近多少条对话 (0 = 禁用, 建议值 3~5)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::orchestrator::Orchestrator;
+    /// # // builder 模式配置
+    /// # // let orch = Orchestrator::new(...).with_memory_context(3);
+    /// ```
+    pub fn with_memory_context(mut self, count: usize) -> Self {
+        self.memory_context_count = count;
+        self
+    }
+
     /// 计算增量消息 — 使用 LiveContinuation 和 ConversationTracker
     ///
     /// 1. 如果启用了 ConversationTracker, 先用 Radix Tree 查找最长公共前缀
@@ -1078,7 +1296,6 @@ where
     /// # // let messages = orch.build_messages_from_memory(3);
     /// # // assert!(messages.len() <= 3);
     /// ```
-    #[allow(dead_code)] // Task 5 基础设施: 未来在 send_attempt_prompt 中集成
     fn build_messages_from_memory(&self, recent_count: usize) -> Vec<String> {
         if recent_count == 0 {
             return vec![];
@@ -1127,22 +1344,44 @@ where
     ) -> Result<crate::traits::ChatResult> {
         if self.live_continuation.is_some() || self.conversation_tracker.is_some() {
             // 构建增量发送的消息列表
-            let messages = if is_fix {
-                if let Some(ref first) = first_prompt {
-                    // 修复轮: [首次完整 prompt, 修复 prompt]
-                    // 首次 prompt 已发送过 → 增量跟踪跳过, 只发送修复 prompt
-                    vec![first.clone(), steered_prompt.to_string()]
+            let (messages, memory_injected) = if is_fix {
+                // === Memory 上下文注入 (Session 89) ===
+                // 修复轮次中, 从 Memory 提取近期对话历史注入消息列表
+                let memory_messages = if self.memory_context_count > 0 {
+                    let msgs = self.build_messages_from_memory(self.memory_context_count);
+                    if !msgs.is_empty() {
+                        info!("    📝 Memory 上下文注入: {} 条近期对话", msgs.len());
+                    }
+                    msgs
                 } else {
-                    // 首次 prompt 未存储 (如上下文衔接后), 全量发送
-                    vec![steered_prompt.to_string()]
-                }
+                    vec![]
+                };
+
+                let injected = memory_messages.len();
+                // 使用纯函数构建消息列表: [first_prompt?, ...memory_messages, fix_prompt]
+                let msgs =
+                    build_fix_messages_with_memory(first_prompt, steered_prompt, &memory_messages);
+                (msgs, injected)
             } else {
                 // 首次尝试: [完整 prompt] → 全量发送
-                vec![steered_prompt.to_string()]
+                (vec![steered_prompt.to_string()], 0)
             };
 
+            // 快照增量统计 (用于计算 memory context 的跳过数)
+            let skipped_before = self.incremental_stats.skipped_messages;
+
             // 通过 send_with_continuation 发送 (自动计算增量 + 更新统计 + DevTrace)
-            self.send_with_continuation(&messages, timeout).await
+            let result = self.send_with_continuation(&messages, timeout).await?;
+
+            // 更新 Memory 上下文注入统计 (跳过数 = 本次发送的总跳过数)
+            if memory_injected > 0 {
+                let skipped_after = self.incremental_stats.skipped_messages;
+                let skipped_delta = skipped_after.saturating_sub(skipped_before);
+                self.memory_context_stats
+                    .record_injection(memory_injected, skipped_delta);
+            }
+
+            Ok(result)
         } else {
             // 向后兼容: 增量跟踪未启用, 直接发送
             self.send_message_safe(steered_prompt, timeout).await
@@ -2623,6 +2862,14 @@ where
                     warn!("保存搜索质量历史失败: {}", e);
                 }
             }
+        }
+
+        // === 打印 Memory 上下文注入统计 (Session 89) ===
+        if self.memory_context_stats.has_data() {
+            println!(
+                "\n  📝 Memory 上下文注入: {}",
+                self.memory_context_stats.to_summary()
+            );
         }
 
         // === DevTrace: 打印追踪摘要 (借鉴方向 4) ===
@@ -5440,6 +5687,494 @@ mod tests {
         // 空内容应被过滤
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], "response");
+    }
+
+    // ===== Session 89: build_messages_from_memory 深度集成测试 =====
+
+    // --- 纯函数 build_fix_messages_with_memory 测试 ---
+
+    #[test]
+    fn test_build_fix_messages_with_first_and_memory() {
+        let msgs = build_fix_messages_with_memory(
+            &Some("first".to_string()),
+            "fix",
+            &["hist1".to_string(), "hist2".to_string()],
+        );
+        assert_eq!(msgs, vec!["first", "hist1", "hist2", "fix"]);
+    }
+
+    #[test]
+    fn test_build_fix_messages_no_first_with_memory() {
+        let msgs = build_fix_messages_with_memory(
+            &None,
+            "fix",
+            &["hist1".to_string(), "hist2".to_string()],
+        );
+        assert_eq!(msgs, vec!["hist1", "hist2", "fix"]);
+    }
+
+    #[test]
+    fn test_build_fix_messages_with_first_no_memory() {
+        let msgs = build_fix_messages_with_memory(&Some("first".to_string()), "fix", &[]);
+        assert_eq!(msgs, vec!["first", "fix"]);
+    }
+
+    #[test]
+    fn test_build_fix_messages_no_first_no_memory() {
+        let msgs = build_fix_messages_with_memory(&None, "fix", &[]);
+        assert_eq!(msgs, vec!["fix"]);
+    }
+
+    #[test]
+    fn test_build_fix_messages_empty_fix_prompt() {
+        let msgs =
+            build_fix_messages_with_memory(&Some("first".to_string()), "", &["hist".to_string()]);
+        assert_eq!(msgs, vec!["first", "hist", ""]);
+    }
+
+    #[test]
+    fn test_build_fix_messages_order_preserved() {
+        let memory = vec!["msg1".to_string(), "msg2".to_string(), "msg3".to_string()];
+        let msgs = build_fix_messages_with_memory(&Some("first".to_string()), "fix", &memory);
+        // 顺序: first, msg1, msg2, msg3, fix
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(msgs[0], "first");
+        assert_eq!(msgs[1], "msg1");
+        assert_eq!(msgs[2], "msg2");
+        assert_eq!(msgs[3], "msg3");
+        assert_eq!(msgs[4], "fix");
+    }
+
+    #[test]
+    fn test_build_fix_messages_large_memory() {
+        let memory: Vec<String> = (0..20).map(|i| format!("msg{}", i)).collect();
+        let msgs = build_fix_messages_with_memory(&Some("first".to_string()), "fix", &memory);
+        assert_eq!(msgs.len(), 22); // 1 (first) + 20 (memory) + 1 (fix)
+        assert_eq!(msgs[0], "first");
+        assert_eq!(msgs[21], "fix");
+    }
+
+    // --- MemoryContextStats 测试 ---
+
+    #[test]
+    fn test_memory_context_stats_new() {
+        let stats = MemoryContextStats::new();
+        assert_eq!(stats.injection_count, 0);
+        assert_eq!(stats.total_messages_injected, 0);
+        assert_eq!(stats.total_messages_skipped, 0);
+        assert!(!stats.has_data());
+        assert!((stats.avg_messages_per_injection() - 0.0).abs() < 0.001);
+        assert!((stats.skip_rate() - 0.0).abs() < 0.001);
+        assert!(stats.to_summary().is_empty());
+    }
+
+    #[test]
+    fn test_memory_context_stats_record_single_injection() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(3, 2);
+        assert_eq!(stats.injection_count, 1);
+        assert_eq!(stats.total_messages_injected, 3);
+        assert_eq!(stats.total_messages_skipped, 2);
+        assert!(stats.has_data());
+    }
+
+    #[test]
+    fn test_memory_context_stats_multiple_injections() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(3, 2);
+        stats.record_injection(5, 4);
+        stats.record_injection(2, 1);
+        assert_eq!(stats.injection_count, 3);
+        assert_eq!(stats.total_messages_injected, 10);
+        assert_eq!(stats.total_messages_skipped, 7);
+    }
+
+    #[test]
+    fn test_memory_context_stats_avg_messages() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(3, 0);
+        stats.record_injection(5, 0);
+        // avg = (3 + 5) / 2 = 4.0
+        assert!((stats.avg_messages_per_injection() - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_memory_context_stats_skip_rate() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(4, 3);
+        // skip_rate = 3/4 = 0.75
+        assert!((stats.skip_rate() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_memory_context_stats_skip_rate_zero_injected() {
+        let stats = MemoryContextStats::new();
+        assert!((stats.skip_rate() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_memory_context_stats_to_summary() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(4, 3);
+        let summary = stats.to_summary();
+        assert!(summary.contains("注入次数: 1"));
+        assert!(summary.contains("总消息: 4"));
+        assert!(summary.contains("跳过: 3"));
+        assert!(summary.contains("跳过率: 75.0%"));
+    }
+
+    #[test]
+    fn test_memory_context_stats_to_summary_empty() {
+        let stats = MemoryContextStats::new();
+        assert!(stats.to_summary().is_empty());
+    }
+
+    #[test]
+    fn test_memory_context_stats_serde_roundtrip() {
+        let mut stats = MemoryContextStats::new();
+        stats.record_injection(5, 3);
+        stats.record_injection(2, 1);
+        let json = serde_json::to_string(&stats).unwrap();
+        let loaded: MemoryContextStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.injection_count, 2);
+        assert_eq!(loaded.total_messages_injected, 7);
+        assert_eq!(loaded.total_messages_skipped, 4);
+    }
+
+    #[test]
+    fn test_memory_context_stats_default() {
+        let stats = MemoryContextStats::default();
+        assert_eq!(stats.injection_count, 0);
+        assert_eq!(stats.total_messages_injected, 0);
+        assert_eq!(stats.total_messages_skipped, 0);
+    }
+
+    // --- with_memory_context builder 测试 ---
+
+    #[test]
+    fn test_with_memory_context_sets_field() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // 默认 memory_context_count 为 0
+        assert_eq!(orch.memory_context_count, 0);
+
+        // 启用后应为指定值
+        let orch = orch.with_memory_context(3);
+        assert_eq!(orch.memory_context_count, 3);
+    }
+
+    #[test]
+    fn test_with_memory_context_zero_disables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_memory_context(5)
+            .with_memory_context(0);
+        assert_eq!(orch.memory_context_count, 0);
+    }
+
+    // --- send_attempt_prompt 集成测试 (with memory context) ---
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_with_memory_context_fix() {
+        // 修复轮次启用 memory context: [first, memory..., fix]
+        // 注意: memory 对话是直接添加到 memory.conversations 的,
+        // 未通过 send_with_continuation 发送, 因此 LiveContinuation 不会跳过它们。
+        // first_prompt 在首次尝试时已发送 → 被 LiveContinuation 跳过。
+        // memory 消息 + fix_prompt 作为增量发送。
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(2);
+
+        // 添加对话历史 (直接添加到 memory, 未通过 chat 发送)
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+        orch.memory
+            .add_conversation("assistant", "hi there", Some("0-0"));
+        orch.memory.add_conversation("user", "do task", Some("0-0"));
+
+        // 首次尝试
+        orch.send_attempt_prompt("first prompt", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复轮次: 注入 memory context
+        // 消息列表: [first_prompt, "hi there", "do task", "fix prompt"]
+        // LiveContinuation 跳过 first_prompt → 增量: ["hi there", "do task", "fix prompt"]
+        let first = Some("first prompt".to_string());
+        let result = orch
+            .send_attempt_prompt("fix prompt", &first, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "resp2");
+        let sent = chat.sent_messages();
+        // 第一次: "first prompt" (全量)
+        // 第二次: 增量发送, first_prompt 被跳过, memory + fix 被发送
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], "first prompt");
+        // memory 消息 + fix prompt 拼接 (用 \n\n 分隔)
+        assert!(sent[1].contains("hi there"));
+        assert!(sent[1].contains("do task"));
+        assert!(sent[1].contains("fix prompt"));
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_stats_tracked() {
+        // 验证 memory_context_stats 被正确更新
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(3);
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+        orch.memory.add_conversation("assistant", "hi", Some("0-0"));
+
+        // 首次尝试 (不注入)
+        orch.send_attempt_prompt("first", &None, false, 30)
+            .await
+            .unwrap();
+        assert!(!orch.memory_context_stats.has_data());
+
+        // 修复轮次 (注入)
+        let first = Some("first".to_string());
+        orch.send_attempt_prompt("fix", &first, true, 30)
+            .await
+            .unwrap();
+
+        // 验证统计
+        assert!(orch.memory_context_stats.has_data());
+        assert_eq!(orch.memory_context_stats.injection_count, 1);
+        assert_eq!(orch.memory_context_stats.total_messages_injected, 2);
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_disabled() {
+        // memory_context_count=0 时不注入, 行为与之前一致
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(0); // 禁用
+
+        // 添加对话历史 (不应被注入)
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+
+        // 首次尝试
+        orch.send_attempt_prompt("first", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复轮次
+        let first = Some("first".to_string());
+        orch.send_attempt_prompt("fix", &first, true, 30)
+            .await
+            .unwrap();
+
+        // 统计不应有数据
+        assert!(!orch.memory_context_stats.has_data());
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_empty_conversations() {
+        // Memory 无对话时不注入
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(3);
+
+        // 不添加任何对话历史
+
+        // 首次尝试
+        orch.send_attempt_prompt("first", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复轮次 (无对话可注入)
+        let first = Some("first".to_string());
+        orch.send_attempt_prompt("fix", &first, true, 30)
+            .await
+            .unwrap();
+
+        // 统计不应有数据 (无对话被注入)
+        assert!(!orch.memory_context_stats.has_data());
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_first_attempt_no_inject() {
+        // 首次尝试不注入 memory context
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(3);
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+
+        // 首次尝试 (不应注入)
+        orch.send_attempt_prompt("first", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 统计不应有数据
+        assert!(!orch.memory_context_stats.has_data());
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_no_first_prompt() {
+        // 修复轮次但 first_prompt=None (如上下文衔接后): [memory..., fix]
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(2);
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+        orch.memory.add_conversation("assistant", "hi", Some("0-0"));
+
+        // 修复轮次, first_prompt=None
+        let result = orch
+            .send_attempt_prompt("fix", &None, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "resp");
+        // 统计应记录注入
+        assert!(orch.memory_context_stats.has_data());
+        assert_eq!(orch.memory_context_stats.total_messages_injected, 2);
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_multiple_fix_rounds() {
+        // 多轮修复: 每次修复都注入 memory context
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["r1", "r2", "r3"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(2);
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "msg1", Some("0-0"));
+        orch.memory
+            .add_conversation("assistant", "resp1", Some("0-0"));
+
+        // 首次尝试
+        let first = "first".to_string();
+        orch.send_attempt_prompt(&first, &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复1
+        let first_opt = Some(first.clone());
+        orch.send_attempt_prompt("fix1", &first_opt, true, 30)
+            .await
+            .unwrap();
+
+        // 修复2
+        orch.send_attempt_prompt("fix2", &first_opt, true, 30)
+            .await
+            .unwrap();
+
+        // 两次注入
+        assert_eq!(orch.memory_context_stats.injection_count, 2);
+        assert_eq!(orch.memory_context_stats.total_messages_injected, 4); // 2 * 2
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_with_conversation_tracker() {
+        // 同时启用 conversation_tracker + memory context
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["r1", "r2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_conversation_tracker()
+            .with_memory_context(2);
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "msg1", Some("0-0"));
+        orch.memory
+            .add_conversation("assistant", "resp1", Some("0-0"));
+
+        // 首次
+        orch.send_attempt_prompt("first", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复: memory context + Radix Tree 增量
+        let first = Some("first".to_string());
+        let result = orch
+            .send_attempt_prompt("fix", &first, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "r2");
+        assert!(orch.memory_context_stats.has_data());
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_memory_context_no_incremental() {
+        // 未启用增量跟踪时, memory context 不生效
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_memory_context(3); // 无 live_continuation/conversation_tracker
+
+        // 添加对话历史
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+
+        // 修复轮次
+        let result = orch
+            .send_attempt_prompt("fix", &None, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "resp");
+        // memory context 在非增量模式下不注入
+        assert!(!orch.memory_context_stats.has_data());
+    }
+
+    #[test]
+    fn test_final_report_memory_context_stats() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_memory_context(3)
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 手动注入统计
+        orch.memory_context_stats.record_injection(3, 2);
+        orch.memory_context_stats.record_injection(2, 1);
+
+        orch.final_report().unwrap();
+
+        // 报告应包含 memory context 统计
+        // (验证不崩溃即可, 因为输出到 stdout)
+    }
+
+    #[test]
+    fn test_final_report_no_memory_context_stats_when_empty() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 无 memory context 统计
+        assert!(!orch.memory_context_stats.has_data());
+
+        // 不应崩溃
+        orch.final_report().unwrap();
     }
 
     // ===== Session 82: CacheTuner 集成测试 =====
