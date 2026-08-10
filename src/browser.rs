@@ -192,6 +192,12 @@ impl BrowserManager {
 
             match CdpSession::connect(&tab_info.ws_url).await {
                 Ok(session) => {
+                    // 借鉴 ds4 web_cdp_prepare_page: 连接后标准化页面环境
+                    // Page.enable + Runtime.enable + 焦点模拟 + 设备尺寸标准化
+                    if let Err(e) = session.prepare_page().await {
+                        warn!("CDP 页面准备失败 (非致命): {}", e);
+                    }
+
                     // 先检测网站类型 — Unknown 网站跳过元素探测 (避免 30s 超时)
                     let site_type = SiteType::detect(&tab_info.url);
                     info!("网站类型: {} ({})", site_type, tab_info.url);

@@ -505,6 +505,54 @@ impl CdpSession {
             tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
         }
     }
+
+    /// CDP 页面准备 — 借鉴 ds4 `web_cdp_prepare_page`
+    ///
+    /// 在与新标签页建立 WebSocket 连接后, 执行以下标准化操作:
+    /// 1. `Page.enable` — 启用页面事件通知
+    /// 2. `Runtime.enable` — 启用 JavaScript 运行时
+    /// 3. `Emulation.setFocusEmulationEnabled` — 模拟焦点状态 (后台标签也能正常输入)
+    /// 4. `Emulation.setDeviceMetricsOverride` — 设置标准视口尺寸 (1365x900)
+    ///
+    /// 这确保所有标签页在一致的渲染环境下运行,
+    /// 避免后台标签页因失去焦点导致输入框不可用等问题。
+    ///
+    /// 借鉴自 ds4 `ds4_web.c` 的 `web_cdp_prepare_page()` 函数,
+    /// 该函数在 ds4 的 web 搜索和页面访问工具中被调用。
+    pub async fn prepare_page(&self) -> Result<()> {
+        // 1. Page.enable
+        self.send_command("Page.enable", json!({})).await?;
+        debug!("CDP 页面准备: Page.enable 已发送");
+
+        // 2. Runtime.enable
+        self.send_command("Runtime.enable", json!({})).await?;
+        debug!("CDP 页面准备: Runtime.enable 已发送");
+
+        // 3. 焦点模拟 — 后台标签页也能正常接收输入
+        let _ = self
+            .send_command(
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            )
+            .await;
+        debug!("CDP 页面准备: setFocusEmulationEnabled 已发送");
+
+        // 4. 设备尺寸标准化 — 确保一致的渲染环境
+        let _ = self
+            .send_command(
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": 1365,
+                    "height": 900,
+                    "deviceScaleFactor": 1,
+                    "mobile": false
+                }),
+            )
+            .await;
+        debug!("CDP 页面准备: setDeviceMetricsOverride 已发送 (1365x900)");
+
+        Ok(())
+    }
 }
 
 // ============================================================================

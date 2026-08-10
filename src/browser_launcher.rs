@@ -179,11 +179,21 @@ pub fn build_launch_args(
     let mut args = vec![
         format!("--remote-debugging-port={}", port),
         format!("--user-data-dir={}", dir.display()),
+        // 借鉴 ds4 web_spawn_chrome: 允许所有来源的 CDP 连接
+        "--remote-allow-origins=*".to_string(),
         // 反检测参数 — 降低被网站识别为自动化的概率
         "--disable-blink-features=AutomationControlled".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-features=Translate".to_string(),
+        // 借鉴 ds4: 禁用同步, 避免弹窗和账号提示
+        "--disable-sync".to_string(),
+        // 借鉴 ds4: 使用 mock keychain, 避免系统钥匙串弹窗
+        "--use-mock-keychain".to_string(),
+        // 借鉴 ds4: 使用基础密码存储, 避免系统密码管理器弹窗
+        "--password-store=basic".to_string(),
+        // 借鉴 ds4: 静音音频, 避免网页突然发声 (24h 运行)
+        "--mute-audio".to_string(),
         // 性能优化
         "--disable-extensions".to_string(),
         "--disable-plugins".to_string(),
@@ -897,6 +907,32 @@ mod tests {
     fn test_build_launch_args_contains_no_first_run() {
         let args = build_launch_args(9222, None, &[]);
         assert!(args.iter().any(|a| a == "--no-first-run"));
+    }
+
+    #[test]
+    fn test_build_launch_args_contains_ds4_stability_flags() {
+        // 借鉴 ds4 web_spawn_chrome 的稳定性参数
+        let args = build_launch_args(9222, None, &[]);
+        assert!(
+            args.iter().any(|a| a == "--remote-allow-origins=*"),
+            "应包含 --remote-allow-origins=* (借鉴 ds4)"
+        );
+        assert!(
+            args.iter().any(|a| a == "--disable-sync"),
+            "应包含 --disable-sync (借鉴 ds4)"
+        );
+        assert!(
+            args.iter().any(|a| a == "--use-mock-keychain"),
+            "应包含 --use-mock-keychain (借鉴 ds4)"
+        );
+        assert!(
+            args.iter().any(|a| a == "--password-store=basic"),
+            "应包含 --password-store=basic (借鉴 ds4)"
+        );
+        assert!(
+            args.iter().any(|a| a == "--mute-audio"),
+            "应包含 --mute-audio (借鉴 ds4)"
+        );
     }
 
     #[test]

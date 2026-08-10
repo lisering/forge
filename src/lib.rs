@@ -92,6 +92,7 @@ pub mod testrunner;
 pub mod trace_store;
 pub mod traits;
 pub mod watchdog;
+pub mod web_tool;
 pub mod workspace;
 
 pub use auto_recovery::{

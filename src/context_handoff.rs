@@ -130,6 +130,177 @@ pub fn should_trigger_handoff(conversation_count: usize, threshold: usize) -> bo
     conversation_count >= threshold
 }
 
+// ============================================================================
+//  ds4 风格上下文压缩策略 — 借鉴 ds4 COMPACT.md
+// ============================================================================
+
+/// 上下文压缩触发类型 — 借鉴 ds4 COMPACT.md 的软/硬触发
+///
+/// ds4 有两种压缩触发:
+/// - Soft trigger: 当对话达到上下文窗口 85% 时, 在下一轮用户消息前压缩
+/// - Hard trigger: 当工具结果无法放入剩余空间时, 立即压缩
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionTrigger {
+    /// 不需要压缩
+    None,
+    /// 软触发: 对话即将达到上下文窗口上限
+    Soft,
+    /// 硬触发: 工具结果无法放入剩余空间
+    Hard,
+}
+
+/// 上下文压缩配置 — 借鉴 ds4 COMPACT.md 的触发阈值
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// 软触发阈值: 对话达到上下文窗口的百分比 (默认 85%)
+    pub soft_threshold_pct: f64,
+    /// 硬触发阈值: 剩余 token 少于此值时硬触发 (默认 8192)
+    pub hard_threshold_tokens: usize,
+    /// 压缩时保留的近期尾部 token 数 (默认 50000, 上限为上下文的 10%)
+    pub tail_preserve_tokens: usize,
+    /// 小上下文保护: 软触发至少需要的最小 token 数 (避免小 ctx 每轮压缩)
+    pub min_tokens_for_soft_trigger: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            soft_threshold_pct: 0.85,
+            hard_threshold_tokens: 8192,
+            tail_preserve_tokens: 50000,
+            min_tokens_for_soft_trigger: 512,
+        }
+    }
+}
+
+/// 判断是否应触发上下文压缩 — 借鉴 ds4 COMPACT.md 触发逻辑
+///
+/// # 参数
+///
+/// - `current_tokens`: 当前对话 token 数
+/// - `context_window`: 上下文窗口大小
+/// - `config`: 压缩配置
+///
+/// # 返回
+///
+/// 返回压缩触发类型:
+/// - `Hard`: 当前 token + 预估工具结果 > 上下文窗口, 或剩余 < hard_threshold
+/// - `Soft`: 当前 token > 上下文窗口 * soft_threshold_pct
+/// - `None`: 无需压缩
+///
+/// # 示例
+///
+/// ```
+/// # use forge::context_handoff::{check_compaction_trigger, CompactionTrigger, CompactionConfig};
+/// let config = CompactionConfig::default();
+///
+/// // 50% 使用率 — 不需要压缩
+/// assert_eq!(check_compaction_trigger(50000, 100000, &config), CompactionTrigger::None);
+///
+/// // 86% 使用率 — 软触发
+/// assert_eq!(check_compaction_trigger(86000, 100000, &config), CompactionTrigger::Soft);
+///
+/// // 剩余 < 8192 — 硬触发
+/// assert_eq!(check_compaction_trigger(93000, 100000, &config), CompactionTrigger::Hard);
+/// ```
+pub fn check_compaction_trigger(
+    current_tokens: usize,
+    context_window: usize,
+    config: &CompactionConfig,
+) -> CompactionTrigger {
+    if context_window == 0 {
+        return CompactionTrigger::None;
+    }
+
+    let remaining = context_window.saturating_sub(current_tokens);
+
+    // 硬触发: 剩余 token 不足
+    if remaining < config.hard_threshold_tokens {
+        return CompactionTrigger::Hard;
+    }
+
+    // 软触发: 使用率超过阈值 (但小上下文保护)
+    if current_tokens >= config.min_tokens_for_soft_trigger {
+        let usage = current_tokens as f64 / context_window as f64;
+        if usage >= config.soft_threshold_pct {
+            return CompactionTrigger::Soft;
+        }
+    }
+
+    CompactionTrigger::None
+}
+
+/// 计算压缩时应保留的尾部 token 数 — 借鉴 ds4 COMPACT.md tail 保留策略
+///
+/// ds4 保留最近的对话尾部 (最多上下文的 10%, 上限 50000 token),
+/// 并尽量对齐到用户消息边界。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::context_handoff::calculate_tail_preserve;
+/// // 100K 上下文, 默认上限 50000 → 10000 (10%)
+/// assert_eq!(calculate_tail_preserve(100000, 50000), 10000);
+///
+/// // 10K 上下文, 默认上限 50000 → 1000 (10%, 未超上限)
+/// assert_eq!(calculate_tail_preserve(10000, 50000), 1000);
+///
+/// // 1M 上下文, 默认上限 50000 → 50000 (上限)
+/// assert_eq!(calculate_tail_preserve(1000000, 50000), 50000);
+/// ```
+pub fn calculate_tail_preserve(context_window: usize, max_tail: usize) -> usize {
+    let ten_pct = context_window / 10;
+    ten_pct.min(max_tail)
+}
+
+/// 构建压缩摘要 prompt — 借鉴 ds4 COMPACT.md 摘要合同
+///
+/// ds4 的摘要合同要求保留:
+/// - 用户目标和约束
+/// - 检查/编辑的文件
+/// - 运行的命令和重要结果
+/// - 决策、拒绝的方案、已知 bug
+/// - 当前下一步
+///
+/// 不应编造事实或总结原始文件内容 (除非已用于得出结论)。
+pub fn build_compaction_summary_prompt() -> &'static str {
+    r#"请总结当前开发会话的关键状态, 以便在新对话中继续工作。
+
+请保留以下持久状态:
+1. **用户目标和约束** — 项目的终极目标和任何限制条件
+2. **已检查/编辑的文件** — 列出文件路径和关键变更
+3. **已运行的命令和重要结果** — 编译/测试结果的关键信息
+4. **决策和拒绝的方案** — 为什么选择了 X 而不是 Y
+5. **已知 bug 和问题** — 当前存在的未解决问题
+6. **当前下一步** — 接下来要做什么
+
+不要:
+- 编造事实
+- 总结原始文件内容 (除非已用于得出结论)
+- 继续执行用户任务 (只总结, 不执行)
+
+请在总结完成后停止, 不要继续开发。"#
+}
+
+/// 判断消息是否为用户消息边界 — 借鉴 ds4 tail 对齐策略
+///
+/// ds4 在压缩时尽量将尾部对齐到用户消息边界,
+/// 确保压缩后的上下文以完整的用户消息开始。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::context_handoff::is_user_message_boundary;
+/// assert!(is_user_message_boundary("用户: 请帮我创建一个计算器"));
+/// assert!(is_user_message_boundary("User: Create a calculator"));
+/// assert!(!is_user_message_boundary("助手: 好的, 我来创建"));
+/// ```
+pub fn is_user_message_boundary(message: &str) -> bool {
+    let trimmed = message.trim();
+    let lower = trimmed.to_lowercase();
+    lower.starts_with("用户:") || lower.starts_with("user:")
+}
+
 /// 格式化错误码徽章 (纯逻辑)
 ///
 /// `Some("E0308")` → `"[E0308]"`, `None` → `""`
