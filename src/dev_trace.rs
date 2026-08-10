@@ -347,6 +347,318 @@ impl IncrementalStats {
 }
 
 // ============================================================================
+//  CacheStatsSummary — 搜索缓存统计摘要 (Session 79)
+// ============================================================================
+
+/// 搜索缓存统计摘要 — 从 DevTrace WebSearch 条目中解析的缓存效果统计
+///
+/// 追踪缓存命中/未命中/搜索失败次数, 以及缓存节省的总时间,
+/// 用于在 DevTraceSummary 报告中展示缓存效果面板。
+///
+/// # 设计
+///
+/// 在 Orchestrator 的 `auto_search_error_solutions` 方法中,
+/// 每次搜索都会通过 `trace_dev` 写入 WebSearch 类型的 DevTrace 条目。
+/// 缓存命中时 error 字段包含 "缓存命中 (key=..., 原始耗时=Xms, ...)";
+/// 缓存未命中时 error 字段包含 "编译错误自动搜索" 或 "编译错误自动搜索 (已缓存)";
+/// 搜索失败时 error 字段包含 "搜索失败: ..."。
+///
+/// 24 小时运行后, 可以从 DevTrace 中查看搜索缓存的整体效果。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::CacheStatsSummary;
+/// let mut stats = CacheStatsSummary::new();
+///
+/// // 第一次搜索: 缓存未命中, 搜索耗时 500ms
+/// stats.record_miss();
+/// assert_eq!(stats.cache_misses, 1);
+/// assert_eq!(stats.time_saved_ms, 0);
+///
+/// // 第二次搜索: 相同错误, 缓存命中, 原始耗时 500ms
+/// stats.record_hit(500);
+/// assert_eq!(stats.cache_hits, 1);
+/// assert_eq!(stats.time_saved_ms, 500);
+/// assert!((stats.hit_rate() - 0.5).abs() < 0.001); // 1/(1+1) = 0.5
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CacheStatsSummary {
+    /// 缓存命中次数
+    pub cache_hits: u32,
+    /// 缓存未命中次数 (成功搜索但未命中缓存)
+    pub cache_misses: u32,
+    /// 搜索失败次数
+    pub search_failures: u32,
+    /// 缓存命中节省的总时间 (毫秒) — 即所有缓存命中条目的原始搜索耗时之和
+    pub time_saved_ms: u64,
+}
+
+impl CacheStatsSummary {
+    /// 创建空的缓存统计
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次缓存命中
+    ///
+    /// # 参数
+    ///
+    /// - `original_duration_ms`: 原始搜索耗时 (毫秒), 即缓存条目中记录的首次搜索耗时
+    pub fn record_hit(&mut self, original_duration_ms: u64) {
+        self.cache_hits += 1;
+        self.time_saved_ms += original_duration_ms;
+    }
+
+    /// 记录一次缓存未命中 (成功搜索)
+    pub fn record_miss(&mut self) {
+        self.cache_misses += 1;
+    }
+
+    /// 记录一次搜索失败
+    pub fn record_failure(&mut self) {
+        self.search_failures += 1;
+    }
+
+    /// 总搜索次数 = 命中 + 未命中 + 失败
+    pub fn total_searches(&self) -> u32 {
+        self.cache_hits + self.cache_misses + self.search_failures
+    }
+
+    /// 缓存命中率 (0.0 ~ 1.0)
+    ///
+    /// 命中次数 / (命中 + 未命中), 搜索失败不计入分母。
+    /// 因为搜索失败不代表缓存未命中, 只是网络搜索本身失败了。
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.cache_hits as f64 / total as f64
+    }
+
+    /// 平均每次命中节省的时间 (毫秒)
+    pub fn avg_time_saved_per_hit(&self) -> f64 {
+        if self.cache_hits == 0 {
+            return 0.0;
+        }
+        self.time_saved_ms as f64 / self.cache_hits as f64
+    }
+
+    /// 是否为空 (没有任何搜索记录)
+    pub fn is_empty(&self) -> bool {
+        self.total_searches() == 0
+    }
+
+    /// 格式化为可读字符串
+    pub fn to_summary(&self) -> String {
+        format!(
+            "搜索缓存统计: 命中 {}, 未命中 {}, 失败 {}, 命中率 {:.1}%, 节省 {}ms",
+            self.cache_hits,
+            self.cache_misses,
+            self.search_failures,
+            self.hit_rate() * 100.0,
+            self.time_saved_ms,
+        )
+    }
+}
+
+// ============================================================================
+//  CacheEntryInfo — 缓存条目类型 (Session 79)
+// ============================================================================
+
+/// 缓存条目类型 — 从 DevTrace WebSearch 条目解析
+///
+/// 表示一条 WebSearch trace 条目与缓存的关系。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheEntryInfo {
+    /// 缓存命中, 包含原始搜索耗时 (毫秒)
+    Hit(u64),
+    /// 缓存未命中 (成功搜索)
+    Miss,
+    /// 搜索失败
+    Failure,
+    /// 非缓存相关条目 (非 WebSearch 或无 error 字段)
+    None,
+}
+
+// ============================================================================
+//  纯函数 — 缓存条目解析 (Session 79)
+// ============================================================================
+
+/// 从缓存命中的 error 字段中解析原始搜索耗时 (毫秒)
+///
+/// 缓存命中时 error 格式为: `"缓存命中 (key=..., 原始耗时=Xms, 命中次数=Y)"`
+/// 本函数提取其中的 `X` 作为原始搜索耗时。
+///
+/// # 参数
+///
+/// - `error`: DevTrace 条目的 error 字段
+///
+/// # 返回
+///
+/// - `Some(ms)`: 原始搜索耗时 (毫秒)
+/// - `None`: 不是缓存命中条目, 或无法解析耗时
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::parse_cache_hit_duration;
+/// let err = "缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=2)";
+/// assert_eq!(parse_cache_hit_duration(err), Some(500));
+///
+/// assert_eq!(parse_cache_hit_duration("编译错误自动搜索"), None);
+/// assert_eq!(parse_cache_hit_duration(""), None);
+/// ```
+pub fn parse_cache_hit_duration(error: &str) -> Option<u64> {
+    // 必须包含 "缓存命中" 才是缓存命中条目
+    if !error.contains("缓存命中") {
+        return None;
+    }
+
+    // 查找 "原始耗时=" 后面的数字
+    let key = "原始耗时=";
+    let pos = error.find(key)?;
+    let after_key = &error[pos + key.len()..];
+
+    // 读取连续的数字字符
+    let digits: String = after_key
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// 判断 error 字段是否表示缓存未命中 (成功搜索)
+///
+/// 缓存未命中时 error 格式为:
+/// - `"编译错误自动搜索 (已缓存)"` — 搜索成功且结果已缓存
+/// - `"编译错误自动搜索"` — 搜索成功但无法缓存 (无 error_code)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::is_cache_miss;
+/// assert!(is_cache_miss("编译错误自动搜索 (已缓存)"));
+/// assert!(is_cache_miss("编译错误自动搜索"));
+/// assert!(!is_cache_miss("缓存命中 (key=E0308)"));
+/// assert!(!is_cache_miss("搜索失败: timeout"));
+/// ```
+pub fn is_cache_miss(error: &str) -> bool {
+    error.contains("编译错误自动搜索") && !error.contains("缓存命中")
+}
+
+/// 判断 error 字段是否表示搜索失败
+///
+/// 搜索失败时 error 格式为: `"搜索失败: ..."`
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::is_search_failure;
+/// assert!(is_search_failure("搜索失败: connection refused"));
+/// assert!(!is_search_failure("缓存命中 (key=E0308)"));
+/// assert!(!is_search_failure("编译错误自动搜索"));
+/// ```
+pub fn is_search_failure(error: &str) -> bool {
+    error.contains("搜索失败")
+}
+
+/// 从 DevTrace 条目解析缓存信息
+///
+/// 根据 trace 条目的 action 和 error 字段判断缓存状态:
+/// - `WebSearch` action + error 含 "缓存命中" → `Hit(duration)`
+/// - `WebSearch` action + error 含 "搜索失败" → `Failure`
+/// - `WebSearch` action + error 含 "编译错误自动搜索" → `Miss`
+/// - 其他 → `None`
+///
+/// # 参数
+///
+/// - `entry`: DevTrace 条目
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{parse_cache_entry, CacheEntryInfo, DevTraceEntry, TraceAction};
+/// let entry = DevTraceEntry::new(
+///     TraceAction::WebSearch, None, None, None,
+///     "query", "result", 0, true,
+///     Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+/// );
+/// assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::Hit(300));
+/// ```
+pub fn parse_cache_entry(entry: &DevTraceEntry) -> CacheEntryInfo {
+    if entry.action != TraceAction::WebSearch {
+        return CacheEntryInfo::None;
+    }
+
+    match &entry.error {
+        None => CacheEntryInfo::None,
+        Some(err) => {
+            if let Some(dur) = parse_cache_hit_duration(err) {
+                CacheEntryInfo::Hit(dur)
+            } else if is_search_failure(err) {
+                CacheEntryInfo::Failure
+            } else if is_cache_miss(err) {
+                CacheEntryInfo::Miss
+            } else {
+                CacheEntryInfo::None
+            }
+        }
+    }
+}
+
+/// 从 DevTrace 条目列表构建缓存统计摘要
+///
+/// 遍历所有 WebSearch 条目, 解析缓存命中/未命中/失败信息,
+/// 汇总为 `CacheStatsSummary`。
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_cache_summary, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, None, None, None,
+///         "q1", "r1", 500, true,
+///         Some("编译错误自动搜索 (已缓存)"),
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, None, None, None,
+///         "q2", "r2", 0, true,
+///         Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+///     ),
+/// ];
+/// let summary = build_cache_summary(&entries);
+/// assert_eq!(summary.cache_hits, 1);
+/// assert_eq!(summary.cache_misses, 1);
+/// assert_eq!(summary.time_saved_ms, 500);
+/// ```
+pub fn build_cache_summary(entries: &[DevTraceEntry]) -> CacheStatsSummary {
+    entries
+        .iter()
+        .map(parse_cache_entry)
+        .fold(CacheStatsSummary::new(), |mut acc, info| {
+            match info {
+                CacheEntryInfo::Hit(dur) => acc.record_hit(dur),
+                CacheEntryInfo::Miss => acc.record_miss(),
+                CacheEntryInfo::Failure => acc.record_failure(),
+                CacheEntryInfo::None => {}
+            }
+            acc
+        })
+}
+
+// ============================================================================
 //  纯逻辑函数 — 统计计算
 // ============================================================================
 
@@ -597,6 +909,13 @@ pub struct DevTraceSummary {
     /// `None` 表示没有增量发送记录 (未启用增量发送或无 trace 数据)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incremental_summary: Option<IncrementalStats>,
+
+    /// 搜索缓存统计摘要 (Session 79)
+    ///
+    /// 从 `WebSearch` trace 条目中解析的缓存命中/未命中/失败统计。
+    /// `None` 表示没有搜索缓存记录 (未启用自动搜索或无 trace 数据)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_summary: Option<CacheStatsSummary>,
 }
 
 impl DevTraceSummary {
@@ -609,6 +928,7 @@ impl DevTraceSummary {
             success_rate: 0.0,
             timeline: vec![],
             incremental_summary: None,
+            cache_summary: None,
         }
     }
 
@@ -645,6 +965,14 @@ impl DevTraceSummary {
             None
         };
 
+        // 从 WebSearch 条目中解析缓存统计 (Session 79)
+        let cache_stats = build_cache_summary(entries);
+        let cache_summary = if cache_stats.is_empty() {
+            None
+        } else {
+            Some(cache_stats)
+        };
+
         Self {
             total_entries,
             total_duration_ms,
@@ -652,6 +980,7 @@ impl DevTraceSummary {
             success_rate,
             timeline,
             incremental_summary,
+            cache_summary,
         }
     }
 
@@ -708,6 +1037,27 @@ impl DevTraceSummary {
                 "  平均每次: 总 {:.1} 条, 实发 {:.1} 条\n",
                 inc_stats.avg_messages_per_send(),
                 inc_stats.avg_sent_per_send()
+            ));
+        }
+
+        // === 搜索缓存统计 (Session 79) ===
+        if let Some(ref cache_stats) = self.cache_summary {
+            report.push_str("\n  ── 搜索缓存统计 ──\n");
+            report.push_str(&format!("  总搜索: {} 次\n", cache_stats.total_searches()));
+            report.push_str(&format!("  缓存命中: {} 次\n", cache_stats.cache_hits));
+            report.push_str(&format!("  缓存未命中: {} 次\n", cache_stats.cache_misses));
+            report.push_str(&format!("  搜索失败: {} 次\n", cache_stats.search_failures));
+            report.push_str(&format!(
+                "  命中率: {:.1}%\n",
+                cache_stats.hit_rate() * 100.0
+            ));
+            report.push_str(&format!(
+                "  节省时间: {}\n",
+                format_duration_human(cache_stats.time_saved_ms)
+            ));
+            report.push_str(&format!(
+                "  平均每次命中: {:.0}ms\n",
+                cache_stats.avg_time_saved_per_hit()
             ));
         }
 
@@ -4205,5 +4555,676 @@ mod tests {
         assert_eq!(inc.sent_messages, 0);
         assert_eq!(inc.skipped_messages, 5);
         assert!((inc.saved_ratio() - 1.0).abs() < 0.001); // 100% saved
+    }
+
+    // ===== Session 79: 搜索缓存统计面板 测试 =====
+
+    // --- parse_cache_hit_duration ---
+
+    #[test]
+    fn test_parse_cache_hit_duration_normal() {
+        let err = "缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=2)";
+        assert_eq!(parse_cache_hit_duration(err), Some(500));
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_large_number() {
+        let err = "缓存命中 (key=E0277, 原始耗时=15000ms, 命中次数=10)";
+        assert_eq!(parse_cache_hit_duration(err), Some(15000));
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_zero() {
+        let err = "缓存命中 (key=EOF, 原始耗时=0ms, 命中次数=1)";
+        assert_eq!(parse_cache_hit_duration(err), Some(0));
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_not_cache_hit() {
+        assert_eq!(parse_cache_hit_duration("编译错误自动搜索"), None);
+        assert_eq!(parse_cache_hit_duration("搜索失败: timeout"), None);
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_missing_duration() {
+        // 缓存命中但没有 "原始耗时=" 字段
+        let err = "缓存命中 (key=E0308, 命中次数=2)";
+        assert_eq!(parse_cache_hit_duration(err), None);
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_empty() {
+        assert_eq!(parse_cache_hit_duration(""), None);
+    }
+
+    #[test]
+    fn test_parse_cache_hit_duration_no_digits() {
+        let err = "缓存命中 (key=E0308, 原始耗时=abcms, 命中次数=1)";
+        assert_eq!(parse_cache_hit_duration(err), None);
+    }
+
+    // --- is_cache_miss ---
+
+    #[test]
+    fn test_is_cache_miss_with_cached() {
+        assert!(is_cache_miss("编译错误自动搜索 (已缓存)"));
+    }
+
+    #[test]
+    fn test_is_cache_miss_without_cached() {
+        assert!(is_cache_miss("编译错误自动搜索"));
+    }
+
+    #[test]
+    fn test_is_cache_miss_not_miss() {
+        assert!(!is_cache_miss("缓存命中 (key=E0308)"));
+        assert!(!is_cache_miss("搜索失败: timeout"));
+        assert!(!is_cache_miss(""));
+    }
+
+    // --- is_search_failure ---
+
+    #[test]
+    fn test_is_search_failure_normal() {
+        assert!(is_search_failure("搜索失败: connection refused"));
+        assert!(is_search_failure("搜索失败: timeout"));
+    }
+
+    #[test]
+    fn test_is_search_failure_not_failure() {
+        assert!(!is_search_failure("缓存命中 (key=E0308)"));
+        assert!(!is_search_failure("编译错误自动搜索"));
+        assert!(!is_search_failure(""));
+    }
+
+    // --- parse_cache_entry ---
+
+    #[test]
+    fn test_parse_cache_entry_hit() {
+        let entry = DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "result",
+            0,
+            true,
+            Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+        );
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::Hit(300));
+    }
+
+    #[test]
+    fn test_parse_cache_entry_miss() {
+        let entry = DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "result",
+            500,
+            true,
+            Some("编译错误自动搜索 (已缓存)"),
+        );
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::Miss);
+    }
+
+    #[test]
+    fn test_parse_cache_entry_failure() {
+        let entry = DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "",
+            3000,
+            false,
+            Some("搜索失败: connection refused"),
+        );
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::Failure);
+    }
+
+    #[test]
+    fn test_parse_cache_entry_non_websearch() {
+        let entry = make_entry(TraceAction::TaskExecution, true);
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::None);
+    }
+
+    #[test]
+    fn test_parse_cache_entry_no_error() {
+        let entry = DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "result",
+            500,
+            true,
+            None,
+        );
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::None);
+    }
+
+    #[test]
+    fn test_parse_cache_entry_unrecognized_error() {
+        let entry = DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "result",
+            500,
+            true,
+            Some("some unrecognized error"),
+        );
+        assert_eq!(parse_cache_entry(&entry), CacheEntryInfo::None);
+    }
+
+    // --- build_cache_summary ---
+
+    #[test]
+    fn test_build_cache_summary_empty() {
+        let entries: Vec<DevTraceEntry> = vec![];
+        let summary = build_cache_summary(&entries);
+        assert!(summary.is_empty());
+        assert_eq!(summary.total_searches(), 0);
+    }
+
+    #[test]
+    fn test_build_cache_summary_all_hits() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0277, 原始耗时=500ms, 命中次数=2)"),
+            ),
+        ];
+        let summary = build_cache_summary(&entries);
+        assert_eq!(summary.cache_hits, 2);
+        assert_eq!(summary.cache_misses, 0);
+        assert_eq!(summary.search_failures, 0);
+        assert_eq!(summary.time_saved_ms, 800); // 300 + 500
+    }
+
+    #[test]
+    fn test_build_cache_summary_all_misses() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                300,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+        ];
+        let summary = build_cache_summary(&entries);
+        assert_eq!(summary.cache_hits, 0);
+        assert_eq!(summary.cache_misses, 2);
+        assert_eq!(summary.search_failures, 0);
+        assert_eq!(summary.time_saved_ms, 0);
+    }
+
+    #[test]
+    fn test_build_cache_summary_mixed() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q3",
+                "",
+                3000,
+                false,
+                Some("搜索失败: timeout"),
+            ),
+            // 非 WebSearch 条目应被忽略
+            make_entry(TraceAction::TaskExecution, true),
+        ];
+        let summary = build_cache_summary(&entries);
+        assert_eq!(summary.cache_hits, 1);
+        assert_eq!(summary.cache_misses, 1);
+        assert_eq!(summary.search_failures, 1);
+        assert_eq!(summary.total_searches(), 3);
+        assert_eq!(summary.time_saved_ms, 500);
+    }
+
+    // --- CacheStatsSummary ---
+
+    #[test]
+    fn test_cache_stats_new() {
+        let stats = CacheStatsSummary::new();
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 0);
+        assert_eq!(stats.search_failures, 0);
+        assert_eq!(stats.time_saved_ms, 0);
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn test_cache_stats_record_hit() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(500);
+        stats.record_hit(300);
+        assert_eq!(stats.cache_hits, 2);
+        assert_eq!(stats.time_saved_ms, 800);
+    }
+
+    #[test]
+    fn test_cache_stats_record_miss() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_miss();
+        stats.record_miss();
+        assert_eq!(stats.cache_misses, 2);
+        assert_eq!(stats.time_saved_ms, 0);
+    }
+
+    #[test]
+    fn test_cache_stats_record_failure() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_failure();
+        assert_eq!(stats.search_failures, 1);
+        assert_eq!(stats.total_searches(), 1);
+    }
+
+    #[test]
+    fn test_cache_stats_hit_rate() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(500);
+        stats.record_miss();
+        stats.record_hit(300);
+        stats.record_miss();
+        // hit_rate = 2 / (2+2) = 0.5
+        assert!((stats.hit_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_stats_hit_rate_empty() {
+        let stats = CacheStatsSummary::new();
+        assert_eq!(stats.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_stats_hit_rate_failures_excluded() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(500);
+        stats.record_miss();
+        stats.record_failure();
+        stats.record_failure();
+        // hit_rate = 1 / (1+1) = 0.5, failures excluded
+        assert!((stats.hit_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_stats_avg_time_saved_per_hit() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(500);
+        stats.record_hit(300);
+        stats.record_hit(700);
+        // avg = (500+300+700) / 3 = 500
+        assert!((stats.avg_time_saved_per_hit() - 500.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_stats_avg_time_saved_no_hits() {
+        let stats = CacheStatsSummary::new();
+        assert_eq!(stats.avg_time_saved_per_hit(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_stats_total_searches() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(100);
+        stats.record_miss();
+        stats.record_failure();
+        assert_eq!(stats.total_searches(), 3);
+    }
+
+    #[test]
+    fn test_cache_stats_to_summary() {
+        let mut stats = CacheStatsSummary::new();
+        stats.record_hit(500);
+        stats.record_miss();
+        let summary = stats.to_summary();
+        assert!(summary.contains("命中 1"));
+        assert!(summary.contains("未命中 1"));
+        assert!(summary.contains("命中率 50.0%"));
+        assert!(summary.contains("节省 500ms"));
+    }
+
+    #[test]
+    fn test_cache_stats_is_empty() {
+        let stats = CacheStatsSummary::new();
+        assert!(stats.is_empty());
+
+        let mut stats2 = CacheStatsSummary::new();
+        stats2.record_hit(100);
+        assert!(!stats2.is_empty());
+    }
+
+    // --- DevTraceSummary 集成 ---
+
+    #[test]
+    fn test_summary_cache_summary_none_without_websearch() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::FixAttempt, false),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.cache_summary.is_none());
+    }
+
+    #[test]
+    fn test_summary_cache_summary_from_websearch_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let cache = summary.cache_summary.expect("should be Some");
+        assert_eq!(cache.cache_hits, 1);
+        assert_eq!(cache.cache_misses, 1);
+        assert_eq!(cache.time_saved_ms, 500);
+        assert!((cache.hit_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_summary_cache_summary_empty_websearch_ignored() {
+        // WebSearch 条目但没有缓存相关的 error → None
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "q",
+            "r",
+            500,
+            true,
+            None, // no error → None
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.cache_summary.is_none());
+    }
+
+    #[test]
+    fn test_to_report_includes_cache_stats() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q3",
+                "",
+                3000,
+                false,
+                Some("搜索失败: timeout"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("搜索缓存统计"));
+        assert!(report.contains("总搜索: 3 次"));
+        assert!(report.contains("缓存命中: 1 次"));
+        assert!(report.contains("缓存未命中: 1 次"));
+        assert!(report.contains("搜索失败: 1 次"));
+        assert!(report.contains("命中率: 50.0%"));
+        assert!(report.contains("节省时间:"));
+    }
+
+    #[test]
+    fn test_to_report_no_cache_section_when_none() {
+        let entries = vec![make_entry(TraceAction::TaskExecution, true)];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("搜索缓存统计"));
+    }
+
+    #[test]
+    fn test_summary_cache_summary_serde_roundtrip() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q1",
+                "r1",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: DevTraceSummary = serde_json::from_str(&json).unwrap();
+
+        let cache = deserialized.cache_summary.expect("should be Some");
+        assert_eq!(cache.cache_hits, 1);
+        assert_eq!(cache.cache_misses, 1);
+        assert_eq!(cache.time_saved_ms, 500);
+    }
+
+    #[test]
+    fn test_summary_cache_summary_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        // cache_summary 为 None 时应被 skip
+        assert!(!json.contains("cache_summary"));
+    }
+
+    #[test]
+    fn test_summary_both_incremental_and_cache() {
+        // 同时有增量发送和搜索缓存的条目
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=10, sent=3, skipped=7",
+                "response",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "q",
+                "r",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.incremental_summary.is_some());
+        assert!(summary.cache_summary.is_some());
+
+        let report = summary.to_report();
+        assert!(report.contains("增量发送统计"));
+        assert!(report.contains("搜索缓存统计"));
+    }
+
+    #[test]
+    fn test_summary_cache_stats_realistic_workflow() {
+        // 模拟真实工作流: 3次未命中 + 5次命中 + 1次失败
+        let mut entries: Vec<DevTraceEntry> = vec![];
+
+        // 3 次缓存未命中 (不同错误代码的首次搜索)
+        for (i, code) in ["E0308", "E0277", "E0433"].iter().enumerate() {
+            entries.push(DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(i),
+                Some(&format!("task{}", i)),
+                &format!("rust {}", code),
+                "search result",
+                500 + i as u64 * 100,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ));
+        }
+
+        // 5 次缓存命中 (相同错误代码重复出现)
+        for i in 0..5 {
+            entries.push(DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(i),
+                Some(&format!("task{}", i)),
+                "rust E0308",
+                "cached result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ));
+        }
+
+        // 1 次搜索失败
+        entries.push(DevTraceEntry::new(
+            TraceAction::WebSearch,
+            Some(0),
+            Some(5),
+            Some("task5"),
+            "rust E0507",
+            "",
+            3000,
+            false,
+            Some("搜索失败: connection refused"),
+        ));
+
+        // 添加一些非 WebSearch 条目
+        entries.push(make_entry(TraceAction::TaskExecution, true));
+        entries.push(make_entry(TraceAction::FixAttempt, false));
+
+        let summary = DevTraceSummary::from_entries(&entries);
+        let cache = summary.cache_summary.expect("should be Some");
+
+        assert_eq!(cache.cache_hits, 5);
+        assert_eq!(cache.cache_misses, 3);
+        assert_eq!(cache.search_failures, 1);
+        assert_eq!(cache.total_searches(), 9);
+        assert_eq!(cache.time_saved_ms, 2500); // 5 * 500
+        assert!((cache.hit_rate() - 5.0 / 8.0).abs() < 0.001); // 5/(5+3)
+        assert!((cache.avg_time_saved_per_hit() - 500.0).abs() < 0.001);
     }
 }
