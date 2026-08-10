@@ -464,6 +464,193 @@ impl CacheStatsSummary {
 }
 
 // ============================================================================
+//  CacheFixCorrelation — 缓存命中与修复成功率关联分析 (Session 80)
+// ============================================================================
+
+/// 缓存命中与修复成功率关联分析 — 评估搜索缓存对修复效果的实际影响
+///
+/// 分析搜索缓存命中/未命中/失败后, 后续编译检查 (`CompileCheck`) 的通过率,
+/// 回答核心问题: **缓存命中的搜索结果是否和新鲜搜索一样有效?**
+///
+/// # 设计
+///
+/// 在 Orchestrator 的修复流程中:
+/// 1. 编译失败 → `auto_search_error_solutions` 搜索 → 记录 `WebSearch` trace
+/// 2. 搜索结果注入修复 prompt → AI 修复 → 记录 `FixAttempt` trace
+/// 3. 再次编译检查 → 记录 `CompileCheck` trace (success=true/false)
+///
+/// 关联分析逻辑:
+/// - 遍历所有 `WebSearch` 条目, 解析缓存状态 (Hit/Miss/Failure)
+/// - 查找同一任务 (phase_idx + task_idx) 的下一个 `CompileCheck` 条目
+/// - 记录该 CompileCheck 的成功/失败, 汇总为关联统计
+///
+/// # 核心指标
+///
+/// - `hit_fix_rate()`: 缓存命中后的编译通过率
+/// - `miss_fix_rate()`: 缓存未命中后的编译通过率
+/// - `hit_vs_miss_diff()`: 两者差值 (正=缓存有效, 负=缓存有害)
+/// - `is_cache_effective()`: 缓存命中是否比未命中有更好的修复效果
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::CacheFixCorrelation;
+/// let mut corr = CacheFixCorrelation::new();
+///
+/// // 缓存命中后编译通过
+/// corr.record_hit_check(true);
+/// // 缓存命中后编译失败
+/// corr.record_hit_check(false);
+/// // 缓存未命中后编译通过
+/// corr.record_miss_check(true);
+///
+/// // 命中后修复率: 1/2 = 50%
+/// assert!((corr.hit_fix_rate() - 0.5).abs() < 0.001);
+/// // 未命中后修复率: 1/1 = 100%
+/// assert!((corr.miss_fix_rate() - 1.0).abs() < 0.001);
+/// // 差值: 50% - 100% = -50% (缓存命中修复率低于未命中)
+/// assert!((corr.hit_vs_miss_diff() - (-0.5)).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CacheFixCorrelation {
+    /// 缓存命中后的编译检查次数
+    pub checks_after_hit: usize,
+    /// 缓存命中后编译通过次数
+    pub successes_after_hit: usize,
+    /// 缓存未命中后的编译检查次数
+    pub checks_after_miss: usize,
+    /// 缓存未命中后编译通过次数
+    pub successes_after_miss: usize,
+    /// 搜索失败后的编译检查次数
+    pub checks_after_failure: usize,
+    /// 搜索失败后编译通过次数
+    pub successes_after_failure: usize,
+    /// 无后续编译检查的搜索次数 (搜索后没有 CompileCheck 条目)
+    pub searches_without_check: usize,
+}
+
+impl CacheFixCorrelation {
+    /// 创建空的关联分析
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次缓存命中后的编译检查结果
+    ///
+    /// # 参数
+    ///
+    /// - `success`: 编译检查是否通过
+    pub fn record_hit_check(&mut self, success: bool) {
+        self.checks_after_hit += 1;
+        if success {
+            self.successes_after_hit += 1;
+        }
+    }
+
+    /// 记录一次缓存未命中后的编译检查结果
+    pub fn record_miss_check(&mut self, success: bool) {
+        self.checks_after_miss += 1;
+        if success {
+            self.successes_after_miss += 1;
+        }
+    }
+
+    /// 记录一次搜索失败后的编译检查结果
+    pub fn record_failure_check(&mut self, success: bool) {
+        self.checks_after_failure += 1;
+        if success {
+            self.successes_after_failure += 1;
+        }
+    }
+
+    /// 记录一次无后续编译检查的搜索 (搜索后没有 CompileCheck 条目)
+    pub fn record_no_check(&mut self) {
+        self.searches_without_check += 1;
+    }
+
+    /// 缓存命中后的修复成功率 (0.0 ~ 1.0)
+    ///
+    /// 无数据时返回 0.0。
+    pub fn hit_fix_rate(&self) -> f64 {
+        if self.checks_after_hit == 0 {
+            return 0.0;
+        }
+        self.successes_after_hit as f64 / self.checks_after_hit as f64
+    }
+
+    /// 缓存未命中后的修复成功率 (0.0 ~ 1.0)
+    ///
+    /// 无数据时返回 0.0。
+    pub fn miss_fix_rate(&self) -> f64 {
+        if self.checks_after_miss == 0 {
+            return 0.0;
+        }
+        self.successes_after_miss as f64 / self.checks_after_miss as f64
+    }
+
+    /// 搜索失败后的修复成功率 (0.0 ~ 1.0)
+    ///
+    /// 无数据时返回 0.0。
+    pub fn failure_fix_rate(&self) -> f64 {
+        if self.checks_after_failure == 0 {
+            return 0.0;
+        }
+        self.successes_after_failure as f64 / self.checks_after_failure as f64
+    }
+
+    /// 缓存命中与未命中的修复成功率差值
+    ///
+    /// 正值表示缓存命中比未命中有更好的修复效果;
+    /// 负值表示缓存命中效果不如未命中;
+    /// 零表示两者效果相同。
+    ///
+    /// 当 hit 或 miss 任一无数据时返回 0.0。
+    pub fn hit_vs_miss_diff(&self) -> f64 {
+        if self.checks_after_hit == 0 || self.checks_after_miss == 0 {
+            return 0.0;
+        }
+        self.hit_fix_rate() - self.miss_fix_rate()
+    }
+
+    /// 缓存是否有效 — 缓存命中的修复成功率 >= 未命中的修复成功率
+    ///
+    /// 当 hit 或 miss 任一无数据时返回 false。
+    pub fn is_cache_effective(&self) -> bool {
+        if self.checks_after_hit == 0 || self.checks_after_miss == 0 {
+            return false;
+        }
+        self.hit_fix_rate() >= self.miss_fix_rate()
+    }
+
+    /// 有后续编译检查的搜索总次数
+    pub fn total_correlated(&self) -> usize {
+        self.checks_after_hit + self.checks_after_miss + self.checks_after_failure
+    }
+
+    /// 是否为空 (没有任何搜索记录)
+    pub fn is_empty(&self) -> bool {
+        self.total_correlated() == 0 && self.searches_without_check == 0
+    }
+
+    /// 格式化为可读字符串
+    pub fn to_summary(&self) -> String {
+        format!(
+            "缓存修复关联: 命中后 {} 次检查 (通过 {}), 未命中后 {} 次检查 (通过 {}), \
+             失败后 {} 次检查 (通过 {}), 命中修复率 {:.1}%, 未命中修复率 {:.1}%, 差值 {:+.1}%",
+            self.checks_after_hit,
+            self.successes_after_hit,
+            self.checks_after_miss,
+            self.successes_after_miss,
+            self.checks_after_failure,
+            self.successes_after_failure,
+            self.hit_fix_rate() * 100.0,
+            self.miss_fix_rate() * 100.0,
+            self.hit_vs_miss_diff() * 100.0,
+        )
+    }
+}
+
+// ============================================================================
 //  CacheEntryInfo — 缓存条目类型 (Session 79)
 // ============================================================================
 
@@ -652,6 +839,152 @@ pub fn build_cache_summary(entries: &[DevTraceEntry]) -> CacheStatsSummary {
                 CacheEntryInfo::Hit(dur) => acc.record_hit(dur),
                 CacheEntryInfo::Miss => acc.record_miss(),
                 CacheEntryInfo::Failure => acc.record_failure(),
+                CacheEntryInfo::None => {}
+            }
+            acc
+        })
+}
+
+// ============================================================================
+//  缓存与修复关联分析纯函数 (Session 80)
+// ============================================================================
+
+/// 在 trace 条目列表中, 从指定索引之后查找同一任务的下一个编译检查条目
+///
+/// 从 `from_idx + 1` 开始遍历, 查找 `CompileCheck` 类型且
+/// `phase_idx` 和 `task_idx` 与参考条目匹配的条目。
+///
+/// # 匹配规则
+///
+/// - 参考条目和目标条目的 `phase_idx` 必须相同 (都为 None 或都为 Some 且值相等)
+/// - 参考条目和目标条目的 `task_idx` 必须相同
+/// - 目标条目的 `action` 必须为 `CompileCheck`
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+/// - `from_idx`: 起始搜索索引 (不含), 从 `from_idx + 1` 开始查找
+///
+/// # 返回
+///
+/// 匹配的 `CompileCheck` 条目的 `success` 字段值; 未找到则返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{find_next_compile_check, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, Some(0), Some(0), Some("task"),
+///         "query", "result", 100, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::FixAttempt, Some(0), Some(0), Some("task"),
+///         "fix", "response", 200, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(0), Some("task"),
+///         "check", "passed", 50, true, None,
+///     ),
+/// ];
+/// // 从索引 0 (WebSearch) 之后查找 CompileCheck
+/// assert_eq!(find_next_compile_check(&entries, 0), Some(true));
+/// // 从索引 1 (FixAttempt) 之后查找 CompileCheck
+/// assert_eq!(find_next_compile_check(&entries, 1), Some(true));
+/// // 从索引 2 (CompileCheck) 之后查找 — 没有更多 CompileCheck
+/// assert_eq!(find_next_compile_check(&entries, 2), None);
+/// ```
+pub fn find_next_compile_check(entries: &[DevTraceEntry], from_idx: usize) -> Option<bool> {
+    if from_idx >= entries.len() {
+        return None;
+    }
+
+    let ref_entry = &entries[from_idx];
+    let ref_phase = ref_entry.phase_idx;
+    let ref_task = ref_entry.task_idx;
+
+    entries
+        .iter()
+        .skip(from_idx + 1)
+        .find(|e| {
+            e.action == TraceAction::CompileCheck
+                && e.phase_idx == ref_phase
+                && e.task_idx == ref_task
+        })
+        .map(|e| e.success)
+}
+
+/// 从 DevTrace 条目列表构建缓存与修复关联分析
+///
+/// 遍历所有 `WebSearch` 条目, 解析缓存状态 (Hit/Miss/Failure),
+/// 然后查找同一任务的下一个 `CompileCheck` 条目,
+/// 记录编译通过/失败, 汇总为 `CacheFixCorrelation`。
+///
+/// # 分析逻辑
+///
+/// 1. 遍历条目, 找到 `WebSearch` 条目
+/// 2. 用 `parse_cache_entry` 解析缓存状态
+/// 3. 用 `find_next_compile_check` 查找后续编译检查
+/// 4. 根据缓存状态 + 编译结果记录到 `CacheFixCorrelation`
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_cache_fix_correlation, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     // 缓存命中 → 后续编译通过
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, Some(0), Some(0), Some("task"),
+///         "query", "result", 0, true,
+///         Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(0), Some("task"),
+///         "check", "passed", 50, true, None,
+///     ),
+///     // 缓存未命中 → 后续编译失败
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, Some(0), Some(1), Some("task2"),
+///         "query", "result", 500, true,
+///         Some("编译错误自动搜索"),
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(1), Some("task2"),
+///         "check", "failed", 50, false, None,
+///     ),
+/// ];
+/// let corr = build_cache_fix_correlation(&entries);
+/// assert_eq!(corr.checks_after_hit, 1);
+/// assert_eq!(corr.successes_after_hit, 1);
+/// assert_eq!(corr.checks_after_miss, 1);
+/// assert_eq!(corr.successes_after_miss, 0);
+/// assert!((corr.hit_fix_rate() - 1.0).abs() < 0.001);  // 1/1 = 100%
+/// assert_eq!(corr.miss_fix_rate(), 0.0);  // 0/1 = 0%
+/// ```
+pub fn build_cache_fix_correlation(entries: &[DevTraceEntry]) -> CacheFixCorrelation {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.action == TraceAction::WebSearch)
+        .fold(CacheFixCorrelation::new(), |mut acc, (idx, entry)| {
+            let cache_info = parse_cache_entry(entry);
+            match cache_info {
+                CacheEntryInfo::Hit(_) => match find_next_compile_check(entries, idx) {
+                    Some(success) => acc.record_hit_check(success),
+                    None => acc.record_no_check(),
+                },
+                CacheEntryInfo::Miss => match find_next_compile_check(entries, idx) {
+                    Some(success) => acc.record_miss_check(success),
+                    None => acc.record_no_check(),
+                },
+                CacheEntryInfo::Failure => match find_next_compile_check(entries, idx) {
+                    Some(success) => acc.record_failure_check(success),
+                    None => acc.record_no_check(),
+                },
                 CacheEntryInfo::None => {}
             }
             acc
@@ -916,6 +1249,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有搜索缓存记录 (未启用自动搜索或无 trace 数据)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_summary: Option<CacheStatsSummary>,
+
+    /// 缓存与修复关联分析 (Session 80)
+    ///
+    /// 从 `WebSearch` + `CompileCheck` trace 条目中解析的关联统计,
+    /// 分析缓存命中/未命中/失败后的修复成功率。
+    /// `None` 表示没有关联数据 (无 WebSearch 或无后续 CompileCheck)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_fix_correlation: Option<CacheFixCorrelation>,
 }
 
 impl DevTraceSummary {
@@ -929,6 +1270,7 @@ impl DevTraceSummary {
             timeline: vec![],
             incremental_summary: None,
             cache_summary: None,
+            cache_fix_correlation: None,
         }
     }
 
@@ -973,6 +1315,14 @@ impl DevTraceSummary {
             Some(cache_stats)
         };
 
+        // 从 WebSearch + CompileCheck 条目中解析缓存与修复关联 (Session 80)
+        let correlation = build_cache_fix_correlation(entries);
+        let cache_fix_correlation = if correlation.is_empty() {
+            None
+        } else {
+            Some(correlation)
+        };
+
         Self {
             total_entries,
             total_duration_ms,
@@ -981,6 +1331,7 @@ impl DevTraceSummary {
             timeline,
             incremental_summary,
             cache_summary,
+            cache_fix_correlation,
         }
     }
 
@@ -1059,6 +1410,48 @@ impl DevTraceSummary {
                 "  平均每次命中: {:.0}ms\n",
                 cache_stats.avg_time_saved_per_hit()
             ));
+        }
+
+        // === 缓存与修复关联分析 (Session 80) ===
+        if let Some(ref corr) = self.cache_fix_correlation {
+            report.push_str("\n  ── 缓存与修复关联分析 ──\n");
+            report.push_str(&format!(
+                "  命中后检查: {} 次 (通过 {})\n",
+                corr.checks_after_hit, corr.successes_after_hit
+            ));
+            report.push_str(&format!(
+                "  未命中后检查: {} 次 (通过 {})\n",
+                corr.checks_after_miss, corr.successes_after_miss
+            ));
+            report.push_str(&format!(
+                "  搜索失败后检查: {} 次 (通过 {})\n",
+                corr.checks_after_failure, corr.successes_after_failure
+            ));
+            if corr.searches_without_check > 0 {
+                report.push_str(&format!(
+                    "  无后续检查: {} 次\n",
+                    corr.searches_without_check
+                ));
+            }
+            report.push_str(&format!(
+                "  命中后修复率: {:.1}%\n",
+                corr.hit_fix_rate() * 100.0
+            ));
+            report.push_str(&format!(
+                "  未命中后修复率: {:.1}%\n",
+                corr.miss_fix_rate() * 100.0
+            ));
+            if corr.checks_after_hit > 0 && corr.checks_after_miss > 0 {
+                report.push_str(&format!(
+                    "  差值: {:+.1}% ({})\n",
+                    corr.hit_vs_miss_diff() * 100.0,
+                    if corr.is_cache_effective() {
+                        "缓存有效"
+                    } else {
+                        "缓存效果不足"
+                    }
+                ));
+            }
         }
 
         if !self.timeline.is_empty() {
@@ -5226,5 +5619,1144 @@ mod tests {
         assert_eq!(cache.time_saved_ms, 2500); // 5 * 500
         assert!((cache.hit_rate() - 5.0 / 8.0).abs() < 0.001); // 5/(5+3)
         assert!((cache.avg_time_saved_per_hit() - 500.0).abs() < 0.001);
+    }
+
+    // ===== Session 80: 缓存命中率与修复成功率关联分析 测试 =====
+
+    // --- CacheFixCorrelation 基本方法 ---
+
+    #[test]
+    fn test_cache_fix_correlation_new() {
+        let corr = CacheFixCorrelation::new();
+        assert_eq!(corr.checks_after_hit, 0);
+        assert_eq!(corr.successes_after_hit, 0);
+        assert_eq!(corr.checks_after_miss, 0);
+        assert_eq!(corr.successes_after_miss, 0);
+        assert_eq!(corr.checks_after_failure, 0);
+        assert_eq!(corr.successes_after_failure, 0);
+        assert_eq!(corr.searches_without_check, 0);
+        assert!(corr.is_empty());
+    }
+
+    #[test]
+    fn test_cache_fix_record_hit_success() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+    }
+
+    #[test]
+    fn test_cache_fix_record_hit_failure() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(false);
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 0);
+    }
+
+    #[test]
+    fn test_cache_fix_record_miss_success() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_miss_check(true);
+        assert_eq!(corr.checks_after_miss, 1);
+        assert_eq!(corr.successes_after_miss, 1);
+    }
+
+    #[test]
+    fn test_cache_fix_record_miss_failure() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_miss_check(false);
+        assert_eq!(corr.checks_after_miss, 1);
+        assert_eq!(corr.successes_after_miss, 0);
+    }
+
+    #[test]
+    fn test_cache_fix_record_failure_success() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_failure_check(true);
+        assert_eq!(corr.checks_after_failure, 1);
+        assert_eq!(corr.successes_after_failure, 1);
+    }
+
+    #[test]
+    fn test_cache_fix_record_failure_failure() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_failure_check(false);
+        assert_eq!(corr.checks_after_failure, 1);
+        assert_eq!(corr.successes_after_failure, 0);
+    }
+
+    #[test]
+    fn test_cache_fix_record_no_check() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_no_check();
+        corr.record_no_check();
+        assert_eq!(corr.searches_without_check, 2);
+        assert!(!corr.is_empty());
+    }
+
+    // --- 修复成功率计算 ---
+
+    #[test]
+    fn test_cache_fix_hit_fix_rate() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(false);
+        // 2/3 = 0.6667
+        assert!((corr.hit_fix_rate() - 2.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_fix_hit_fix_rate_empty() {
+        let corr = CacheFixCorrelation::new();
+        assert_eq!(corr.hit_fix_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_fix_miss_fix_rate() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        // 1/2 = 0.5
+        assert!((corr.miss_fix_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_fix_miss_fix_rate_empty() {
+        let corr = CacheFixCorrelation::new();
+        assert_eq!(corr.miss_fix_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_cache_fix_failure_fix_rate() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_failure_check(true);
+        corr.record_failure_check(false);
+        corr.record_failure_check(false);
+        // 1/3 = 0.3333
+        assert!((corr.failure_fix_rate() - 1.0 / 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_fix_failure_fix_rate_empty() {
+        let corr = CacheFixCorrelation::new();
+        assert_eq!(corr.failure_fix_rate(), 0.0);
+    }
+
+    // --- 差值和有效性 ---
+
+    #[test]
+    fn test_cache_fix_hit_vs_miss_diff_positive() {
+        // 缓存有效: 命中修复率 > 未命中修复率
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        // hit: 2/2 = 100%, miss: 1/2 = 50%, diff: +50%
+        assert!((corr.hit_vs_miss_diff() - 0.5).abs() < 0.001);
+        assert!(corr.is_cache_effective());
+    }
+
+    #[test]
+    fn test_cache_fix_hit_vs_miss_diff_negative() {
+        // 缓存无效: 命中修复率 < 未命中修复率
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(false);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        // hit: 1/2 = 50%, miss: 2/2 = 100%, diff: -50%
+        assert!((corr.hit_vs_miss_diff() - (-0.5)).abs() < 0.001);
+        assert!(!corr.is_cache_effective());
+    }
+
+    #[test]
+    fn test_cache_fix_hit_vs_miss_diff_zero() {
+        // 两者修复率相同
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(false);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        // hit: 1/2 = 50%, miss: 1/2 = 50%, diff: 0%
+        assert!((corr.hit_vs_miss_diff()).abs() < 0.001);
+        assert!(corr.is_cache_effective()); // >= 包含等于
+    }
+
+    #[test]
+    fn test_cache_fix_hit_vs_miss_diff_no_data() {
+        // hit 有数据, miss 无数据 → 返回 0.0
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        assert_eq!(corr.hit_vs_miss_diff(), 0.0);
+        assert!(!corr.is_cache_effective());
+    }
+
+    #[test]
+    fn test_cache_fix_is_cache_effective_no_hit_data() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_miss_check(true);
+        assert!(!corr.is_cache_effective());
+    }
+
+    #[test]
+    fn test_cache_fix_is_cache_effective_no_miss_data() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        assert!(!corr.is_cache_effective());
+    }
+
+    // --- 汇总方法 ---
+
+    #[test]
+    fn test_cache_fix_total_correlated() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(false);
+        corr.record_miss_check(true);
+        corr.record_failure_check(false);
+        corr.record_failure_check(true);
+        // 2 + 1 + 2 = 5
+        assert_eq!(corr.total_correlated(), 5);
+    }
+
+    #[test]
+    fn test_cache_fix_is_empty() {
+        let corr = CacheFixCorrelation::new();
+        assert!(corr.is_empty());
+
+        let mut corr2 = CacheFixCorrelation::new();
+        corr2.record_hit_check(true);
+        assert!(!corr2.is_empty());
+
+        let mut corr3 = CacheFixCorrelation::new();
+        corr3.record_no_check();
+        assert!(!corr3.is_empty());
+    }
+
+    #[test]
+    fn test_cache_fix_to_summary() {
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_miss_check(false);
+        let summary = corr.to_summary();
+        assert!(summary.contains("命中后 1 次检查"));
+        assert!(summary.contains("通过 1"));
+        assert!(summary.contains("未命中后 1 次检查"));
+        assert!(summary.contains("通过 0"));
+        assert!(summary.contains("命中修复率 100.0%"));
+        assert!(summary.contains("未命中修复率 0.0%"));
+    }
+
+    // --- find_next_compile_check ---
+
+    #[test]
+    fn test_find_next_compile_check_found() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::FixAttempt,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "fix",
+                "response",
+                200,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        assert_eq!(find_next_compile_check(&entries, 0), Some(true));
+    }
+
+    #[test]
+    fn test_find_next_compile_check_not_found() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::FixAttempt,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "fix",
+                "response",
+                200,
+                true,
+                None,
+            ),
+        ];
+        assert_eq!(find_next_compile_check(&entries, 0), None);
+    }
+
+    #[test]
+    fn test_find_next_compile_check_wrong_phase() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(1), // 不同 phase
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        // phase 不匹配, 不应找到
+        assert_eq!(find_next_compile_check(&entries, 0), None);
+    }
+
+    #[test]
+    fn test_find_next_compile_check_wrong_task() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1), // 不同 task
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        // task 不匹配, 不应找到
+        assert_eq!(find_next_compile_check(&entries, 0), None);
+    }
+
+    #[test]
+    fn test_find_next_compile_check_skips_non_compile() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::FixAttempt,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "fix",
+                "response",
+                200,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::Clarification,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "clarify",
+                "response",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        // 应跳过 FixAttempt 和 Clarification, 找到 CompileCheck (failed)
+        assert_eq!(find_next_compile_check(&entries, 0), Some(false));
+    }
+
+    #[test]
+    fn test_find_next_compile_check_none_phase_task() {
+        // 当 WebSearch 和 CompileCheck 都没有 phase/task 时应匹配
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                None,
+                None,
+                None,
+                "query",
+                "result",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                None,
+                None,
+                None,
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        assert_eq!(find_next_compile_check(&entries, 0), Some(true));
+    }
+
+    #[test]
+    fn test_find_next_compile_check_out_of_bounds() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::WebSearch,
+            None,
+            None,
+            None,
+            "query",
+            "result",
+            100,
+            true,
+            None,
+        )];
+        // from_idx 超出范围
+        assert_eq!(find_next_compile_check(&entries, 10), None);
+    }
+
+    #[test]
+    fn test_find_next_compile_check_empty_entries() {
+        let entries: Vec<DevTraceEntry> = vec![];
+        assert_eq!(find_next_compile_check(&entries, 0), None);
+    }
+
+    // --- build_cache_fix_correlation ---
+
+    #[test]
+    fn test_build_correlation_empty() {
+        let entries: Vec<DevTraceEntry> = vec![];
+        let corr = build_cache_fix_correlation(&entries);
+        assert!(corr.is_empty());
+    }
+
+    #[test]
+    fn test_build_correlation_hit_success() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+        assert!((corr.hit_fix_rate() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_correlation_hit_failure() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 0);
+        assert_eq!(corr.hit_fix_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_build_correlation_miss_success() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_miss, 1);
+        assert_eq!(corr.successes_after_miss, 1);
+        assert!((corr.miss_fix_rate() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_correlation_miss_failure() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                500,
+                true,
+                Some("编译错误自动搜索 (已缓存)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_miss, 1);
+        assert_eq!(corr.successes_after_miss, 0);
+        assert_eq!(corr.miss_fix_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_build_correlation_failure_search() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "",
+                3000,
+                false,
+                Some("搜索失败: connection refused"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_failure, 1);
+        assert_eq!(corr.successes_after_failure, 0);
+        assert_eq!(corr.failure_fix_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_build_correlation_no_subsequent_check() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            // 没有 CompileCheck 条目
+            DevTraceEntry::new(
+                TraceAction::FixAttempt,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "fix",
+                "response",
+                200,
+                true,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.searches_without_check, 1);
+        assert_eq!(corr.checks_after_miss, 0);
+    }
+
+    #[test]
+    fn test_build_correlation_mixed() {
+        let entries = vec![
+            // Task 0: 缓存命中 → 编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task0"),
+                "q1",
+                "r1",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task0"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            // Task 1: 缓存未命中 → 编译失败
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "q2",
+                "r2",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            // Task 2: 搜索失败 → 编译通过 (AI 自己修好了)
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task2"),
+                "q3",
+                "",
+                3000,
+                false,
+                Some("搜索失败: timeout"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task2"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+        assert_eq!(corr.checks_after_miss, 1);
+        assert_eq!(corr.successes_after_miss, 0);
+        assert_eq!(corr.checks_after_failure, 1);
+        assert_eq!(corr.successes_after_failure, 1);
+        assert_eq!(corr.total_correlated(), 3);
+        // hit: 100%, miss: 0%, diff: +100% → 缓存有效
+        assert!(corr.is_cache_effective());
+        assert!((corr.hit_vs_miss_diff() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_correlation_ignores_non_websearch() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "input",
+                "output",
+                1000,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let corr = build_cache_fix_correlation(&entries);
+        // 非 WebSearch 条目应被忽略
+        assert!(corr.is_empty());
+    }
+
+    #[test]
+    fn test_build_correlation_realistic_workflow() {
+        // 模拟真实修复工作流: 多轮修复 + 缓存命中/未命中混合
+        let entries: Vec<DevTraceEntry> = vec![
+            // Task 0: 首次编译失败 → 搜索 (未命中) → 修复 → 编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task0"),
+                "rust E0308",
+                "search result",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task0"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            // Task 1: 首次编译失败 → 搜索 (未命中) → 修复 → 编译失败
+            //         → 再次搜索 (命中, 相同错误) → 修复 → 编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "rust E0277",
+                "search result",
+                600,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "rust E0277",
+                "cached result",
+                0,
+                true,
+                Some("缓存命中 (key=E0277, 原始耗时=600ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            // Task 2: 搜索失败 → 编译失败 (没有搜索结果, AI 也没修好)
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task2"),
+                "rust E0507",
+                "",
+                3000,
+                false,
+                Some("搜索失败: connection refused"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task2"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+
+        let corr = build_cache_fix_correlation(&entries);
+
+        // 统计验证
+        assert_eq!(corr.checks_after_hit, 1); // Task1 第二次搜索
+        assert_eq!(corr.successes_after_hit, 1); // Task1 第二次编译通过
+        assert_eq!(corr.checks_after_miss, 2); // Task0 + Task1 第一次
+        assert_eq!(corr.successes_after_miss, 1); // Task0 通过, Task1 第一次失败
+        assert_eq!(corr.checks_after_failure, 1); // Task2
+        assert_eq!(corr.successes_after_failure, 0); // Task2 失败
+        assert_eq!(corr.total_correlated(), 4);
+
+        // 修复率: hit 100%, miss 50%, failure 0%
+        assert!((corr.hit_fix_rate() - 1.0).abs() < 0.001);
+        assert!((corr.miss_fix_rate() - 0.5).abs() < 0.001);
+        assert_eq!(corr.failure_fix_rate(), 0.0);
+
+        // 差值: 100% - 50% = +50% → 缓存有效
+        assert!((corr.hit_vs_miss_diff() - 0.5).abs() < 0.001);
+        assert!(corr.is_cache_effective());
+    }
+
+    // --- DevTraceSummary 集成 ---
+
+    #[test]
+    fn test_summary_correlation_none_without_websearch() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.cache_fix_correlation.is_none());
+    }
+
+    #[test]
+    fn test_summary_correlation_from_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let corr = summary.cache_fix_correlation.expect("should be Some");
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+    }
+
+    #[test]
+    fn test_summary_correlation_websearch_without_compile_check() {
+        // 有 WebSearch 但没有后续 CompileCheck → searches_without_check > 0
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            // 没有 CompileCheck
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let corr = summary.cache_fix_correlation.expect("should be Some");
+        assert_eq!(corr.searches_without_check, 1);
+        assert_eq!(corr.total_correlated(), 0);
+    }
+
+    #[test]
+    fn test_summary_correlation_in_report() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "query",
+                "result",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("缓存与修复关联分析"));
+        assert!(report.contains("命中后检查: 1 次 (通过 1)"));
+        assert!(report.contains("未命中后检查: 1 次 (通过 0)"));
+        assert!(report.contains("命中后修复率: 100.0%"));
+        assert!(report.contains("未命中后修复率: 0.0%"));
+        assert!(report.contains("缓存有效"));
+    }
+
+    #[test]
+    fn test_summary_correlation_not_in_report() {
+        // 没有 WebSearch → 报告中不应包含关联分析
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+        assert!(!report.contains("缓存与修复关联分析"));
+    }
+
+    #[test]
+    fn test_summary_correlation_serde_roundtrip() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: DevTraceSummary = serde_json::from_str(&json).unwrap();
+
+        let corr = deserialized.cache_fix_correlation.expect("should be Some");
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+    }
+
+    #[test]
+    fn test_summary_correlation_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        // cache_fix_correlation 为 None 时应被 skip
+        assert!(!json.contains("cache_fix_correlation"));
+    }
+
+    #[test]
+    fn test_summary_all_three_stats() {
+        // 同时有增量发送 + 缓存统计 + 关联分析
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=10, sent=3, skipped=7",
+                "response",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.incremental_summary.is_some());
+        assert!(summary.cache_summary.is_some());
+        assert!(summary.cache_fix_correlation.is_some());
+
+        let report = summary.to_report();
+        assert!(report.contains("增量发送统计"));
+        assert!(report.contains("搜索缓存统计"));
+        assert!(report.contains("缓存与修复关联分析"));
+
+        let corr = summary.cache_fix_correlation.expect("should be Some");
+        assert_eq!(corr.checks_after_hit, 1);
+        assert_eq!(corr.successes_after_hit, 1);
+        assert!(!corr.is_cache_effective()); // 没有 miss 数据
     }
 }

@@ -140,12 +140,12 @@ pub use context_handoff::{
 };
 pub use deadline::{no_deadline, Deadline};
 pub use dev_trace::{
-    build_cache_summary, build_timeline, calculate_success_rate, format_action_stats_line,
-    format_duration_human, format_success_rate_percent, format_timeline_line,
-    group_entries_by_action, is_cache_miss, is_search_failure, parse_cache_entry,
-    parse_cache_hit_duration, parse_incremental_entry, parse_jsonl_line, ActionStats,
-    CacheEntryInfo, CacheStatsSummary, DevTraceEntry, DevTraceSummary, DevTraceWriter,
-    IncrementalStats, TimelineEntry, TraceAction,
+    build_cache_fix_correlation, build_cache_summary, build_timeline, calculate_success_rate,
+    find_next_compile_check, format_action_stats_line, format_duration_human,
+    format_success_rate_percent, format_timeline_line, group_entries_by_action, is_cache_miss,
+    is_search_failure, parse_cache_entry, parse_cache_hit_duration, parse_incremental_entry,
+    parse_jsonl_line, ActionStats, CacheEntryInfo, CacheFixCorrelation, CacheStatsSummary,
+    DevTraceEntry, DevTraceSummary, DevTraceWriter, IncrementalStats, TimelineEntry, TraceAction,
 };
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,
