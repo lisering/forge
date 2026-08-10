@@ -72,6 +72,7 @@ pub mod context_handoff;
 pub mod deadline;
 pub mod dev_trace;
 pub mod error_diagnosis;
+pub mod error_search;
 pub mod extract;
 pub mod failover_chat;
 pub mod interaction;
@@ -146,6 +147,10 @@ pub use dev_trace::{
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,
     HeuristicErrorDiagnoser, HybridErrorDiagnoser, LlmErrorDiagnoser, MockErrorDiagnoser,
+};
+pub use error_search::{
+    build_error_search_query, extract_error_keywords, format_search_results_section,
+    should_search_errors, truncate_search_results,
 };
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};

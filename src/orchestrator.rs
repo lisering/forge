@@ -27,6 +27,7 @@ use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
 use crate::dev_trace::{DevTraceWriter, TraceAction};
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
+use crate::error_search;
 use crate::interaction::AutoApprove;
 use crate::loop_detector::LoopDetector;
 use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
@@ -1068,6 +1069,142 @@ where
         } else {
             // 向后兼容: 增量跟踪未启用, 直接发送
             self.send_message_safe(steered_prompt, timeout).await
+        }
+    }
+
+    /// 编译错误自动搜索 — web_tool 深度集成
+    ///
+    /// 当编译/测试失败时, 自动从错误信息中提取关键词,
+    /// 通过 WebTool 搜索解决方案, 返回格式化的搜索结果段落。
+    ///
+    /// ## 设计理念
+    ///
+    /// 借鉴 ds4 的 "auto-search on error" 模式:
+    /// - 编译错误 → 提取关键词 → Google 搜索 → 结果注入修复 prompt
+    /// - AI 获得额外上下文, 提高首次修复成功率
+    /// - 与 `/search` slash command 互补: 主动搜索 vs AI 自主搜索
+    ///
+    /// ## 条件
+    ///
+    /// - `web_tool` 必须已启用 (否则返回 None)
+    /// - 错误列表非空
+    /// - 非首次尝试 (attempt > 1, 首次失败直接让 AI 修复)
+    /// - 非网络错误
+    ///
+    /// # 参数
+    ///
+    /// - `errors`: 编译错误列表
+    /// - `attempt`: 当前尝试轮次 (1-based)
+    /// - `is_network_error`: 是否为网络错误
+    /// - `phase_idx`: 阶段索引 (DevTrace)
+    /// - `task_idx`: 任务索引 (DevTrace)
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(Some(section))`: 搜索结果格式化段落, 追加到修复 prompt
+    /// - `Ok(None)`: 未搜索 (条件不满足或搜索结果为空)
+    /// - `Err(e)`: 搜索过程出错 (非致命, 调用方应忽略)
+    async fn auto_search_error_solutions(
+        &mut self,
+        errors: &[CompileError],
+        attempt: u32,
+        is_network_error: bool,
+        phase_idx: usize,
+        task_idx: usize,
+    ) -> Result<Option<String>> {
+        // 条件检查: 是否应该搜索
+        if !error_search::should_search_errors(errors, attempt, is_network_error) {
+            return Ok(None);
+        }
+
+        // 构建搜索查询
+        let query = match error_search::build_error_search_query(errors) {
+            Some(q) => q,
+            None => {
+                debug!("    🔍 自动搜索: 无法从错误中构建搜索查询");
+                return Ok(None);
+            }
+        };
+
+        // WebTool 必须已启用
+        let web_tool = match self.web_tool.as_ref() {
+            Some(tool) => tool,
+            None => {
+                debug!("    🔍 自动搜索: WebTool 未启用, 跳过");
+                return Ok(None);
+            }
+        };
+
+        info!("    🔍 自动搜索: '{}'", query);
+        println!("    🔍 自动搜索错误解决方案: {}", query);
+
+        // 创建取消令牌
+        let cancel_source = self.create_cancellation_token();
+        let cancel_token = cancel_source.token();
+
+        // 执行搜索
+        let search_start = Instant::now();
+        let search_result = web_tool.search_web(&query, None, Some(&cancel_token)).await;
+        let search_duration = search_start.elapsed().as_millis() as u64;
+
+        match search_result {
+            Ok(result) => {
+                if result.content.is_empty() {
+                    debug!("    🔍 自动搜索: 搜索结果为空");
+                    return Ok(None);
+                }
+
+                info!(
+                    "    ✅ 自动搜索完成: {}ms, {} 字符",
+                    search_duration,
+                    result.content.len()
+                );
+                println!("    ✅ 搜索结果已获取 ({} 字符)", result.content.len());
+
+                // DevTrace: 记录自动搜索
+                let as_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+                self.trace_dev(
+                    TraceAction::WebSearch,
+                    Some(phase_idx),
+                    Some(task_idx),
+                    Some(&as_task_name),
+                    &query,
+                    &result.content,
+                    search_duration,
+                    true,
+                    Some("编译错误自动搜索"),
+                );
+
+                // 格式化搜索结果段落
+                let section = error_search::format_search_results_section(
+                    &result.query,
+                    &result.content,
+                    result.duration_ms,
+                );
+
+                Ok(Some(section))
+            }
+            Err(e) => {
+                warn!("    ❌ 自动搜索失败: {}", e);
+                println!("    ❌ 自动搜索失败: {}", e);
+
+                // DevTrace: 记录搜索失败
+                let as_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+                self.trace_dev(
+                    TraceAction::WebSearch,
+                    Some(phase_idx),
+                    Some(task_idx),
+                    Some(&as_task_name),
+                    &query,
+                    "",
+                    search_duration,
+                    false,
+                    Some(&format!("搜索失败: {}", e)),
+                );
+
+                // 搜索失败是非致命的, 返回 None 不影响修复流程
+                Ok(None)
+            }
         }
     }
 
@@ -2663,6 +2800,9 @@ where
         let mut last_feedback: String = String::new();
         // 智能错误诊断结果 (方向 F) — 用于增强修复 prompt
         let mut last_diagnosis: Option<DiagnosisResult> = None;
+        // === web_tool 深度集成: 编译错误自动搜索结果 ===
+        // 修复轮次中, 将搜索结果追加到修复 prompt, 为 AI 提供额外上下文
+        let mut last_search_results: Option<String> = None;
 
         // === 网络错误处理常量 (orchestrator 层面) ===
         // run_cargo 已重试 3 次 (5s 间隔), orchestrator 层面再重试 3 次 (30s 间隔)
@@ -2719,7 +2859,7 @@ where
 
                 // === 智能错误诊断增强 (方向 F) ===
                 // 将诊断结果追加到修复 prompt 前面, 为 AI 提供更精准的修复指导
-                if let Some(ref diagnosis) = last_diagnosis {
+                let with_diagnosis = if let Some(ref diagnosis) = last_diagnosis {
                     if diagnosis.has_guidance() {
                         format!(
                             "🔍 错误诊断 ({})\n\
@@ -2736,6 +2876,15 @@ where
                     }
                 } else {
                     base_prompt
+                };
+
+                // === web_tool 深度集成: 追加搜索结果 ===
+                // 将编译错误自动搜索的结果追加到修复 prompt 后面,
+                // 为 AI 提供额外的解决方案上下文
+                if let Some(ref search_section) = last_search_results {
+                    format!("{}{}", with_diagnosis, search_section)
+                } else {
+                    with_diagnosis
                 }
             };
 
@@ -3190,6 +3339,20 @@ where
                         last_diagnosis = Some(result);
                     }
 
+                    // === web_tool 深度集成: 编译错误自动搜索 ===
+                    // 仅在修复轮次 (attempt > 1) 且非网络错误时搜索
+                    last_search_results = self
+                        .auto_search_error_solutions(
+                            &last_errors,
+                            attempt,
+                            false,
+                            phase_idx,
+                            task_idx,
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+
                     if attempt == self.max_rounds_per_task {
                         // 版本管理: 最终失败,回滚到 known good
                         self.do_rollback(phase_idx, &task_id);
@@ -3254,6 +3417,14 @@ where
                     }
                     last_diagnosis = Some(result);
                 }
+
+                // === web_tool 深度集成: 编译错误自动搜索 ===
+                // 仅在修复轮次 (attempt > 1) 且非网络错误时搜索
+                last_search_results = self
+                    .auto_search_error_solutions(&last_errors, attempt, false, phase_idx, task_idx)
+                    .await
+                    .ok()
+                    .flatten();
 
                 if attempt == self.max_rounds_per_task {
                     // 版本管理: 最终失败,回滚到 known good
