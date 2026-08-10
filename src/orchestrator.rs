@@ -26,7 +26,9 @@ use crate::cache_tuning::CacheTuner;
 use crate::clarify::HeuristicClarificationChecker;
 use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
-use crate::dev_trace::{build_cache_fix_correlation, DevTraceWriter, TraceAction};
+use crate::dev_trace::{
+    build_cache_fix_correlation, build_search_quality_stats, DevTraceWriter, TraceAction,
+};
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
 use crate::error_search;
 use crate::interaction::AutoApprove;
@@ -35,6 +37,7 @@ use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
 use crate::prompt_builder::SystemPrompt;
 use crate::response_handler::{HandlerChain, TaskContext};
 use crate::search_cache::{self, CachedSearchEntry, SearchCache};
+use crate::search_quality::SearchQualityEvaluator;
 use crate::slash_command::{self, SlashCommand, SlashCommandAction};
 use crate::steer_reminder::SteerReminder;
 use crate::task_graph::TaskGraph;
@@ -498,6 +501,13 @@ where
     /// 自动调整 TTL (缩短/延长) 或禁用缓存。
     /// None 表示禁用 (默认, 向后兼容)。
     pub cache_tuner: Option<CacheTuner>,
+
+    /// 搜索质量评估器 — 评估自动搜索对修复成功率的影响 (Session 85)
+    ///
+    /// 启用后, 在每次编译检查后评估搜索质量,
+    /// 当搜索有害时自动禁用搜索功能。
+    /// None 表示禁用 (默认, 向后兼容)。
+    pub search_quality_evaluator: Option<SearchQualityEvaluator>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -545,6 +555,7 @@ where
             incremental_stats: crate::dev_trace::IncrementalStats::new(),
             search_cache: SearchCache::default_config(),
             cache_tuner: None,
+            search_quality_evaluator: None,
         }
     }
 }
@@ -608,6 +619,7 @@ where
             incremental_stats: self.incremental_stats,
             search_cache: self.search_cache,
             cache_tuner: self.cache_tuner,
+            search_quality_evaluator: self.search_quality_evaluator,
         }
     }
 
@@ -824,6 +836,21 @@ where
     /// - `tuner`: 已配置的 CacheTuner (含初始 TTL 和调优配置)
     pub fn with_cache_tuner(mut self, tuner: CacheTuner) -> Self {
         self.cache_tuner = Some(tuner);
+        self
+    }
+
+    /// 启用搜索质量评估器 — 评估自动搜索对修复成功率的影响 (Session 85)
+    ///
+    /// 启用后, 在每次编译检查后评估搜索质量,
+    /// 当搜索有害 (搜索后修复率明显低于不搜索) 时自动禁用搜索功能。
+    ///
+    /// 需要同时启用 DevTrace (`with_dev_trace(true)`) 才能工作。
+    ///
+    /// # 参数
+    ///
+    /// - `evaluator`: 已配置的 SearchQualityEvaluator
+    pub fn with_search_quality_evaluator(mut self, evaluator: SearchQualityEvaluator) -> Self {
+        self.search_quality_evaluator = Some(evaluator);
         self
     }
 
@@ -1174,6 +1201,17 @@ where
             return Ok(None);
         }
 
+        // === 搜索质量评估器禁用检查 (Session 85) ===
+        // 当搜索质量评估器判定搜索有害并禁用后, 跳过自动搜索
+        if self
+            .search_quality_evaluator
+            .as_ref()
+            .is_some_and(|e| !e.is_enabled())
+        {
+            debug!("    🔍 自动搜索: 搜索质量评估器已禁用搜索, 跳过");
+            return Ok(None);
+        }
+
         // 构建搜索查询
         let query = match error_search::build_error_search_query(errors) {
             Some(q) => q,
@@ -1424,6 +1462,93 @@ where
                 corr.checks_after_miss
             ),
             &decision.to_summary(),
+            0,
+            true,
+            Some(&decision.reason),
+        );
+    }
+
+    /// 搜索质量评估 — 评估并应用搜索质量决策 (Session 85)
+    ///
+    /// 在每次编译检查后调用, 基于 DevTrace 中的 WebSearch + CompileCheck 条目
+    /// 构建 `SearchQualityStats`, 评估搜索与不搜索的修复成功率差值,
+    /// 当搜索有害时自动禁用搜索功能。
+    ///
+    /// ## 条件
+    ///
+    /// - `search_quality_evaluator` 必须已启用 (否则跳过)
+    /// - `dev_trace` 必须已启用 (否则跳过, 无数据可分析)
+    ///
+    /// ## 决策应用
+    ///
+    /// - `DisableSearch` → 后续 `auto_search_error_solutions` 跳过搜索
+    /// - `KeepSearching` / `InsufficientData` → 无操作
+    ///
+    /// # 参数
+    ///
+    /// - `phase_idx`: 阶段索引 (DevTrace)
+    /// - `task_idx`: 任务索引 (DevTrace)
+    fn evaluate_search_quality(&mut self, phase_idx: usize, task_idx: usize) {
+        let (evaluator, trace_writer) = match (&mut self.search_quality_evaluator, &self.dev_trace)
+        {
+            (Some(e), Some(w)) => (e, w),
+            _ => return, // 未启用, 跳过
+        };
+
+        // 读取 DevTrace 条目, 构建搜索质量统计
+        let entries = match trace_writer.read_all() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("    🔍 搜索质量: 读取 DevTrace 失败: {}", e);
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            debug!("    🔍 搜索质量: 无 DevTrace 条目, 跳过");
+            return;
+        }
+
+        let stats = build_search_quality_stats(&entries);
+
+        // 评估并应用质量决策
+        let decision = evaluator.evaluate_and_apply(&stats);
+
+        // 应用决策
+        match &decision.action {
+            crate::search_quality::SearchQualityAction::KeepSearching => {
+                debug!("    🔍 搜索质量: {}", decision.reason);
+            }
+            crate::search_quality::SearchQualityAction::InsufficientData => {
+                debug!("    🔍 搜索质量: {}", decision.reason);
+            }
+            crate::search_quality::SearchQualityAction::DisableSearch => {
+                info!(
+                    "    🔍 搜索质量: 禁用搜索 (差值 {:+.1}%)",
+                    decision.diff * 100.0
+                );
+                println!(
+                    "    🔍 搜索质量: 禁用自动搜索 ({:+.1}% 差值, 搜索有害)",
+                    decision.diff * 100.0
+                );
+            }
+        }
+
+        // DevTrace: 记录搜索质量决策
+        let sq_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+        self.trace_dev(
+            TraceAction::SearchQuality,
+            Some(phase_idx),
+            Some(task_idx),
+            Some(&sq_task_name),
+            &format!(
+                "with={}/{} without={}/{}",
+                stats.successes_with_search,
+                stats.checks_with_search,
+                stats.successes_without_search,
+                stats.checks_without_search,
+            ),
+            &decision.to_trace_summary(),
             0,
             true,
             Some(&decision.reason),
@@ -3368,6 +3493,10 @@ where
             // 在每次编译检查后评估缓存命中与未命中的修复成功率,
             // 自动调整 TTL 或禁用缓存
             self.evaluate_cache_tuning(phase_idx, task_idx);
+
+            // === 搜索质量评估 (Session 85) ===
+            // 在每次编译检查后评估搜索质量, 当搜索有害时自动禁用
+            self.evaluate_search_quality(phase_idx, task_idx);
 
             if check_result.success {
                 println!("    ✅ 编译成功");
@@ -6265,6 +6394,575 @@ mod tests {
 
         assert_eq!(orch2.cache_tuner.as_ref().unwrap().current_ttl(), 4050);
         assert_eq!(orch2.cache_tuner.as_ref().unwrap().adjustment_count(), 1);
+    }
+
+    // ===== Session 85: 搜索质量评估集成测试 =====
+
+    /// 创建带搜索质量评估器的测试 Orchestrator
+    fn make_orchestrator_with_quality<'a>(
+        chat: &'a MockChatClient,
+        workspace_dir: &'a str,
+    ) -> Orchestrator<'a, MockChatClient, MockTestRunner, MockExtractor> {
+        std::fs::create_dir_all(format!("{}/.forge", workspace_dir)).unwrap();
+        make_orchestrator(chat, workspace_dir)
+            .with_dev_trace(true)
+            .with_search_quality_evaluator(
+                crate::search_quality::SearchQualityEvaluator::with_default_config(),
+            )
+    }
+
+    #[test]
+    fn test_with_search_quality_evaluator_sets_field() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // 默认 search_quality_evaluator 为 None
+        assert!(orch.search_quality_evaluator.is_none());
+
+        // 启用后应为 Some
+        let orch = orch.with_search_quality_evaluator(
+            crate::search_quality::SearchQualityEvaluator::with_default_config(),
+        );
+        assert!(orch.search_quality_evaluator.is_some());
+        assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_noop_without_evaluator() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 没有 search_quality_evaluator, 应该是无操作
+        orch.evaluate_search_quality(0, 0);
+        // 不 panic 即可
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_noop_without_devtrace() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_search_quality_evaluator(
+                crate::search_quality::SearchQualityEvaluator::with_default_config(),
+            );
+        setup_test_phase(&mut orch);
+
+        // 没有 dev_trace, 应该是无操作
+        orch.evaluate_search_quality(0, 0);
+        // 不 panic 即可
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_noop_with_empty_entries() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // DevTrace 为空, 应该无操作
+        orch.evaluate_search_quality(0, 0);
+        assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_insufficient_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入少量数据 (不足 min_samples=5)
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::WebSearch,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "query",
+                    "result",
+                    500,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::CompileCheck,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "check",
+                    "passed",
+                    50,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        orch.evaluate_search_quality(0, 0);
+
+        // 数据不足, 应保持启用
+        assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_disables_harmful_search() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 构建数据: 搜索后修复率低 (0/3), 不搜索修复率高 (3/3)
+        // diff = 0% - 100% = -100% < -10% → 禁用搜索
+        let entries: Vec<DevTraceEntry> = vec![
+            // 3次有搜索 → 全部编译失败
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "q1",
+                "r1",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            // 3次无搜索 → 全部编译通过
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.evaluate_search_quality(0, 0);
+
+        // 搜索应被禁用
+        assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_keeps_beneficial_search() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 构建数据: 搜索后修复率高 (3/3), 不搜索修复率低 (0/3)
+        // diff = 100% - 0% = +100% >= 5% → 保持搜索
+        let entries: Vec<DevTraceEntry> = vec![
+            // 3次有搜索 → 全部编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "q1",
+                "r1",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            // 3次无搜索 → 全部编译失败
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "failed",
+                50,
+                false,
+                None,
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.evaluate_search_quality(0, 0);
+
+        // 搜索应保持启用
+        assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_writes_devtrace_entry() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入一些数据
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::WebSearch,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "q",
+                    "r",
+                    500,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::CompileCheck,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "check",
+                    "passed",
+                    50,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        // 调用 evaluate_search_quality
+        orch.evaluate_search_quality(0, 0);
+
+        // 验证 DevTrace 中新增了 SearchQuality 条目
+        let entries = orch.dev_trace.as_ref().unwrap().read_all().unwrap();
+        let sq_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.action == TraceAction::SearchQuality)
+            .collect();
+        assert_eq!(sq_entries.len(), 1);
+        assert!(sq_entries[0].success);
+    }
+
+    #[test]
+    fn test_search_disabled_after_quality_eval_skips_search() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动禁用搜索
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let mut stats = crate::dev_trace::SearchQualityStats::new();
+            // 搜索有害
+            for _ in 0..3 {
+                stats.record_with_search(false);
+                stats.record_without_search(true);
+            }
+            evaluator.evaluate_and_apply(&stats);
+        }
+
+        // 验证搜索已被禁用
+        assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+
+        // 验证 auto_search 逻辑: 当 evaluator 禁用时, 应跳过搜索
+        let search_enabled = orch
+            .search_quality_evaluator
+            .as_ref()
+            .is_none_or(|e| e.is_enabled());
+        assert!(!search_enabled);
+    }
+
+    #[test]
+    fn test_with_clarification_preserves_search_quality_evaluator() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_search_quality_evaluator(
+                crate::search_quality::SearchQualityEvaluator::with_default_config(),
+            );
+
+        // with_clarification 应保留 search_quality_evaluator
+        let orch2 = orch.with_clarification(HeuristicClarificationChecker::new());
+        assert!(orch2.search_quality_evaluator.is_some());
+        assert!(orch2
+            .search_quality_evaluator
+            .as_ref()
+            .unwrap()
+            .is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_search_quality_neutral_keeps_enabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // diff = 0% → 中性 → 保持
+        // 有搜索: 3/3 通过, 无搜索: 3/3 通过
+        let entries: Vec<DevTraceEntry> = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "q1",
+                "r1",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.evaluate_search_quality(0, 0);
+
+        // 中性 → 保持启用
+        assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
     }
 }
 

@@ -1182,6 +1182,14 @@ where
         orch = orch.with_cache_tuner(CacheTuner::with_default_config(current_ttl));
     }
 
+    // Session 85: 启用搜索质量评估器 (需要 DevTrace 数据)
+    // 当 DevTrace 启用时自动启用 SearchQualityEvaluator, 评估搜索效果并自动禁用有害搜索
+    if dev_trace {
+        orch = orch.with_search_quality_evaluator(
+            forge::search_quality::SearchQualityEvaluator::with_default_config(),
+        );
+    }
+
     // Session 69: 集成 HandlerChain 回调处理器链
     if let Some(chain) = handler_chain {
         orch = orch.with_response_handlers(chain);

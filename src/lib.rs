@@ -89,6 +89,7 @@ pub mod proxy_pool;
 pub mod radix_tree;
 pub mod response_handler;
 pub mod search_cache;
+pub mod search_quality;
 pub mod site_health;
 pub mod slash_command;
 pub mod stealth_patches;
@@ -148,12 +149,13 @@ pub use context_handoff::{
 };
 pub use deadline::{no_deadline, Deadline};
 pub use dev_trace::{
-    build_cache_fix_correlation, build_cache_summary, build_timeline, calculate_success_rate,
-    find_next_compile_check, format_action_stats_line, format_duration_human,
-    format_success_rate_percent, format_timeline_line, group_entries_by_action, is_cache_miss,
-    is_search_failure, parse_cache_entry, parse_cache_hit_duration, parse_incremental_entry,
-    parse_jsonl_line, ActionStats, CacheEntryInfo, CacheFixCorrelation, CacheStatsSummary,
-    DevTraceEntry, DevTraceSummary, DevTraceWriter, IncrementalStats, TimelineEntry, TraceAction,
+    build_cache_fix_correlation, build_cache_summary, build_search_quality_stats, build_timeline,
+    calculate_success_rate, find_next_compile_check, format_action_stats_line,
+    format_duration_human, format_success_rate_percent, format_timeline_line,
+    group_entries_by_action, is_cache_miss, is_search_failure, parse_cache_entry,
+    parse_cache_hit_duration, parse_incremental_entry, parse_jsonl_line, ActionStats,
+    CacheEntryInfo, CacheFixCorrelation, CacheStatsSummary, DevTraceEntry, DevTraceSummary,
+    DevTraceWriter, IncrementalStats, SearchQualityStats, TimelineEntry, TraceAction,
 };
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,
@@ -203,6 +205,11 @@ pub use search_cache::{
     build_cache_key, find_oldest_key, format_cache_stats, is_cache_expired,
     normalize_query_for_cache, CacheStats, CachedSearchEntry, SearchCache, DEFAULT_CACHE_MAX_SIZE,
     DEFAULT_CACHE_TTL_SECS,
+};
+pub use search_quality::{
+    compute_search_quality_decision, has_sufficient_search_data, should_disable_search,
+    SearchQualityAction, SearchQualityConfig, SearchQualityDecision, SearchQualityEvaluator,
+    DEFAULT_BENEFICIAL_THRESHOLD,
 };
 pub use site_health::{
     build_detailed_check_js, calculate_health_rate, check_all_tabs, check_and_log,

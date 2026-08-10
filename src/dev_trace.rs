@@ -83,6 +83,8 @@ pub enum TraceAction {
     IncrementalSend,
     /// 缓存调优 — CacheTuner 自动评估并调整缓存 TTL 或禁用缓存 (Session 82)
     CacheTuning,
+    /// 搜索质量评估 — SearchQualityEvaluator 评估搜索效果并自动禁用 (Session 85)
+    SearchQuality,
 }
 
 impl std::fmt::Display for TraceAction {
@@ -107,6 +109,7 @@ impl std::fmt::Display for TraceAction {
             TraceAction::WebSearch => write!(f, "WebSearch"),
             TraceAction::IncrementalSend => write!(f, "IncrementalSend"),
             TraceAction::CacheTuning => write!(f, "CacheTuning"),
+            TraceAction::SearchQuality => write!(f, "SearchQuality"),
         }
     }
 }
@@ -134,6 +137,7 @@ impl TraceAction {
             TraceAction::WebSearch => "网页搜索",
             TraceAction::IncrementalSend => "增量发送",
             TraceAction::CacheTuning => "缓存调优",
+            TraceAction::SearchQuality => "搜索质量评估",
         }
     }
 
@@ -159,6 +163,7 @@ impl TraceAction {
             TraceAction::WebSearch,
             TraceAction::IncrementalSend,
             TraceAction::CacheTuning,
+            TraceAction::SearchQuality,
         ]
     }
 }
@@ -653,6 +658,312 @@ impl CacheFixCorrelation {
             self.hit_vs_miss_diff() * 100.0,
         )
     }
+}
+
+// ============================================================================
+//  SearchQualityStats — 搜索质量统计 (Session 85)
+// ============================================================================
+
+/// 搜索质量统计 — 评估自动搜索对修复成功率的影响
+///
+/// 比较使用了搜索结果的修复 (with search) 和未使用搜索结果的修复
+/// (without search) 的成功率, 回答核心问题:
+/// **自动搜索是否真正提高了修复成功率?**
+///
+/// # 设计
+///
+/// 在 Orchestrator 的修复流程中:
+/// 1. 编译失败 → `auto_search_error_solutions` 搜索 → 记录 `WebSearch` trace
+/// 2. 搜索结果注入修复 prompt → AI 修复 → 记录 `FixAttempt` trace
+/// 3. 再次编译检查 → 记录 `CompileCheck` trace (success=true/false)
+///
+/// 质量统计逻辑:
+/// - 遍历所有 `CompileCheck` 条目
+/// - 检查同一任务 (phase_idx + task_idx) 在此 `CompileCheck` 之前是否有 `WebSearch`
+/// - 有 → 记录为 "with search"; 无 → 记录为 "without search"
+/// - 汇总两组的成功/失败次数
+///
+/// # 核心指标
+///
+/// - `with_search_fix_rate()`: 使用搜索结果后的编译通过率
+/// - `without_search_fix_rate()`: 未使用搜索结果时的编译通过率
+/// - `search_vs_no_search_diff()`: 两者差值 (正=搜索有效, 负=搜索有害)
+/// - `is_search_beneficial()`: 搜索是否有助于提高修复成功率
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::SearchQualityStats;
+/// let mut stats = SearchQualityStats::new();
+///
+/// // 有搜索结果: 2次成功, 1次失败
+/// stats.record_with_search(true);
+/// stats.record_with_search(true);
+/// stats.record_with_search(false);
+///
+/// // 无搜索结果: 1次成功, 2次失败
+/// stats.record_without_search(true);
+/// stats.record_without_search(false);
+/// stats.record_without_search(false);
+///
+/// // 有搜索修复率: 2/3 = 67%
+/// assert!((stats.with_search_fix_rate() - 2.0 / 3.0).abs() < 0.001);
+/// // 无搜索修复率: 1/3 = 33%
+/// assert!((stats.without_search_fix_rate() - 1.0 / 3.0).abs() < 0.001);
+/// // 差值: 67% - 33% = +33% (搜索有效)
+/// assert!((stats.search_vs_no_search_diff() - (2.0 / 3.0 - 1.0 / 3.0)).abs() < 0.001);
+/// assert!(stats.is_search_beneficial());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchQualityStats {
+    /// 使用搜索结果后的编译检查次数
+    pub checks_with_search: usize,
+    /// 使用搜索结果后编译通过次数
+    pub successes_with_search: usize,
+    /// 未使用搜索结果时的编译检查次数
+    pub checks_without_search: usize,
+    /// 未使用搜索结果时编译通过次数
+    pub successes_without_search: usize,
+    /// 总搜索次数 (WebSearch 条目数)
+    pub total_searches: usize,
+    /// 搜索成功次数
+    pub successful_searches: usize,
+    /// 搜索失败次数
+    pub failed_searches: usize,
+}
+
+impl SearchQualityStats {
+    /// 创建空的搜索质量统计
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次使用搜索结果后的编译检查结果
+    ///
+    /// # 参数
+    ///
+    /// - `success`: 编译检查是否通过
+    pub fn record_with_search(&mut self, success: bool) {
+        self.checks_with_search += 1;
+        if success {
+            self.successes_with_search += 1;
+        }
+    }
+
+    /// 记录一次未使用搜索结果时的编译检查结果
+    ///
+    /// # 参数
+    ///
+    /// - `success`: 编译检查是否通过
+    pub fn record_without_search(&mut self, success: bool) {
+        self.checks_without_search += 1;
+        if success {
+            self.successes_without_search += 1;
+        }
+    }
+
+    /// 记录一次搜索尝试
+    ///
+    /// # 参数
+    ///
+    /// - `success`: 搜索是否成功
+    pub fn record_search(&mut self, success: bool) {
+        self.total_searches += 1;
+        if success {
+            self.successful_searches += 1;
+        } else {
+            self.failed_searches += 1;
+        }
+    }
+
+    /// 使用搜索结果后的修复成功率 (0.0 ~ 1.0)
+    ///
+    /// 无数据时返回 0.0。
+    pub fn with_search_fix_rate(&self) -> f64 {
+        if self.checks_with_search == 0 {
+            return 0.0;
+        }
+        self.successes_with_search as f64 / self.checks_with_search as f64
+    }
+
+    /// 未使用搜索结果时的修复成功率 (0.0 ~ 1.0)
+    ///
+    /// 无数据时返回 0.0。
+    pub fn without_search_fix_rate(&self) -> f64 {
+        if self.checks_without_search == 0 {
+            return 0.0;
+        }
+        self.successes_without_search as f64 / self.checks_without_search as f64
+    }
+
+    /// 搜索与不搜索的修复成功率差值
+    ///
+    /// 正值表示搜索有助于提高修复成功率;
+    /// 负值表示搜索反而降低了修复成功率;
+    /// 零表示两者效果相同。
+    ///
+    /// 当 with_search 或 without_search 任一无数据时返回 0.0。
+    pub fn search_vs_no_search_diff(&self) -> f64 {
+        if self.checks_with_search == 0 || self.checks_without_search == 0 {
+            return 0.0;
+        }
+        self.with_search_fix_rate() - self.without_search_fix_rate()
+    }
+
+    /// 搜索是否有助于提高修复成功率
+    ///
+    /// 当 with_search 和 without_search 都有数据, 且搜索修复率 >= 不搜索修复率时返回 true。
+    pub fn is_search_beneficial(&self) -> bool {
+        if self.checks_with_search == 0 || self.checks_without_search == 0 {
+            return false;
+        }
+        self.with_search_fix_rate() >= self.without_search_fix_rate()
+    }
+
+    /// 总编译检查次数 (with + without)
+    pub fn total_checks(&self) -> usize {
+        self.checks_with_search + self.checks_without_search
+    }
+
+    /// 是否为空 (没有任何编译检查记录)
+    pub fn is_empty(&self) -> bool {
+        self.total_checks() == 0 && self.total_searches == 0
+    }
+
+    /// 是否有足够的样本进行评估
+    ///
+    /// 需要同时有 with_search 和 without_search 的数据, 且总数 >= min_samples。
+    pub fn has_sufficient_data(&self, min_samples: usize) -> bool {
+        self.checks_with_search > 0
+            && self.checks_without_search > 0
+            && self.total_checks() >= min_samples
+    }
+
+    /// 搜索成功率 (0.0 ~ 1.0)
+    ///
+    /// 无搜索数据时返回 0.0。
+    pub fn search_success_rate(&self) -> f64 {
+        if self.total_searches == 0 {
+            return 0.0;
+        }
+        self.successful_searches as f64 / self.total_searches as f64
+    }
+
+    /// 格式化为可读字符串
+    pub fn to_summary(&self) -> String {
+        format!(
+            "搜索质量: 有搜索 {} 次检查 (通过 {}), 无搜索 {} 次检查 (通过 {}), \
+             搜索修复率 {:.1}%, 无搜索修复率 {:.1}%, 差值 {:+.1}%, \
+             搜索 {} 次 (成功 {}, 失败 {})",
+            self.checks_with_search,
+            self.successes_with_search,
+            self.checks_without_search,
+            self.successes_without_search,
+            self.with_search_fix_rate() * 100.0,
+            self.without_search_fix_rate() * 100.0,
+            self.search_vs_no_search_diff() * 100.0,
+            self.total_searches,
+            self.successful_searches,
+            self.failed_searches,
+        )
+    }
+}
+
+/// 检查 CompileCheck 条目之前是否有同一任务的 WebSearch
+///
+/// 从 `idx` 位置向前搜索, 直到找到同一任务的 WebSearch (返回 true)
+/// 或遇到同一任务的另一个 CompileCheck (返回 false, 表示这是新一轮修复)
+/// 或到达列表起始 (返回 false)。
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+/// - `idx`: CompileCheck 条目的索引
+fn has_preceding_websearch(entries: &[DevTraceEntry], idx: usize) -> bool {
+    if idx == 0 || idx >= entries.len() {
+        return false;
+    }
+
+    let ref_entry = &entries[idx];
+    let ref_phase = ref_entry.phase_idx;
+    let ref_task = ref_entry.task_idx;
+
+    // 向前搜索
+    for j in (0..idx).rev() {
+        let e = &entries[j];
+        // 只匹配同一任务的条目
+        if e.phase_idx != ref_phase || e.task_idx != ref_task {
+            continue;
+        }
+        if e.action == TraceAction::WebSearch {
+            return true;
+        }
+        if e.action == TraceAction::CompileCheck {
+            // 遇到前一个 CompileCheck, 说明当前是新一轮修复, 不算
+            return false;
+        }
+    }
+
+    false
+}
+
+/// 从 DevTrace 条目列表构建搜索质量统计
+///
+/// 遍历所有条目:
+/// 1. `WebSearch` 条目 → 记录搜索尝试 (成功/失败)
+/// 2. `CompileCheck` 条目 → 检查是否有前置 `WebSearch` (同一任务)
+///    - 有 → 记录为 "with search"
+///    - 无 → 记录为 "without search"
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_search_quality_stats, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     // Task 1: 首次编译失败 (无搜索)
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(0), Some("task1"),
+///         "check", "failed", 50, false, None,
+///     ),
+///     // Task 2: 搜索后编译通过 (有搜索)
+///     DevTraceEntry::new(
+///         TraceAction::WebSearch, Some(0), Some(1), Some("task2"),
+///         "query", "result", 500, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(1), Some("task2"),
+///         "check", "passed", 50, true, None,
+///     ),
+/// ];
+/// let stats = build_search_quality_stats(&entries);
+/// assert_eq!(stats.checks_without_search, 1); // Task 1
+/// assert_eq!(stats.checks_with_search, 1);    // Task 2
+/// assert_eq!(stats.total_searches, 1);
+/// ```
+pub fn build_search_quality_stats(entries: &[DevTraceEntry]) -> SearchQualityStats {
+    entries
+        .iter()
+        .enumerate()
+        .fold(SearchQualityStats::new(), |mut acc, (idx, entry)| {
+            match entry.action {
+                TraceAction::WebSearch => {
+                    acc.record_search(entry.success);
+                }
+                TraceAction::CompileCheck => {
+                    if has_preceding_websearch(entries, idx) {
+                        acc.record_with_search(entry.success);
+                    } else {
+                        acc.record_without_search(entry.success);
+                    }
+                }
+                _ => {}
+            }
+            acc
+        })
 }
 
 // ============================================================================
@@ -1626,6 +1937,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有缓存调优记录 (未启用 CacheTuner 或无 trace 数据)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_tuning_summary: Option<CacheTuningSummary>,
+
+    /// 搜索质量统计摘要 (Session 85)
+    ///
+    /// 从 `WebSearch` + `CompileCheck` trace 条目中解析的搜索质量统计,
+    /// 比较使用搜索结果 vs 不使用搜索结果的修复成功率。
+    /// `None` 表示没有搜索质量数据 (无 WebSearch 或无 CompileCheck)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_quality_summary: Option<SearchQualityStats>,
 }
 
 impl DevTraceSummary {
@@ -1641,6 +1960,7 @@ impl DevTraceSummary {
             cache_summary: None,
             cache_fix_correlation: None,
             cache_tuning_summary: None,
+            search_quality_summary: None,
         }
     }
 
@@ -1701,6 +2021,14 @@ impl DevTraceSummary {
             Some(tuning_stats)
         };
 
+        // 从 WebSearch + CompileCheck 条目中解析搜索质量统计 (Session 85)
+        let sq_stats = build_search_quality_stats(entries);
+        let search_quality_summary = if sq_stats.is_empty() {
+            None
+        } else {
+            Some(sq_stats)
+        };
+
         Self {
             total_entries,
             total_duration_ms,
@@ -1711,6 +2039,7 @@ impl DevTraceSummary {
             cache_summary,
             cache_fix_correlation,
             cache_tuning_summary,
+            search_quality_summary,
         }
     }
 
@@ -1868,6 +2197,46 @@ impl DevTraceSummary {
                 report.push_str(&format!(
                     "  平均差值: {:+.1}%\n",
                     tuning.avg_correlation_diff() * 100.0
+                ));
+            }
+        }
+
+        // === 搜索质量评估 (Session 85) ===
+        if let Some(ref sq) = self.search_quality_summary {
+            report.push_str("\n  ── 搜索质量评估 ──\n");
+            report.push_str(&format!(
+                "  有搜索修复: {} 次检查 (通过 {})\n",
+                sq.checks_with_search, sq.successes_with_search
+            ));
+            report.push_str(&format!(
+                "  无搜索修复: {} 次检查 (通过 {})\n",
+                sq.checks_without_search, sq.successes_without_search
+            ));
+            report.push_str(&format!(
+                "  搜索次数: {} (成功 {}, 失败 {})\n",
+                sq.total_searches, sq.successful_searches, sq.failed_searches
+            ));
+            if sq.checks_with_search > 0 {
+                report.push_str(&format!(
+                    "  有搜索修复率: {:.1}%\n",
+                    sq.with_search_fix_rate() * 100.0
+                ));
+            }
+            if sq.checks_without_search > 0 {
+                report.push_str(&format!(
+                    "  无搜索修复率: {:.1}%\n",
+                    sq.without_search_fix_rate() * 100.0
+                ));
+            }
+            if sq.checks_with_search > 0 && sq.checks_without_search > 0 {
+                report.push_str(&format!(
+                    "  差值: {:+.1}% ({})\n",
+                    sq.search_vs_no_search_diff() * 100.0,
+                    if sq.is_search_beneficial() {
+                        "搜索有效"
+                    } else {
+                        "搜索效果不足"
+                    }
                 ));
             }
         }
@@ -2387,7 +2756,7 @@ mod tests {
     #[test]
     fn test_trace_action_all() {
         let all = TraceAction::all();
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), 20);
         assert!(all.contains(&TraceAction::Planning));
         assert!(all.contains(&TraceAction::TaskExecution));
         assert!(all.contains(&TraceAction::FixAttempt));
@@ -3116,7 +3485,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 19); // 所有 19 种操作类型
+        assert_eq!(entries.len(), 20); // 所有 20 种操作类型
 
         let summary = writer.summary();
         for action in TraceAction::all() {
@@ -3545,7 +3914,7 @@ mod tests {
     fn test_trace_action_performance_stats_in_all() {
         let all = TraceAction::all();
         assert!(all.contains(&TraceAction::PerformanceStats));
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), 20);
     }
 
     #[test]
@@ -3658,7 +4027,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 19); // 所有 19 种操作类型
+        assert_eq!(entries.len(), 20); // 所有 20 种操作类型
 
         // 确保 PerformanceStats 被包含
         let has_performance_stats = entries
@@ -4267,7 +4636,7 @@ mod tests {
             })
             .collect();
         let grouped = group_entries_by_action(&entries);
-        assert_eq!(grouped.len(), 19);
+        assert_eq!(grouped.len(), 20);
         for action in TraceAction::all() {
             assert!(grouped.contains_key(&action));
         }
