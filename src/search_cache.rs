@@ -508,6 +508,28 @@ impl SearchCache {
         self.ttl_secs
     }
 
+    /// 设置缓存 TTL (秒) — 用于 CacheTuner 动态调优 (Session 82)
+    ///
+    /// 更新 TTL 后, 现有缓存条目会在下次 `get` 时按新 TTL 检查是否过期。
+    /// 不会立即清除已过期的条目 (惰性淘汰)。
+    ///
+    /// # 参数
+    ///
+    /// - `ttl_secs`: 新的 TTL (秒), 0 表示永不过期
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::search_cache::SearchCache;
+    /// let mut cache = SearchCache::default_config();
+    /// assert_eq!(cache.ttl_secs(), 1800);
+    /// cache.set_ttl(900);
+    /// assert_eq!(cache.ttl_secs(), 900);
+    /// ```
+    pub fn set_ttl(&mut self, ttl_secs: u64) {
+        self.ttl_secs = ttl_secs;
+    }
+
     /// 最大缓存条目数
     pub fn max_size(&self) -> usize {
         self.max_size
@@ -1241,5 +1263,73 @@ mod tests {
             let result = cache.get(&key, ts).unwrap();
             prop_assert_eq!(result.content, content);
         });
+    }
+
+    // ===== Session 82: set_ttl 测试 =====
+
+    #[test]
+    fn test_set_ttl_changes_ttl() {
+        let mut cache = SearchCache::default_config();
+        assert_eq!(cache.ttl_secs(), 1800);
+
+        cache.set_ttl(900);
+        assert_eq!(cache.ttl_secs(), 900);
+
+        cache.set_ttl(3600);
+        assert_eq!(cache.ttl_secs(), 3600);
+    }
+
+    #[test]
+    fn test_set_ttl_to_one_second() {
+        let mut cache = SearchCache::new(100, 50);
+        cache.insert(
+            "key".into(),
+            CachedSearchEntry::with_timestamp("q".into(), "r".into(), 100, 1000),
+            1000,
+        );
+
+        // 设置 TTL=1 秒
+        cache.set_ttl(1);
+        assert_eq!(cache.ttl_secs(), 1);
+
+        // t=1000 → 0秒差 → 命中
+        assert!(cache.get("key", 1000).is_some());
+
+        // 重新插入 (上次 get 已命中)
+        // t=1002 → 2秒差 > TTL=1 → 过期
+        assert!(cache.get("key", 1002).is_none());
+    }
+
+    #[test]
+    fn test_set_ttl_affects_existing_entries() {
+        let mut cache = SearchCache::new(3600, 50); // TTL=1小时
+
+        // 插入条目 (t=1000)
+        cache.insert(
+            "key".into(),
+            CachedSearchEntry::with_timestamp("q".into(), "r".into(), 100, 1000),
+            1000,
+        );
+
+        // 在 TTL=3600 范围内, 应命中
+        assert!(cache.get("key", 4000).is_some());
+
+        // 缩短 TTL 到 100 秒
+        cache.set_ttl(100);
+
+        // 现在同样的时间差 (4000-1000=3000 > 100) 应该过期
+        // 重新插入条目 (因为上面的 get 可能已经过期移除了)
+        cache.insert(
+            "key".into(),
+            CachedSearchEntry::with_timestamp("q".into(), "r".into(), 100, 1000),
+            1000,
+        );
+
+        // t=1050 → 50秒差, 在 TTL=100 内 → 命中
+        assert!(cache.get("key", 1050).is_some());
+
+        // 重新插入 (上面的 get 命中后不会移除)
+        // t=1200 → 200秒差, 超过 TTL=100 → 过期
+        assert!(cache.get("key", 1200).is_none());
     }
 }

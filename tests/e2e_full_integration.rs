@@ -1179,11 +1179,11 @@ async fn test_strip_commands_preserves_code_all_features() {
     // 主要验证: 没有因为指令标记导致提取失败或 panic
 }
 
-/// 测试 21: TraceAction::all() 包含所有 16 种操作类型
+/// 测试 21: TraceAction::all() 包含所有 19 种操作类型
 #[test]
 fn test_all_trace_actions_present() {
     let all = TraceAction::all();
-    assert_eq!(all.len(), 18, "应有 18 种 TraceAction");
+    assert_eq!(all.len(), 19, "应有 19 种 TraceAction");
 
     // 验证包含 SlashCommand
     assert!(

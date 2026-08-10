@@ -22,10 +22,11 @@
 //! - `VersionManager` — 封装快照保存/回滚操作
 
 use crate::auto_recovery::{AutoRecovery, RecoveryConfig};
+use crate::cache_tuning::CacheTuner;
 use crate::clarify::HeuristicClarificationChecker;
 use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
-use crate::dev_trace::{DevTraceWriter, TraceAction};
+use crate::dev_trace::{build_cache_fix_correlation, DevTraceWriter, TraceAction};
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
 use crate::error_search;
 use crate::interaction::AutoApprove;
@@ -490,6 +491,13 @@ where
     /// 减少搜索延迟和带宽消耗。
     /// 基于 TTL + LRU 策略, 默认 TTL=30分钟, 最大50条。
     pub search_cache: SearchCache,
+
+    /// 缓存调优器 — 基于 CacheFixCorrelation 自动调优缓存策略 (Session 82)
+    ///
+    /// 启用后, 在每次编译检查后评估缓存命中与未命中的修复成功率差值,
+    /// 自动调整 TTL (缩短/延长) 或禁用缓存。
+    /// None 表示禁用 (默认, 向后兼容)。
+    pub cache_tuner: Option<CacheTuner>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -536,6 +544,7 @@ where
             conversation_tracker: None,
             incremental_stats: crate::dev_trace::IncrementalStats::new(),
             search_cache: SearchCache::default_config(),
+            cache_tuner: None,
         }
     }
 }
@@ -598,6 +607,7 @@ where
             conversation_tracker: self.conversation_tracker,
             incremental_stats: self.incremental_stats,
             search_cache: self.search_cache,
+            cache_tuner: self.cache_tuner,
         }
     }
 
@@ -799,6 +809,21 @@ where
     /// - `max_size`: 最大缓存条目数, 0 表示无限制
     pub fn with_search_cache_config(mut self, ttl_secs: u64, max_size: usize) -> Self {
         self.search_cache = SearchCache::new(ttl_secs, max_size);
+        self
+    }
+
+    /// 启用缓存调优器 — 自动调整缓存 TTL 或禁用缓存 (Session 82)
+    ///
+    /// 启用后, 在每次编译检查后读取 DevTrace 条目, 构建 CacheFixCorrelation,
+    /// 评估缓存命中与未命中的修复成功率差值, 自动调整 TTL 或禁用缓存。
+    ///
+    /// 需要同时启用 DevTrace (`with_dev_trace(true)`) 才能工作。
+    ///
+    /// # 参数
+    ///
+    /// - `tuner`: 已配置的 CacheTuner (含初始 TTL 和调优配置)
+    pub fn with_cache_tuner(mut self, tuner: CacheTuner) -> Self {
+        self.cache_tuner = Some(tuner);
         self
     }
 
@@ -1168,7 +1193,13 @@ where
         };
 
         // === 搜索结果缓存: 构建缓存键并检查缓存 (Session 78) ===
-        let cache_key = search_cache::build_cache_key(errors);
+        // CacheTuner 禁用缓存时, 跳过缓存查找和插入 (Session 82)
+        let cache_enabled = self.cache_tuner.as_ref().is_none_or(|t| t.is_enabled());
+        let cache_key = if cache_enabled {
+            search_cache::build_cache_key(errors)
+        } else {
+            None
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1230,6 +1261,7 @@ where
                 }
 
                 // === 搜索结果缓存: 存入缓存 (Session 78) ===
+                // cache_key 为 None 时表示缓存已禁用 (Session 82)
                 if let Some(ref key) = cache_key {
                     let entry = CachedSearchEntry::with_timestamp(
                         result.query.clone(),
@@ -1252,6 +1284,8 @@ where
                 let as_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
                 let cache_note = if cache_key.is_some() {
                     Some("编译错误自动搜索 (已缓存)")
+                } else if !cache_enabled {
+                    Some("编译错误自动搜索 (缓存已禁用)")
                 } else {
                     Some("编译错误自动搜索")
                 };
@@ -1298,6 +1332,102 @@ where
                 Ok(None)
             }
         }
+    }
+
+    /// 缓存策略自动调优 — 评估并应用缓存调优决策 (Session 82)
+    ///
+    /// 在每次编译检查后调用, 基于 DevTrace 中的 WebSearch + CompileCheck 条目
+    /// 构建 `CacheFixCorrelation`, 评估缓存命中与未命中的修复成功率差值,
+    /// 自动调整 TTL (缩短/延长) 或禁用缓存。
+    ///
+    /// ## 条件
+    ///
+    /// - `cache_tuner` 必须已启用 (否则跳过)
+    /// - `dev_trace` 必须已启用 (否则跳过, 无数据可分析)
+    ///
+    /// ## 决策应用
+    ///
+    /// - `AdjustTtl { new_ttl }` → `search_cache.set_ttl(new_ttl)`
+    /// - `DisableCache` → `search_cache.clear()` (清除缓存条目)
+    /// - `KeepCurrent` → 无操作
+    ///
+    /// # 参数
+    ///
+    /// - `phase_idx`: 阶段索引 (DevTrace)
+    /// - `task_idx`: 任务索引 (DevTrace)
+    fn evaluate_cache_tuning(&mut self, phase_idx: usize, task_idx: usize) {
+        let (tuner, trace_writer) = match (&mut self.cache_tuner, &self.dev_trace) {
+            (Some(t), Some(w)) => (t, w),
+            _ => return, // 未启用, 跳过
+        };
+
+        // 读取 DevTrace 条目, 构建缓存修复关联分析
+        let entries = match trace_writer.read_all() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("    📊 缓存调优: 读取 DevTrace 失败: {}", e);
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            debug!("    📊 缓存调优: 无 DevTrace 条目, 跳过");
+            return;
+        }
+
+        let corr = build_cache_fix_correlation(&entries);
+        let stats = self.search_cache.stats().clone();
+
+        // 评估并应用调优决策
+        let decision = tuner.evaluate_and_apply(&corr, &stats);
+
+        // 应用决策到 SearchCache
+        match &decision.action {
+            crate::cache_tuning::TuningAction::KeepCurrent => {
+                debug!("    📊 缓存调优: {}", decision.reason);
+            }
+            crate::cache_tuning::TuningAction::AdjustTtl { new_ttl } => {
+                info!(
+                    "    📊 缓存调优: 调整 TTL {}s → {}s (差值 {:+.1}%)",
+                    decision.old_ttl,
+                    new_ttl,
+                    decision.correlation_diff * 100.0
+                );
+                println!("    📊 缓存调优: TTL {}s → {}s", decision.old_ttl, new_ttl);
+                self.search_cache.set_ttl(*new_ttl);
+            }
+            crate::cache_tuning::TuningAction::DisableCache => {
+                info!(
+                    "    📊 缓存调优: 禁用缓存 (差值 {:+.1}%)",
+                    decision.correlation_diff * 100.0
+                );
+                println!(
+                    "    📊 缓存调优: 禁用缓存 ({:.1}% 差值)",
+                    decision.correlation_diff * 100.0
+                );
+                self.search_cache.clear();
+            }
+        }
+
+        // DevTrace: 记录缓存调优决策
+        let ct_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+        self.trace_dev(
+            TraceAction::CacheTuning,
+            Some(phase_idx),
+            Some(task_idx),
+            Some(&ct_task_name),
+            &format!(
+                "hit={}/{} miss={}/{}",
+                corr.successes_after_hit,
+                corr.checks_after_hit,
+                corr.successes_after_miss,
+                corr.checks_after_miss
+            ),
+            &decision.to_summary(),
+            0,
+            true,
+            Some(&decision.reason),
+        );
     }
 
     /// memory.json 路径
@@ -3196,6 +3326,11 @@ where
                 },
             );
 
+            // === 缓存策略自动调优 (Session 82) ===
+            // 在每次编译检查后评估缓存命中与未命中的修复成功率,
+            // 自动调整 TTL 或禁用缓存
+            self.evaluate_cache_tuning(phase_idx, task_idx);
+
             if check_result.success {
                 println!("    ✅ 编译成功");
 
@@ -5060,6 +5195,750 @@ mod tests {
         // 空内容应被过滤
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0], "response");
+    }
+
+    // ===== Session 82: CacheTuner 集成测试 =====
+
+    use crate::dev_trace::DevTraceEntry;
+    use crate::memory::{Phase, PhaseStatus, Task, TaskStatus};
+
+    /// 创建带 DevTrace + CacheTuner 的 Orchestrator
+    fn make_orchestrator_with_tuning<'a>(
+        chat: &'a MockChatClient,
+        workspace_dir: &'a str,
+    ) -> Orchestrator<'a, MockChatClient, MockTestRunner, MockExtractor> {
+        std::fs::create_dir_all(format!("{}/.forge", workspace_dir)).unwrap();
+        make_orchestrator(chat, workspace_dir)
+            .with_dev_trace(true)
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+    }
+
+    /// 在 memory 中添加测试 phase + task
+    fn setup_test_phase(
+        orch: &mut Orchestrator<'_, MockChatClient, MockTestRunner, MockExtractor>,
+    ) {
+        orch.memory.phases.push(Phase {
+            id: 0,
+            name: "test phase".to_string(),
+            description: "test".to_string(),
+            status: PhaseStatus::InProgress,
+            tasks: vec![Task {
+                id: "0-0".to_string(),
+                phase_id: 0,
+                name: "test task".to_string(),
+                prompt: "test".to_string(),
+                status: TaskStatus::InProgress,
+                result: None,
+                attempts: 1,
+                files_written: vec![],
+                test_result: None,
+                last_good_snapshot: None,
+                clarifications: vec![],
+                depends_on: vec![],
+            }],
+        });
+    }
+
+    /// 写入 DevTrace 条目
+    fn write_trace_entries(
+        orch: &Orchestrator<'_, MockChatClient, MockTestRunner, MockExtractor>,
+        entries: &[DevTraceEntry],
+    ) {
+        if let Some(ref writer) = orch.dev_trace {
+            for entry in entries {
+                writer.write_entry(entry).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_cache_tuner_sets_field() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // 默认 cache_tuner 为 None
+        assert!(orch.cache_tuner.is_none());
+
+        // 启用后应为 Some
+        let orch = orch.with_cache_tuner(CacheTuner::with_default_config(1800));
+        assert!(orch.cache_tuner.is_some());
+        assert!(orch.cache_tuner.as_ref().unwrap().is_enabled());
+        assert_eq!(orch.cache_tuner.as_ref().unwrap().current_ttl(), 1800);
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_noop_without_tuner() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 没有 cache_tuner, 应该是无操作
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+        assert_eq!(orch.search_cache.ttl_secs(), ttl_before);
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_noop_without_devtrace() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800));
+        setup_test_phase(&mut orch);
+
+        // 没有 dev_trace, 应该是无操作
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+        assert_eq!(orch.search_cache.ttl_secs(), ttl_before);
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_noop_with_empty_entries() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // DevTrace 为空, 应该无操作
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+        assert_eq!(orch.search_cache.ttl_secs(), ttl_before);
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_keep_current_insufficient_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入少量数据 (不足 min_samples=3)
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::WebSearch,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "query",
+                    "result",
+                    500,
+                    true,
+                    Some("编译错误自动搜索"),
+                ),
+                DevTraceEntry::new(
+                    TraceAction::CompileCheck,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "check",
+                    "passed",
+                    50,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+
+        // 数据不足, 应保持当前
+        assert_eq!(orch.search_cache.ttl_secs(), ttl_before);
+        assert!(orch.cache_tuner.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_disables_harmful_cache() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 构建数据: 缓存命中后修复率低 (0/3), 未命中后修复率高 (3/3)
+        // diff = 0% - 100% = -100% < -15% → 禁用缓存
+        let entries: Vec<DevTraceEntry> = vec![
+            // 3次缓存命中 → 全部编译失败
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "q1",
+                "r1",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0277, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                0,
+                true,
+                Some("缓存命中 (key=E0507, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+            // 3次缓存未命中 → 全部编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "q4",
+                "r4",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "q5",
+                "r5",
+                600,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "q6",
+                "r6",
+                700,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.evaluate_cache_tuning(0, 0);
+
+        // 缓存应被禁用
+        assert!(!orch.cache_tuner.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_increases_ttl_for_effective_cache() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 构建数据: 缓存命中后修复率高 (3/3), 未命中后修复率低 (1/3)
+        // diff = 100% - 33% = +67% > 5% → 延长 TTL
+        let entries: Vec<DevTraceEntry> = vec![
+            // 3次缓存命中 → 全部编译通过
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "q1",
+                "r1",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0277, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                0,
+                true,
+                Some("缓存命中 (key=E0507, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            // 3次缓存未命中 → 1次通过 2次失败
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "q4",
+                "r4",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "q5",
+                "r5",
+                600,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "q6",
+                "r6",
+                700,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+
+        // TTL 应延长 (1800 * 1.5 = 2700)
+        assert!(orch.search_cache.ttl_secs() > ttl_before);
+        assert_eq!(orch.search_cache.ttl_secs(), 2700);
+        assert!(orch.cache_tuner.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_reduces_ttl_for_slightly_harmful_cache() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 构建数据: 缓存命中后修复率低 (1/3=33%), 未命中后修复率高 (2/3=67%)
+        // diff = 33% - 67% = -33% < -5% → 缩短 TTL
+        // 但 -33% < -15% → 实际应该禁用, 让我调整为略差
+        // diff = -10% → 缩短 TTL (在 -15% 和 -5% 之间)
+        // hit: 2/3=67%, miss: 3/3=100%, diff = -33% → 这会禁用
+        // 调整: hit: 2/3=67%, miss: 2/3=67% → diff=0 → 保持
+        // 调整: hit: 2/4=50%, miss: 3/4=75% → diff=-25% → 禁用
+        // 需要 diff 在 [-15%, -5%) 之间
+        // hit: 2/3=67%, miss: 3/4=75% → diff=-8% → 缩短 TTL
+        let entries: Vec<DevTraceEntry> = vec![
+            // 3次缓存命中 → 2次通过 1次失败 (67%)
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "q1",
+                "r1",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "q2",
+                "r2",
+                0,
+                true,
+                Some("缓存命中 (key=E0277, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "q3",
+                "r3",
+                0,
+                true,
+                Some("缓存命中 (key=E0507, 原始耗时=500ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+            // 4次缓存未命中 → 3次通过 1次失败 (75%)
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "q4",
+                "r4",
+                500,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "q5",
+                "r5",
+                600,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(4),
+                Some("task5"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "q6",
+                "r6",
+                700,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(5),
+                Some("task6"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(6),
+                Some("task7"),
+                "q7",
+                "r7",
+                800,
+                true,
+                Some("编译错误自动搜索"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(6),
+                Some("task7"),
+                "check",
+                "failed",
+                50,
+                false,
+                Some("error"),
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        let ttl_before = orch.search_cache.ttl_secs();
+        orch.evaluate_cache_tuning(0, 0);
+
+        // diff = 67% - 75% = -8% → 在 [-15%, -5%) 之间 → 缩短 TTL
+        // 1800 * 0.5 = 900
+        assert!(orch.search_cache.ttl_secs() < ttl_before);
+        assert_eq!(orch.search_cache.ttl_secs(), 900);
+        assert!(orch.cache_tuner.as_ref().unwrap().is_enabled());
+    }
+
+    #[test]
+    fn test_evaluate_cache_tuning_writes_devtrace_entry() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入一些数据
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::WebSearch,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "q",
+                    "r",
+                    500,
+                    true,
+                    Some("编译错误自动搜索"),
+                ),
+                DevTraceEntry::new(
+                    TraceAction::CompileCheck,
+                    Some(0),
+                    Some(0),
+                    Some("task"),
+                    "check",
+                    "passed",
+                    50,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        // 调用 evaluate_cache_tuning
+        orch.evaluate_cache_tuning(0, 0);
+
+        // 验证 DevTrace 中新增了 CacheTuning 条目
+        let entries = orch.dev_trace.as_ref().unwrap().read_all().unwrap();
+        let tuning_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.action == TraceAction::CacheTuning)
+            .collect();
+        assert_eq!(tuning_entries.len(), 1);
+        assert!(tuning_entries[0].success);
+    }
+
+    #[test]
+    fn test_cache_disabled_after_tuning_skips_cache_in_search() {
+        // 验证当 cache_tuner 禁用缓存后, auto_search_error_solutions 不使用缓存
+        // 这里间接测试: 禁用后 search_cache 中不应有新条目插入
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动禁用缓存
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let mut corr = crate::dev_trace::CacheFixCorrelation::new();
+            // 填入足够的负面数据来禁用
+            corr.record_hit_check(false);
+            corr.record_hit_check(false);
+            corr.record_hit_check(false);
+            corr.record_miss_check(true);
+            corr.record_miss_check(true);
+            corr.record_miss_check(true);
+            let stats = orch.search_cache.stats().clone();
+            tuner.evaluate_and_apply(&corr, &stats);
+        }
+
+        // 验证缓存已被禁用
+        assert!(!orch.cache_tuner.as_ref().unwrap().is_enabled());
+
+        // 验证 cache_enabled 逻辑: 当 tuner 禁用时, cache_key 应为 None
+        // (这里间接验证: search_cache 不应被使用)
+        let cache_enabled = orch.cache_tuner.as_ref().is_none_or(|t| t.is_enabled());
+        assert!(!cache_enabled);
+    }
+
+    #[test]
+    fn test_with_clarification_preserves_cache_tuner() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800));
+
+        // with_clarification 应保留 cache_tuner
+        let orch2 = orch.with_clarification(HeuristicClarificationChecker::new());
+        assert!(orch2.cache_tuner.is_some());
+        assert_eq!(orch2.cache_tuner.as_ref().unwrap().current_ttl(), 1800);
     }
 }
 

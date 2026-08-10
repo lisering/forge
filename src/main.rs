@@ -4,6 +4,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use forge::browser_launcher::{self, BrowserLauncher};
+use forge::cache_tuning::CacheTuner;
 use forge::cdp;
 use forge::chat::TimeoutConfig;
 use forge::clarify::HeuristicClarificationChecker;
@@ -1172,6 +1173,13 @@ where
         } else {
             orch = orch.with_dev_trace_backend(trace_backend);
         }
+    }
+
+    // Session 82: 启用缓存调优器 (需要 DevTrace 数据)
+    // 当 DevTrace 启用时自动启用 CacheTuner, 基于编译修复成功率自动调整缓存策略
+    if dev_trace {
+        let current_ttl = orch.search_cache.ttl_secs();
+        orch = orch.with_cache_tuner(CacheTuner::with_default_config(current_ttl));
     }
 
     // Session 69: 集成 HandlerChain 回调处理器链
