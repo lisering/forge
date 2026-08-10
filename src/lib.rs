@@ -139,9 +139,9 @@ pub use context_handoff::{
 pub use deadline::{no_deadline, Deadline};
 pub use dev_trace::{
     build_timeline, calculate_success_rate, format_action_stats_line, format_duration_human,
-    format_success_rate_percent, format_timeline_line, group_entries_by_action, parse_jsonl_line,
-    ActionStats, DevTraceEntry, DevTraceSummary, DevTraceWriter, IncrementalStats, TimelineEntry,
-    TraceAction,
+    format_success_rate_percent, format_timeline_line, group_entries_by_action,
+    parse_incremental_entry, parse_jsonl_line, ActionStats, DevTraceEntry, DevTraceSummary,
+    DevTraceWriter, IncrementalStats, TimelineEntry, TraceAction,
 };
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,

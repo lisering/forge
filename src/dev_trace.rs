@@ -414,6 +414,61 @@ impl ActionStats {
 }
 
 // ============================================================================
+//  纯逻辑函数 — 增量发送解析 (Session 76)
+// ============================================================================
+
+/// 从 `IncrementalSend` trace 条目的 `input_summary` 中解析 `(total, sent, skipped)`。
+///
+/// `input_summary` 格式由 Orchestrator 的 `send_with_continuation` 写入:
+/// - `"total=5, sent=2, skipped=3"` (正常增量发送)
+/// - `"[全部跳过] total=5, sent=0, skipped=5"` (全部跳过)
+///
+/// 解析失败时返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::parse_incremental_entry;
+/// // 正常格式
+/// assert_eq!(parse_incremental_entry("total=5, sent=2, skipped=3"), Some((5, 2, 3)));
+///
+/// // 带前缀的格式
+/// assert_eq!(parse_incremental_entry("[全部跳过] total=5, sent=0, skipped=5"), Some((5, 0, 5)));
+///
+/// // 格式错误
+/// assert_eq!(parse_incremental_entry("not a valid format"), None);
+/// assert_eq!(parse_incremental_entry(""), None);
+/// ```
+pub fn parse_incremental_entry(input_summary: &str) -> Option<(usize, usize, usize)> {
+    let total = parse_number_after(input_summary, "total")?;
+    let sent = parse_number_after(input_summary, "sent")?;
+    let skipped = parse_number_after(input_summary, "skipped")?;
+    Some((total, sent, skipped))
+}
+
+/// 从字符串中查找 `key` 后面的数字并解析。
+///
+/// 在 `text` 中查找 `key` 的位置, 然后跳过可选空格和 `=` 号,
+/// 再跳过可选空格, 读取连续的数字字符并解析为 `usize`。
+///
+/// 支持 `"total=5"` 和 `"total = 5"` 两种格式。
+fn parse_number_after(text: &str, key: &str) -> Option<usize> {
+    let pos = text.find(key)?;
+    let after_key = &text[pos + key.len()..];
+    // 跳过可选空格、= 号、再跳过可选空格
+    let rest: &str = after_key.trim_start();
+    let rest = rest.strip_prefix('=')?;
+    let rest = rest.trim_start();
+    // 读取连续的数字字符
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+// ============================================================================
 //  纯逻辑函数 — 格式化
 // ============================================================================
 
@@ -536,6 +591,12 @@ pub struct DevTraceSummary {
     pub success_rate: f64,
     /// 简化时间线 (最近 100 条)
     pub timeline: Vec<TimelineEntry>,
+    /// 增量发送统计摘要 (Session 76)
+    ///
+    /// 从 `IncrementalSend` trace 条目中解析的累计统计。
+    /// `None` 表示没有增量发送记录 (未启用增量发送或无 trace 数据)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_summary: Option<IncrementalStats>,
 }
 
 impl DevTraceSummary {
@@ -547,10 +608,15 @@ impl DevTraceSummary {
             by_action: HashMap::new(),
             success_rate: 0.0,
             timeline: vec![],
+            incremental_summary: None,
         }
     }
 
     /// 从 trace 条目列表构建摘要
+    ///
+    /// 除了常规统计外, 还会从 `IncrementalSend` 条目中解析
+    /// 增量发送的累计统计 (total/sent/skipped), 用于报告中的
+    /// 增量发送效果可视化 (Session 76)。
     pub fn from_entries(entries: &[DevTraceEntry]) -> Self {
         let total_entries = entries.len();
         let total_duration_ms: u64 = entries.iter().map(|e| e.duration_ms).sum();
@@ -559,12 +625,33 @@ impl DevTraceSummary {
         let by_action = group_entries_by_action(entries);
         let timeline = build_timeline(entries, 100);
 
+        // 从 IncrementalSend 条目中解析累计增量发送统计
+        let incremental_stats = entries
+            .iter()
+            .filter(|e| e.action == TraceAction::IncrementalSend)
+            .filter_map(|e| parse_incremental_entry(&e.input_summary))
+            .fold(
+                IncrementalStats::new(),
+                |mut acc, (total, sent, _skipped)| {
+                    acc.record(total, sent);
+                    acc
+                },
+            );
+
+        // 只在有增量发送记录时才包含
+        let incremental_summary = if incremental_stats.send_count > 0 {
+            Some(incremental_stats)
+        } else {
+            None
+        };
+
         Self {
             total_entries,
             total_duration_ms,
             by_action,
             success_rate,
             timeline,
+            incremental_summary,
         }
     }
 
@@ -595,6 +682,33 @@ impl DevTraceSummary {
             if let Some(stats) = self.by_action.get(&action) {
                 report.push_str(&format_action_stats_line(action, stats));
             }
+        }
+
+        // === 增量发送统计 (Session 76) ===
+        if let Some(ref inc_stats) = self.incremental_summary {
+            report.push_str("\n  ── 增量发送统计 ──\n");
+            report.push_str(&format!("  发送次数: {}\n", inc_stats.send_count));
+            report.push_str(&format!(
+                "  总消息: {} 条 (含重复)\n",
+                inc_stats.total_messages
+            ));
+            report.push_str(&format!(
+                "  实际发送: {} 条 (增量)\n",
+                inc_stats.sent_messages
+            ));
+            report.push_str(&format!(
+                "  跳过: {} 条 (已发送, 复用)\n",
+                inc_stats.skipped_messages
+            ));
+            report.push_str(&format!(
+                "  节省比例: {:.1}%\n",
+                inc_stats.saved_ratio() * 100.0
+            ));
+            report.push_str(&format!(
+                "  平均每次: 总 {:.1} 条, 实发 {:.1} 条\n",
+                inc_stats.avg_messages_per_send(),
+                inc_stats.avg_sent_per_send()
+            ));
         }
 
         if !self.timeline.is_empty() {
@@ -3822,5 +3936,274 @@ mod tests {
         assert_eq!(summary.total_entries, 1);
         let report = summary.to_report();
         assert!(report.contains("增量发送"));
+    }
+
+    // ===== Session 76: 增量发送效果可视化 测试 =====
+
+    #[test]
+    fn test_parse_incremental_entry_normal() {
+        assert_eq!(
+            parse_incremental_entry("total=5, sent=2, skipped=3"),
+            Some((5, 2, 3))
+        );
+    }
+
+    #[test]
+    fn test_parse_incremental_entry_with_prefix() {
+        assert_eq!(
+            parse_incremental_entry("[全部跳过] total=10, sent=0, skipped=10"),
+            Some((10, 0, 10))
+        );
+    }
+
+    #[test]
+    fn test_parse_incremental_entry_large_numbers() {
+        assert_eq!(
+            parse_incremental_entry("total=100000, sent=50000, skipped=50000"),
+            Some((100000, 50000, 50000))
+        );
+    }
+
+    #[test]
+    fn test_parse_incremental_entry_malformed() {
+        assert_eq!(parse_incremental_entry("not a valid format"), None);
+        assert_eq!(parse_incremental_entry(""), None);
+        assert_eq!(
+            parse_incremental_entry("total=abc, sent=2, skipped=3"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_incremental_entry_missing_fields() {
+        assert_eq!(parse_incremental_entry("total=5, sent=2"), None);
+        assert_eq!(parse_incremental_entry("sent=2, skipped=3"), None);
+        assert_eq!(parse_incremental_entry("total=5"), None);
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_none_without_entries() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::FixAttempt, false),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.incremental_summary.is_none());
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_from_single_entry() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "total=10, sent=3, skipped=7",
+            "response",
+            500,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let inc = summary.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 1);
+        assert_eq!(inc.total_messages, 10);
+        assert_eq!(inc.sent_messages, 3);
+        assert_eq!(inc.skipped_messages, 7);
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_from_multiple_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=5, sent=5, skipped=0",
+                "resp1",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=5, sent=2, skipped=3",
+                "resp2",
+                200,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "[全部跳过] total=3, sent=0, skipped=3",
+                "",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let inc = summary.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 3);
+        assert_eq!(inc.total_messages, 13); // 5 + 5 + 3
+        assert_eq!(inc.sent_messages, 7); // 5 + 2 + 0
+        assert_eq!(inc.skipped_messages, 6); // 0 + 3 + 3
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_mixed_entries() {
+        // IncrementalSend 条目和其他类型混合
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=10, sent=7, skipped=3",
+                "response",
+                300,
+                true,
+                None,
+            ),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert_eq!(summary.total_entries, 3); // 3 entries total
+        let inc = summary.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 1);
+        assert_eq!(inc.total_messages, 10);
+        assert_eq!(inc.sent_messages, 7);
+        assert_eq!(inc.skipped_messages, 3);
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_empty_stats() {
+        let entries: Vec<DevTraceEntry> = vec![];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.incremental_summary.is_none());
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_malformed_entry_ignored() {
+        // 格式错误的 IncrementalSend 条目应被跳过
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "malformed input",
+            "response",
+            100,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        // 格式错误 → send_count == 0 → None
+        assert!(summary.incremental_summary.is_none());
+    }
+
+    #[test]
+    fn test_to_report_includes_incremental_stats() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "total=20, sent=5, skipped=15",
+            "response",
+            1000,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("增量发送统计"));
+        assert!(report.contains("发送次数: 1"));
+        assert!(report.contains("总消息: 20 条"));
+        assert!(report.contains("实际发送: 5 条"));
+        assert!(report.contains("跳过: 15 条"));
+        assert!(report.contains("节省比例"));
+        assert!(report.contains("75.0%")); // 15/20 = 75%
+    }
+
+    #[test]
+    fn test_to_report_no_incremental_section_when_none() {
+        let entries = vec![make_entry(TraceAction::TaskExecution, true)];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("增量发送统计"));
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_serde_roundtrip() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "total=10, sent=7, skipped=3",
+            "response",
+            500,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: DevTraceSummary = serde_json::from_str(&json).unwrap();
+
+        let inc = deserialized.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 1);
+        assert_eq!(inc.total_messages, 10);
+        assert_eq!(inc.sent_messages, 7);
+        assert_eq!(inc.skipped_messages, 3);
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        // incremental_summary 为 None 时应被 skip
+        assert!(!json.contains("incremental_summary"));
+    }
+
+    #[test]
+    fn test_parse_incremental_entry_extra_whitespace() {
+        assert_eq!(
+            parse_incremental_entry("total = 5, sent = 2, skipped = 3"),
+            Some((5, 2, 3))
+        );
+    }
+
+    #[test]
+    fn test_summary_incremental_summary_with_all_skipped_entry() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "[全部跳过] total=5, sent=0, skipped=5",
+            "",
+            0,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let inc = summary.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 1);
+        assert_eq!(inc.total_messages, 5);
+        assert_eq!(inc.sent_messages, 0);
+        assert_eq!(inc.skipped_messages, 5);
+        assert!((inc.saved_ratio() - 1.0).abs() < 0.001); // 100% saved
     }
 }

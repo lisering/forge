@@ -975,6 +975,102 @@ where
         &self.incremental_stats
     }
 
+    /// 从 Memory 对话历史构建消息列表 (Task 5 — 多轮对话增量优化)
+    ///
+    /// 提取最近 `recent_count` 条对话, 构建为消息列表。
+    /// 结合 `send_with_continuation` 使用, 可实现增量发送:
+    /// - 已发送的对话消息会被增量跟踪跳过
+    /// - 只发送新增的对话消息 + 当前 prompt
+    ///
+    /// # 设计理念
+    ///
+    /// 在多轮修复中, AI 的对话历史已经在上下文中。
+    /// 将历史消息加入消息列表后, 增量跟踪会自动跳过已发送的部分,
+    /// 避免重复发送相同的上下文。
+    ///
+    /// # 参数
+    ///
+    /// - `recent_count`: 提取最近多少条对话 (0 = 不提取)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::orchestrator::Orchestrator;
+    /// # // build_messages_from_memory 是内部方法, 此处仅展示概念
+    /// # // let messages = orch.build_messages_from_memory(3);
+    /// # // assert!(messages.len() <= 3);
+    /// ```
+    #[allow(dead_code)] // Task 5 基础设施: 未来在 send_attempt_prompt 中集成
+    fn build_messages_from_memory(&self, recent_count: usize) -> Vec<String> {
+        if recent_count == 0 {
+            return vec![];
+        }
+        let conversations = &self.memory.conversations;
+        let start = conversations.len().saturating_sub(recent_count);
+        conversations[start..]
+            .iter()
+            .filter(|c| !c.content.is_empty())
+            .map(|c| c.content.clone())
+            .collect()
+    }
+
+    /// 发送尝试 prompt — 支持增量发送 (Task 3 — send_with_continuation 实际调用)
+    ///
+    /// 在 `execute_task` 的修复循环中替代 `send_message_safe`:
+    ///
+    /// ## 增量跟踪启用时 (live_continuation 或 conversation_tracker)
+    ///
+    /// - **首次尝试** (attempt == 1):
+    ///   构建 `[steered_prompt]` 单条消息列表 → 全量发送
+    /// - **修复轮次** (attempt > 1):
+    ///   构建 `[first_prompt, fix_prompt]` 消息列表 →
+    ///   `first_prompt` 已发送过被跳过, 只发送 `fix_prompt`
+    ///
+    /// 这样系统提示 + 上下文 + 任务 prompt 等稳定部分在修复轮次中被跳过,
+    /// 只发送变化的修复 prompt, 大幅减少 token 消耗。
+    ///
+    /// ## 增量跟踪未启用时 (向后兼容)
+    ///
+    /// 退化为 `send_message_safe`, 行为与之前完全一致。
+    ///
+    /// # 参数
+    ///
+    /// - `steered_prompt`: 经转向提醒处理后的 prompt
+    /// - `first_prompt`: 首次尝试的 prompt (用于修复轮次的增量跳过)
+    ///   `None` 表示尚未存储首次 prompt
+    /// - `is_fix`: 是否为修复轮次 (attempt > 1)
+    /// - `timeout`: 发送超时 (秒)
+    async fn send_attempt_prompt(
+        &mut self,
+        steered_prompt: &str,
+        first_prompt: &Option<String>,
+        is_fix: bool,
+        timeout: u64,
+    ) -> Result<crate::traits::ChatResult> {
+        if self.live_continuation.is_some() || self.conversation_tracker.is_some() {
+            // 构建增量发送的消息列表
+            let messages = if is_fix {
+                if let Some(ref first) = first_prompt {
+                    // 修复轮: [首次完整 prompt, 修复 prompt]
+                    // 首次 prompt 已发送过 → 增量跟踪跳过, 只发送修复 prompt
+                    vec![first.clone(), steered_prompt.to_string()]
+                } else {
+                    // 首次 prompt 未存储 (如上下文衔接后), 全量发送
+                    vec![steered_prompt.to_string()]
+                }
+            } else {
+                // 首次尝试: [完整 prompt] → 全量发送
+                vec![steered_prompt.to_string()]
+            };
+
+            // 通过 send_with_continuation 发送 (自动计算增量 + 更新统计 + DevTrace)
+            self.send_with_continuation(&messages, timeout).await
+        } else {
+            // 向后兼容: 增量跟踪未启用, 直接发送
+            self.send_message_safe(steered_prompt, timeout).await
+        }
+    }
+
     /// memory.json 路径
     fn memory_path(&self) -> std::path::PathBuf {
         self.workspace.root.join(".forge").join("memory.json")
@@ -2576,6 +2672,11 @@ where
         const MAX_NETWORK_ERROR_SKIPS: u32 = 5;
         let mut network_error_skips: u32 = 0;
 
+        // === 增量发送: 存储首次尝试的 prompt (Task 3) ===
+        // 修复轮次中, first_attempt_prompt 已发送过会被增量跟踪跳过,
+        // 只发送修复 prompt, 减少 token 消耗。
+        let mut first_attempt_prompt: Option<String> = None;
+
         let mut attempt = 1u32;
         while attempt <= self.max_rounds_per_task {
             self.memory.phases[phase_idx].tasks[task_idx].attempts = attempt;
@@ -2679,9 +2780,21 @@ where
             self.memory
                 .add_conversation("user", &attempt_prompt, Some(&task_id));
             let steered_prompt = self.maybe_steer_reminder(&attempt_prompt);
+
+            // === 增量发送集成 (Task 3) ===
+            // 首次尝试后存储 steered_prompt, 修复轮次中用于增量跳过
+            if attempt == 1 {
+                first_attempt_prompt = Some(steered_prompt.clone());
+            }
+
             let msg_start = Instant::now();
             let result = self
-                .send_message_safe(&steered_prompt, self.timeout_secs)
+                .send_attempt_prompt(
+                    &steered_prompt,
+                    &first_attempt_prompt,
+                    attempt > 1,
+                    self.timeout_secs,
+                )
                 .await?;
             let msg_duration = msg_start.elapsed().as_millis() as u64;
 
@@ -4458,6 +4571,232 @@ mod tests {
         assert_eq!(result.text, "resp2");
         // 两次 send_message 调用 (重置后全量发送)
         assert_eq!(chat.sent_messages().len(), 2);
+    }
+
+    // ===== Session 76: send_attempt_prompt + build_messages_from_memory 测试 =====
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_no_incremental() {
+        // 未启用增量跟踪时, send_attempt_prompt 退化为 send_message_safe
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let result = orch
+            .send_attempt_prompt("test prompt", &None, false, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "AI response");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "test prompt");
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_first_attempt() {
+        // 首次尝试: 全量发送
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1", "AI response 2"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        // 首次尝试
+        let result = orch
+            .send_attempt_prompt("first prompt", &None, false, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "AI response 1");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "first prompt");
+        // 统计: total=1, sent=1 (全量, 无增量优化)
+        assert_eq!(orch.incremental_stats().total_messages, 1);
+        assert_eq!(orch.incremental_stats().sent_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_fix_attempt() {
+        // 修复轮次: first_prompt 被跳过, 只发送 fix_prompt
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1", "AI response 2"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        // 首次尝试
+        orch.send_attempt_prompt("first prompt", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复轮次: first_prompt 已发送过 → 跳过, 只发送 fix_prompt
+        let first_prompt = Some("first prompt".to_string());
+        let result = orch
+            .send_attempt_prompt("fix prompt", &first_prompt, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "AI response 2");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 2); // 两次 send_message
+        assert_eq!(sent[1], "fix prompt"); // 第二次只发送了 fix_prompt
+
+        // 统计: total=3 (1+2), sent=2 (1+1), skipped=1
+        assert_eq!(orch.incremental_stats().total_messages, 3);
+        assert_eq!(orch.incremental_stats().sent_messages, 2);
+        assert_eq!(orch.incremental_stats().skipped_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_fix_without_first() {
+        // 修复轮次但 first_prompt 为 None: 全量发送 (如上下文衔接后)
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        let result = orch
+            .send_attempt_prompt("fix prompt", &None, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "AI response");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "fix prompt");
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_with_conversation_tracker() {
+        // 启用 conversation_tracker (Radix Tree) + live_continuation
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_conversation_tracker();
+
+        // 首次
+        orch.send_attempt_prompt("full prompt", &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复: full prompt 已发送 → 跳过
+        let first = Some("full prompt".to_string());
+        let result = orch
+            .send_attempt_prompt("fix prompt", &first, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "resp2");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], "fix prompt");
+        assert_eq!(orch.incremental_stats().skipped_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_attempt_prompt_multiple_fix_rounds() {
+        // 多轮修复: 第一次修复跳过 first_prompt, 后续修复也跳过
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2", "resp3"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        // 首次
+        let first = "first prompt".to_string();
+        orch.send_attempt_prompt(&first, &None, false, 30)
+            .await
+            .unwrap();
+
+        // 修复1
+        let first_opt = Some(first.clone());
+        orch.send_attempt_prompt("fix1", &first_opt, true, 30)
+            .await
+            .unwrap();
+
+        // 修复2: first_prompt 仍然会被跳过
+        let result = orch
+            .send_attempt_prompt("fix2", &first_opt, true, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "resp3");
+        // 3次 send_message 调用
+        assert_eq!(chat.sent_messages().len(), 3);
+        assert_eq!(chat.sent_messages()[1], "fix1");
+        assert_eq!(chat.sent_messages()[2], "fix2");
+    }
+
+    #[test]
+    fn test_build_messages_from_memory_empty() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // Memory 无对话
+        let messages = orch.build_messages_from_memory(3);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_build_messages_from_memory_with_conversations() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // 添加对话
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+        orch.memory
+            .add_conversation("assistant", "hi there", Some("0-0"));
+        orch.memory.add_conversation("user", "do task", Some("0-0"));
+
+        // 提取最近 2 条
+        let messages = orch.build_messages_from_memory(2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], "hi there");
+        assert_eq!(messages[1], "do task");
+    }
+
+    #[test]
+    fn test_build_messages_from_memory_count_zero() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+
+        let messages = orch.build_messages_from_memory(0);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_build_messages_from_memory_more_than_available() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        orch.memory.add_conversation("user", "hello", Some("0-0"));
+
+        // 请求 10 条但只有 1 条
+        let messages = orch.build_messages_from_memory(10);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "hello");
+    }
+
+    #[test]
+    fn test_build_messages_from_memory_skips_empty_content() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        orch.memory.add_conversation("user", "", Some("0-0"));
+        orch.memory
+            .add_conversation("assistant", "response", Some("0-0"));
+
+        let messages = orch.build_messages_from_memory(2);
+        // 空内容应被过滤
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "response");
     }
 }
 
