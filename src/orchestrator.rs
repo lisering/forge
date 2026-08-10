@@ -2280,6 +2280,29 @@ where
             .join("error_history.json");
         self.error_history.history_path = Some(error_history_path.clone());
 
+        // === 加载缓存调优历史 (Session 84) ===
+        // 如果启用了 cache_tuner, 尝试从 .forge/cache_tuning_history.json 恢复
+        if let Some(ref tuner) = self.cache_tuner {
+            let config = tuner.config().clone();
+            let default_ttl = tuner.current_ttl();
+            if let Some(loaded_tuner) =
+                CacheTuner::load_from_workspace(&self.workspace.root, config, default_ttl)
+            {
+                let new_ttl = loaded_tuner.current_ttl();
+                let enabled = loaded_tuner.is_enabled();
+                self.cache_tuner = Some(loaded_tuner);
+                // 同步 search_cache 的 TTL 和状态
+                self.search_cache.set_ttl(new_ttl);
+                if !enabled {
+                    // 历史显示缓存被禁用, 清除当前缓存
+                    self.search_cache.clear();
+                    println!("  📊 缓存调优: 从历史恢复 (缓存已禁用)");
+                } else if new_ttl != default_ttl {
+                    println!("  📊 缓存调优: 从历史恢复 TTL={}s", new_ttl);
+                }
+            }
+        }
+
         let memory_path = self.memory_path();
 
         // ========== 断点恢复检查 ==========
@@ -2424,6 +2447,21 @@ where
         let report_path = self.workspace.root.join("FORGE_REPORT.md");
         std::fs::write(&report_path, self.memory.execution_report())?;
         println!("报告已保存: {}", report_path.display());
+
+        // === 保存缓存调优历史 (Session 84) ===
+        if let Some(ref tuner) = self.cache_tuner {
+            match tuner.save_to_workspace(&self.workspace.root) {
+                Ok(()) => {
+                    let h = tuner.to_history();
+                    if !h.is_empty() {
+                        println!("\n  📊 缓存调优历史已保存: {}", h.to_summary());
+                    }
+                }
+                Err(e) => {
+                    warn!("保存缓存调优历史失败: {}", e);
+                }
+            }
+        }
 
         // === DevTrace: 打印追踪摘要 (借鉴方向 4) ===
         if let Some(ref trace) = self.dev_trace {
@@ -5939,6 +5977,294 @@ mod tests {
         let orch2 = orch.with_clarification(HeuristicClarificationChecker::new());
         assert!(orch2.cache_tuner.is_some());
         assert_eq!(orch2.cache_tuner.as_ref().unwrap().current_ttl(), 1800);
+    }
+
+    // ===== Session 84: CacheTuner 持久化集成测试 =====
+
+    #[test]
+    fn test_final_report_saves_cache_tuning_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 调用 final_report
+        orch.final_report().unwrap();
+
+        // 验证历史文件已创建
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        assert!(history_path.exists(), "缓存调优历史文件应存在");
+
+        // 验证可以加载
+        let loaded = crate::cache_tuning::CacheTuningHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 1800);
+        assert!(loaded.saved_at.is_some()); // final_report 保存时添加时间戳
+    }
+
+    #[test]
+    fn test_final_report_saves_adjusted_ttl() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动调整 TTL
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "测试延长");
+            tuner.apply_decision(&decision);
+        }
+
+        orch.final_report().unwrap();
+
+        // 验证保存的 TTL
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        let loaded = crate::cache_tuning::CacheTuningHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert_eq!(loaded.adjustment_count, 1);
+        assert_eq!(loaded.decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_final_report_saves_disabled_state() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动禁用缓存
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::disable_cache(1800, -0.2, "有害");
+            tuner.apply_decision(&decision);
+        }
+
+        orch.final_report().unwrap();
+
+        // 验证保存的禁用状态
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        let loaded = crate::cache_tuning::CacheTuningHistory::load(&history_path).unwrap();
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.disable_count, 1);
+    }
+
+    #[test]
+    fn test_final_report_no_save_without_tuner() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 没有 cache_tuner
+        assert!(orch.cache_tuner.is_none());
+
+        orch.final_report().unwrap();
+
+        // 不应创建历史文件
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        assert!(!history_path.exists());
+    }
+
+    #[test]
+    fn test_final_report_empty_tuner_no_decisions() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // tuner 存在但没有决策
+        assert!(orch.cache_tuner.as_ref().unwrap().decisions().is_empty());
+
+        orch.final_report().unwrap();
+
+        // 文件应存在 (即使没有决策, 也保存状态)
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        assert!(history_path.exists());
+
+        let loaded = crate::cache_tuning::CacheTuningHistory::load(&history_path).unwrap();
+        assert!(loaded.is_empty()); // 无决策
+        assert_eq!(loaded.current_ttl, 1800); // TTL 保持默认
+    }
+
+    #[test]
+    fn test_load_history_restores_ttl_in_orchestrator() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 先保存一个历史 (TTL=2700)
+        let history = crate::cache_tuning::CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            enabled: true,
+            adjustment_count: 1,
+            disable_count: 0,
+            decisions: vec![crate::cache_tuning::CacheTuningDecision::adjust_ttl(
+                1800, 2700, 0.33, "延长",
+            )],
+            saved_at: None,
+        };
+        history.save_to_workspace(dir.path()).unwrap();
+
+        // 创建 orchestrator (默认 TTL=1800)
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+
+        // 模拟 run() 中的加载逻辑
+        if let Some(ref tuner) = orch.cache_tuner {
+            let config = tuner.config().clone();
+            let default_ttl = tuner.current_ttl();
+            if let Some(loaded_tuner) =
+                CacheTuner::load_from_workspace(&orch.workspace.root, config, default_ttl)
+            {
+                let new_ttl = loaded_tuner.current_ttl();
+                let enabled = loaded_tuner.is_enabled();
+                orch.cache_tuner = Some(loaded_tuner);
+                orch.search_cache.set_ttl(new_ttl);
+                if !enabled {
+                    orch.search_cache.clear();
+                }
+            }
+        }
+
+        // 验证从历史恢复
+        assert_eq!(orch.cache_tuner.as_ref().unwrap().current_ttl(), 2700);
+        assert_eq!(orch.cache_tuner.as_ref().unwrap().initial_ttl(), 2700);
+        assert!(orch.cache_tuner.as_ref().unwrap().is_enabled());
+        // search_cache 的 TTL 也应同步
+        assert_eq!(orch.search_cache.ttl_secs(), 2700);
+    }
+
+    #[test]
+    fn test_load_history_restores_disabled_in_orchestrator() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 保存一个禁用状态的历史
+        let history = crate::cache_tuning::CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 1800,
+            enabled: false,
+            adjustment_count: 0,
+            disable_count: 1,
+            decisions: vec![crate::cache_tuning::CacheTuningDecision::disable_cache(
+                1800, -0.2, "有害",
+            )],
+            saved_at: None,
+        };
+        history.save_to_workspace(dir.path()).unwrap();
+
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+
+        // 模拟 run() 中的加载逻辑
+        if let Some(ref tuner) = orch.cache_tuner {
+            let config = tuner.config().clone();
+            let default_ttl = tuner.current_ttl();
+            if let Some(loaded_tuner) =
+                CacheTuner::load_from_workspace(&orch.workspace.root, config, default_ttl)
+            {
+                let new_ttl = loaded_tuner.current_ttl();
+                let enabled = loaded_tuner.is_enabled();
+                orch.cache_tuner = Some(loaded_tuner);
+                orch.search_cache.set_ttl(new_ttl);
+                if !enabled {
+                    orch.search_cache.clear();
+                }
+            }
+        }
+
+        // 验证禁用状态被恢复
+        assert!(!orch.cache_tuner.as_ref().unwrap().is_enabled());
+        assert_eq!(orch.cache_tuner.as_ref().unwrap().current_ttl(), 1800);
+    }
+
+    #[test]
+    fn test_load_history_preserves_config_in_orchestrator() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 保存一个空历史
+        let history = crate::cache_tuning::CacheTuningHistory::new();
+        history.save_to_workspace(dir.path()).unwrap();
+
+        // 用 aggressive 配置创建 orchestrator
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_cache_tuner(
+            CacheTuner::new(crate::cache_tuning::CacheTuningConfig::aggressive(), 1800),
+        );
+
+        // 模拟加载
+        if let Some(ref tuner) = orch.cache_tuner {
+            let config = tuner.config().clone();
+            let default_ttl = tuner.current_ttl();
+            if let Some(loaded_tuner) =
+                CacheTuner::load_from_workspace(&orch.workspace.root, config, default_ttl)
+            {
+                orch.cache_tuner = Some(loaded_tuner);
+            }
+        }
+
+        // 验证配置被保留 (aggressive 的 min_samples=2)
+        let tuner = orch.cache_tuner.as_ref().unwrap();
+        assert_eq!(tuner.config().min_samples, 2);
+        assert_eq!(tuner.config().disable_threshold, -0.05);
+    }
+
+    #[test]
+    fn test_save_load_roundtrip_via_orchestrator() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 调整 TTL (模拟调优过程)
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&decision);
+        }
+
+        // 保存 (final_report)
+        orch.final_report().unwrap();
+
+        // 创建新 orchestrator (模拟新 session)
+        let mut orch2 = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+
+        // 加载历史
+        if let Some(ref tuner) = orch2.cache_tuner {
+            let config = tuner.config().clone();
+            let default_ttl = tuner.current_ttl();
+            if let Some(loaded_tuner) =
+                CacheTuner::load_from_workspace(&orch2.workspace.root, config, default_ttl)
+            {
+                let new_ttl = loaded_tuner.current_ttl();
+                let enabled = loaded_tuner.is_enabled();
+                orch2.cache_tuner = Some(loaded_tuner);
+                orch2.search_cache.set_ttl(new_ttl);
+                if !enabled {
+                    orch2.search_cache.clear();
+                }
+            }
+        }
+
+        // 验证状态恢复
+        assert_eq!(orch2.cache_tuner.as_ref().unwrap().current_ttl(), 2700);
+        assert_eq!(orch2.cache_tuner.as_ref().unwrap().initial_ttl(), 2700);
+        assert!(orch2.cache_tuner.as_ref().unwrap().is_enabled());
+        assert_eq!(orch2.search_cache.ttl_secs(), 2700);
+
+        // 新 session 继续调优
+        if let Some(ref mut tuner) = orch2.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(2700, 4050, 0.33, "再次延长");
+            tuner.apply_decision(&decision);
+        }
+
+        assert_eq!(orch2.cache_tuner.as_ref().unwrap().current_ttl(), 4050);
+        assert_eq!(orch2.cache_tuner.as_ref().unwrap().adjustment_count(), 1);
     }
 }
 

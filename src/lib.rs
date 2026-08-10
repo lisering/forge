@@ -120,10 +120,10 @@ pub use browser_launcher::{
 };
 pub use cache_tuning::{
     compute_new_ttl, has_sufficient_data, make_tuning_decision, should_adjust_ttl,
-    should_disable_cache, CacheTuner, CacheTuningConfig, CacheTuningDecision, TuningAction,
-    DEFAULT_DISABLE_THRESHOLD, DEFAULT_INCREASE_TTL_THRESHOLD, DEFAULT_MAX_TTL_SECS,
+    should_disable_cache, CacheTuner, CacheTuningConfig, CacheTuningDecision, CacheTuningHistory,
+    TuningAction, DEFAULT_DISABLE_THRESHOLD, DEFAULT_INCREASE_TTL_THRESHOLD, DEFAULT_MAX_TTL_SECS,
     DEFAULT_MIN_SAMPLES, DEFAULT_MIN_TTL_SECS, DEFAULT_REDUCE_TTL_THRESHOLD,
-    DEFAULT_TTL_INCREASE_FACTOR, DEFAULT_TTL_REDUCE_FACTOR,
+    DEFAULT_TTL_INCREASE_FACTOR, DEFAULT_TTL_REDUCE_FACTOR, TUNING_HISTORY_FILENAME,
 };
 pub use cancellation_token::{CancelError, CancellationToken, CancellationTokenSource};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};

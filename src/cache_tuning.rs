@@ -50,7 +50,10 @@
 
 use crate::dev_trace::CacheFixCorrelation;
 use crate::search_cache::CacheStats;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use tracing::{info, warn};
 
 // ============================================================================
 //  常量
@@ -577,6 +580,195 @@ pub fn make_tuning_decision(
     )
 }
 
+/// 持久化文件名 — 存储在 `.forge/cache_tuning_history.json`
+pub const TUNING_HISTORY_FILENAME: &str = "cache_tuning_history.json";
+
+// ============================================================================
+//  CacheTuningHistory — 调优历史持久化 (Session 84)
+// ============================================================================
+
+/// 缓存调优历史 — 跨 session 持久化调优状态和决策记录
+///
+/// 存储在 `.forge/cache_tuning_history.json`, 在 Orchestrator 启动时加载,
+/// 在 `final_report` 时保存。这使得新 session 可以复用上一 session 的
+/// 调优经验 (TTL 值、缓存启用状态、累计统计)。
+///
+/// # 字段
+///
+/// | 字段 | 说明 |
+/// |------|------|
+/// | `initial_ttl` | session 开始时的 TTL |
+/// | `current_ttl` | 最终 TTL (下次 session 的起始值) |
+/// | `enabled` | 缓存是否启用 |
+/// | `adjustment_count` | 累计 TTL 调整次数 |
+/// | `disable_count` | 累计禁用次数 |
+/// | `decisions` | 所有调优决策记录 |
+/// | `saved_at` | 保存时间 (ISO 8601) |
+///
+/// # 示例
+///
+/// ```
+/// use forge::cache_tuning::{CacheTuner, CacheTuningConfig, CacheTuningHistory};
+///
+/// let mut tuner = CacheTuner::new(CacheTuningConfig::default(), 1800);
+/// let history = tuner.to_history();
+/// assert_eq!(history.initial_ttl, 1800);
+/// assert_eq!(history.current_ttl, 1800);
+/// assert!(history.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheTuningHistory {
+    /// session 开始时的 TTL (秒)
+    pub initial_ttl: u64,
+    /// 最终 TTL (秒) — 下次 session 的起始值
+    pub current_ttl: u64,
+    /// 缓存是否启用
+    pub enabled: bool,
+    /// 累计 TTL 调整次数
+    pub adjustment_count: u32,
+    /// 累计禁用次数
+    pub disable_count: u32,
+    /// 所有调优决策记录 (按时间顺序)
+    pub decisions: Vec<CacheTuningDecision>,
+    /// 保存时间 (ISO 8601 格式, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl CacheTuningHistory {
+    /// 创建空的调优历史
+    ///
+    /// 默认值: TTL=0, enabled=true, 无决策记录
+    pub fn new() -> Self {
+        Self {
+            initial_ttl: 0,
+            current_ttl: 0,
+            enabled: true,
+            adjustment_count: 0,
+            disable_count: 0,
+            decisions: vec![],
+            saved_at: None,
+        }
+    }
+
+    /// 是否为空 (无决策记录)
+    pub fn is_empty(&self) -> bool {
+        self.decisions.is_empty()
+    }
+
+    /// 决策记录数
+    pub fn decision_count(&self) -> usize {
+        self.decisions.len()
+    }
+
+    /// TTL 变化量 (current - initial)
+    pub fn ttl_delta(&self) -> i64 {
+        self.current_ttl as i64 - self.initial_ttl as i64
+    }
+
+    /// 格式化为可读摘要字符串
+    pub fn to_summary(&self) -> String {
+        let status = if self.enabled { "启用" } else { "禁用" };
+        let delta = self.ttl_delta();
+        let delta_str = if delta > 0 {
+            format!(" (+{}s)", delta)
+        } else if delta < 0 {
+            format!(" ({}s)", delta)
+        } else {
+            String::new()
+        };
+        format!(
+            "缓存调优历史: 初始TTL={}s, 当前TTL={}s{}, 状态={}, 调整{}次, 禁用{}次, 决策{}条",
+            self.initial_ttl,
+            self.current_ttl,
+            delta_str,
+            status,
+            self.adjustment_count,
+            self.disable_count,
+            self.decisions.len()
+        )
+    }
+
+    /// 从文件加载调优历史
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(history)`: 成功加载
+    /// - `Err`: 文件不存在或解析失败
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(anyhow!("调优历史文件不存在: {}", path.display()));
+        }
+        let content =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("读取调优历史失败: {}", e))?;
+        let history: CacheTuningHistory =
+            serde_json::from_str(&content).map_err(|e| anyhow!("解析调优历史 JSON 失败: {}", e))?;
+        Ok(history)
+    }
+
+    /// 保存调优历史到文件
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content =
+            serde_json::to_string_pretty(self).map_err(|e| anyhow!("序列化调优历史失败: {}", e))?;
+        std::fs::write(path, content).map_err(|e| anyhow!("写入调优历史失败: {}", e))?;
+        Ok(())
+    }
+
+    /// 从工作区加载 (查找 `.forge/cache_tuning_history.json`)
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    ///
+    /// # 返回
+    ///
+    /// - `Some(history)`: 文件存在且加载成功
+    /// - `None`: 文件不存在或加载失败 (静默降级, 不报错)
+    pub fn load_from_workspace(workspace_root: &Path) -> Option<Self> {
+        let path = workspace_root.join(".forge").join(TUNING_HISTORY_FILENAME);
+        match Self::load(&path) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!("加载缓存调优历史失败, 使用默认配置: {}", e);
+                None
+            }
+        }
+    }
+
+    /// 保存到工作区 (`.forge/cache_tuning_history.json`)
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let path = workspace_root.join(".forge").join(TUNING_HISTORY_FILENAME);
+        self.save(&path)
+    }
+
+    /// 创建带时间戳的副本 (用于保存时自动添加保存时间)
+    pub fn with_timestamp(mut self) -> Self {
+        self.saved_at = Some(chrono::Utc::now().to_rfc3339());
+        self
+    }
+}
+
+impl Default for CacheTuningHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ============================================================================
 //  CacheTuner — 缓存调优器 (状态管理)
 // ============================================================================
@@ -587,10 +779,13 @@ pub fn make_tuning_decision(
 ///
 /// `CacheTuner` 封装了缓存调优的状态和逻辑:
 /// - `config`: 调优配置 (阈值和参数)
+/// - `initial_ttl`: 初始 TTL (秒), 用于跟踪 TTL 变化
 /// - `current_ttl`: 当前 TTL (秒), 随调优决策动态更新
 /// - `enabled`: 缓存是否启用 (禁用后不再缓存)
 /// - `adjustment_count`: 累计调整次数
+/// - `disable_count`: 累计禁用次数
 /// - `last_decision`: 最近一次调优决策
+/// - `decisions`: 所有调优决策历史 (Session 84 持久化支持)
 ///
 /// # 用法
 ///
@@ -620,6 +815,8 @@ pub fn make_tuning_decision(
 pub struct CacheTuner {
     /// 调优配置
     config: CacheTuningConfig,
+    /// 初始 TTL (秒) — session 开始时的值, 用于跟踪变化
+    initial_ttl: u64,
     /// 当前 TTL (秒)
     current_ttl: u64,
     /// 缓存是否启用
@@ -630,6 +827,8 @@ pub struct CacheTuner {
     disable_count: u32,
     /// 最近一次调优决策
     last_decision: Option<CacheTuningDecision>,
+    /// 所有调优决策历史 (Session 84)
+    decisions: Vec<CacheTuningDecision>,
 }
 
 impl CacheTuner {
@@ -642,11 +841,13 @@ impl CacheTuner {
     pub fn new(config: CacheTuningConfig, initial_ttl: u64) -> Self {
         Self {
             config,
+            initial_ttl,
             current_ttl: initial_ttl,
             enabled: true,
             adjustment_count: 0,
             disable_count: 0,
             last_decision: None,
+            decisions: vec![],
         }
     }
 
@@ -680,6 +881,8 @@ impl CacheTuner {
 
     /// 应用调优决策, 更新内部状态
     ///
+    /// 同时将决策追加到 `decisions` 历史记录中 (Session 84)。
+    ///
     /// # 参数
     ///
     /// - `decision`: 调优决策
@@ -696,6 +899,7 @@ impl CacheTuner {
             }
         }
         self.last_decision = Some(decision.clone());
+        self.decisions.push(decision.clone());
     }
 
     /// 一步评估并应用 — 等价于 `evaluate` + `apply_decision`
@@ -748,6 +952,140 @@ impl CacheTuner {
         self.last_decision.as_ref()
     }
 
+    /// 所有调优决策历史 (按时间顺序)
+    ///
+    /// 返回所有 `apply_decision` 调用记录的决策列表。
+    pub fn decisions(&self) -> &[CacheTuningDecision] {
+        &self.decisions
+    }
+
+    /// 初始 TTL (秒) — session 开始时的值
+    pub fn initial_ttl(&self) -> u64 {
+        self.initial_ttl
+    }
+
+    /// 导出为调优历史 (用于持久化)
+    ///
+    /// 将当前 CacheTuner 状态导出为 `CacheTuningHistory`,
+    /// 可通过 `save_to_workspace()` 持久化到 `.forge/` 目录。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::cache_tuning::{CacheTuner, CacheTuningConfig};
+    ///
+    /// let tuner = CacheTuner::new(CacheTuningConfig::default(), 1800);
+    /// let history = tuner.to_history();
+    /// assert_eq!(history.initial_ttl, 1800);
+    /// assert_eq!(history.current_ttl, 1800);
+    /// assert!(history.is_empty());
+    /// ```
+    pub fn to_history(&self) -> CacheTuningHistory {
+        CacheTuningHistory {
+            initial_ttl: self.initial_ttl,
+            current_ttl: self.current_ttl,
+            enabled: self.enabled,
+            adjustment_count: self.adjustment_count,
+            disable_count: self.disable_count,
+            decisions: self.decisions.clone(),
+            saved_at: None,
+        }
+    }
+
+    /// 从调优历史恢复 CacheTuner 状态
+    ///
+    /// 使用历史记录中的 `current_ttl` 作为新的初始 TTL,
+    /// 保留 `enabled` 状态和累计计数, 但清空决策历史
+    /// (新 session 的决策将重新积累)。
+    ///
+    /// # 参数
+    ///
+    /// - `history`: 调优历史
+    /// - `config`: 调优配置 (历史不保存配置, 由调用方提供)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::cache_tuning::{CacheTuner, CacheTuningConfig, CacheTuningHistory};
+    ///
+    /// let mut history = CacheTuningHistory::new();
+    /// history.current_ttl = 2700;
+    /// history.enabled = true;
+    /// history.adjustment_count = 2;
+    ///
+    /// let tuner = CacheTuner::from_history(history, CacheTuningConfig::default());
+    /// assert_eq!(tuner.current_ttl(), 2700); // 从历史 TTL 继续
+    /// assert_eq!(tuner.initial_ttl(), 2700); // 初始 = 历史 TTL
+    /// assert!(tuner.is_enabled());
+    /// assert_eq!(tuner.adjustment_count(), 0); // 新 session, 计数从 0 开始
+    /// ```
+    pub fn from_history(history: CacheTuningHistory, config: CacheTuningConfig) -> Self {
+        Self {
+            config,
+            initial_ttl: history.current_ttl, // 新 session 的初始 = 上次的最终
+            current_ttl: history.current_ttl,
+            enabled: history.enabled,
+            adjustment_count: 0, // 新 session, 重新计数
+            disable_count: 0,
+            last_decision: None,
+            decisions: vec![], // 新 session, 重新积累
+        }
+    }
+
+    /// 保存调优历史到工作区 (`.forge/cache_tuning_history.json`)
+    ///
+    /// 将当前状态导出为 `CacheTuningHistory` 并保存到工作区,
+    /// 包含自动时间戳。
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let history = self.to_history().with_timestamp();
+        history.save_to_workspace(workspace_root)
+    }
+
+    /// 从工作区加载调优历史并恢复 CacheTuner
+    ///
+    /// 查找 `.forge/cache_tuning_history.json`, 如果存在则恢复状态。
+    /// 文件不存在时返回 `None` (调用方使用默认配置)。
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    /// - `config`: 调优配置
+    /// - `default_ttl`: 如果无历史记录, 使用的默认 TTL
+    ///
+    /// # 返回
+    ///
+    /// - `Some(tuner)`: 成功从历史恢复
+    /// - `None`: 无历史文件或加载失败
+    pub fn load_from_workspace(
+        workspace_root: &Path,
+        config: CacheTuningConfig,
+        default_ttl: u64,
+    ) -> Option<Self> {
+        match CacheTuningHistory::load_from_workspace(workspace_root) {
+            Some(history) => {
+                info!(
+                    "📥 加载缓存调优历史: 初始TTL={}s, 当前TTL={}s, 状态={}",
+                    history.initial_ttl,
+                    history.current_ttl,
+                    if history.enabled { "启用" } else { "禁用" }
+                );
+                Some(Self::from_history(history, config))
+            }
+            None => {
+                // 无历史文件, 使用默认 TTL
+                if default_ttl > 0 {
+                    Some(Self::new(config, default_ttl))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// 格式化为可读字符串
     pub fn to_summary(&self) -> String {
         let status = if self.enabled { "启用" } else { "禁用" };
@@ -756,8 +1094,8 @@ impl CacheTuner {
             None => "无".to_string(),
         };
         format!(
-            "缓存调优器: 状态={}, TTL={}s, 调整{}次, 禁用{}次, 最近决策: {}",
-            status, self.current_ttl, self.adjustment_count, self.disable_count, last
+            "缓存调优器: 状态={}, 初始TTL={}s, 当前TTL={}s, 调整{}次, 禁用{}次, 决策{}条, 最近决策: {}",
+            status, self.initial_ttl, self.current_ttl, self.adjustment_count, self.disable_count, self.decisions.len(), last
         )
     }
 }
@@ -1598,6 +1936,618 @@ mod tests {
         // 7200 × 1.5 = 10800 → clamp to 7200 → 与当前相同 → keep
         assert!(decision.is_keep());
         assert_eq!(tuner.current_ttl(), 7200);
+    }
+
+    // ===== CacheTuningHistory (Session 84: 持久化) =====
+
+    #[test]
+    fn test_history_new() {
+        let h = CacheTuningHistory::new();
+        assert_eq!(h.initial_ttl, 0);
+        assert_eq!(h.current_ttl, 0);
+        assert!(h.enabled);
+        assert_eq!(h.adjustment_count, 0);
+        assert_eq!(h.disable_count, 0);
+        assert!(h.decisions.is_empty());
+        assert!(h.saved_at.is_none());
+    }
+
+    #[test]
+    fn test_history_default() {
+        let h = CacheTuningHistory::default();
+        assert!(h.is_empty());
+        assert_eq!(h.decision_count(), 0);
+    }
+
+    #[test]
+    fn test_history_is_empty() {
+        let h = CacheTuningHistory::new();
+        assert!(h.is_empty());
+
+        let mut h2 = CacheTuningHistory::new();
+        h2.decisions
+            .push(CacheTuningDecision::keep_current(1800, 0.0, "test"));
+        assert!(!h2.is_empty());
+    }
+
+    #[test]
+    fn test_history_decision_count() {
+        let mut h = CacheTuningHistory::new();
+        assert_eq!(h.decision_count(), 0);
+
+        h.decisions
+            .push(CacheTuningDecision::keep_current(1800, 0.0, "a"));
+        h.decisions
+            .push(CacheTuningDecision::adjust_ttl(1800, 900, -0.1, "b"));
+        assert_eq!(h.decision_count(), 2);
+    }
+
+    #[test]
+    fn test_history_ttl_delta_zero() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 1800,
+            ..CacheTuningHistory::new()
+        };
+        assert_eq!(h.ttl_delta(), 0);
+    }
+
+    #[test]
+    fn test_history_ttl_delta_positive() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            ..CacheTuningHistory::new()
+        };
+        assert_eq!(h.ttl_delta(), 900);
+    }
+
+    #[test]
+    fn test_history_ttl_delta_negative() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 900,
+            ..CacheTuningHistory::new()
+        };
+        assert_eq!(h.ttl_delta(), -900);
+    }
+
+    #[test]
+    fn test_history_to_summary_empty() {
+        let h = CacheTuningHistory::new();
+        let s = h.to_summary();
+        assert!(s.contains("初始TTL=0s"));
+        assert!(s.contains("当前TTL=0s"));
+        assert!(s.contains("启用"));
+        assert!(s.contains("决策0条"));
+    }
+
+    #[test]
+    fn test_history_to_summary_with_data() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            enabled: true,
+            adjustment_count: 1,
+            disable_count: 0,
+            decisions: vec![CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长")],
+            saved_at: None,
+        };
+        let s = h.to_summary();
+        assert!(s.contains("初始TTL=1800s"));
+        assert!(s.contains("当前TTL=2700s"));
+        assert!(s.contains("+900s"));
+        assert!(s.contains("调整1次"));
+        assert!(s.contains("决策1条"));
+    }
+
+    #[test]
+    fn test_history_to_summary_disabled() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 1800,
+            enabled: false,
+            ..CacheTuningHistory::new()
+        };
+        let s = h.to_summary();
+        assert!(s.contains("禁用"));
+    }
+
+    #[test]
+    fn test_history_with_timestamp() {
+        let h = CacheTuningHistory::new().with_timestamp();
+        assert!(h.saved_at.is_some());
+        // 验证是有效的 ISO 8601 格式
+        assert!(h.saved_at.as_ref().unwrap().contains('T'));
+    }
+
+    #[test]
+    fn test_history_serde_roundtrip() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            enabled: true,
+            adjustment_count: 2,
+            disable_count: 0,
+            decisions: vec![
+                CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长"),
+                CacheTuningDecision::keep_current(2700, 0.0, "正常"),
+            ],
+            saved_at: Some("2024-01-01T00:00:00Z".to_string()),
+        };
+
+        let json = serde_json::to_string_pretty(&h).unwrap();
+        let loaded: CacheTuningHistory = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.adjustment_count, 2);
+        assert_eq!(loaded.decisions.len(), 2);
+        assert_eq!(loaded.saved_at, Some("2024-01-01T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_history_serde_skip_none_timestamp() {
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 1800,
+            enabled: true,
+            adjustment_count: 0,
+            disable_count: 0,
+            decisions: vec![],
+            saved_at: None,
+        };
+
+        let json = serde_json::to_string(&h).unwrap();
+        // saved_at 为 None 时不应出现在 JSON 中
+        assert!(!json.contains("saved_at"));
+    }
+
+    #[test]
+    fn test_history_serde_empty_decisions() {
+        let h = CacheTuningHistory::new();
+        let json = serde_json::to_string(&h).unwrap();
+        let loaded: CacheTuningHistory = serde_json::from_str(&json).unwrap();
+        assert!(loaded.decisions.is_empty());
+    }
+
+    // ===== CacheTuningHistory: save / load =====
+
+    #[test]
+    fn test_history_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache_tuning_history.json");
+
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            enabled: true,
+            adjustment_count: 1,
+            disable_count: 0,
+            decisions: vec![CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长")],
+            saved_at: None,
+        };
+
+        h.save(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = CacheTuningHistory::load(&path).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.adjustment_count, 1);
+        assert_eq!(loaded.decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_history_load_nonexistent() {
+        let path = std::path::Path::new("/nonexistent/cache_tuning_history.json");
+        let result = CacheTuningHistory::load(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_history_load_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.json");
+        std::fs::write(&path, "{invalid json}").unwrap();
+
+        let result = CacheTuningHistory::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_history_save_creates_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subdir").join("cache_tuning_history.json");
+
+        let h = CacheTuningHistory::new();
+        h.save(&path).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_history_save_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let forge_dir = dir.path().join(".forge");
+        std::fs::create_dir_all(&forge_dir).unwrap();
+
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 900,
+            enabled: false,
+            ..CacheTuningHistory::new()
+        };
+
+        h.save_to_workspace(dir.path()).unwrap();
+
+        let path = forge_dir.join("cache_tuning_history.json");
+        assert!(path.exists());
+
+        let loaded = CacheTuningHistory::load(&path).unwrap();
+        assert_eq!(loaded.current_ttl, 900);
+        assert!(!loaded.enabled);
+    }
+
+    #[test]
+    fn test_history_load_from_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let forge_dir = dir.path().join(".forge");
+        std::fs::create_dir_all(&forge_dir).unwrap();
+        let path = forge_dir.join("cache_tuning_history.json");
+
+        let h = CacheTuningHistory {
+            initial_ttl: 1800,
+            current_ttl: 2700,
+            enabled: true,
+            adjustment_count: 2,
+            ..CacheTuningHistory::new()
+        };
+        h.save(&path).unwrap();
+
+        let loaded = CacheTuningHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().current_ttl, 2700);
+    }
+
+    #[test]
+    fn test_history_load_from_workspace_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = CacheTuningHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_none());
+    }
+
+    // ===== CacheTuner: to_history / from_history =====
+
+    #[test]
+    fn test_tuner_to_history_empty() {
+        let tuner = CacheTuner::with_default_config(1800);
+        let h = tuner.to_history();
+
+        assert_eq!(h.initial_ttl, 1800);
+        assert_eq!(h.current_ttl, 1800);
+        assert!(h.enabled);
+        assert_eq!(h.adjustment_count, 0);
+        assert_eq!(h.disable_count, 0);
+        assert!(h.decisions.is_empty());
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn test_tuner_to_history_after_adjustment() {
+        let mut tuner = CacheTuner::with_default_config(1800);
+
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        let stats = CacheStats::new();
+
+        tuner.evaluate_and_apply(&corr, &stats);
+
+        let h = tuner.to_history();
+        assert_eq!(h.initial_ttl, 1800);
+        assert_eq!(h.current_ttl, 2700); // 1800 × 1.5
+        assert!(h.enabled);
+        assert_eq!(h.adjustment_count, 1);
+        assert_eq!(h.decisions.len(), 1);
+        assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn test_tuner_to_history_after_disable() {
+        let mut tuner = CacheTuner::with_default_config(1800);
+
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(false);
+        corr.record_hit_check(false);
+        corr.record_hit_check(false);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        let stats = CacheStats::new();
+
+        tuner.evaluate_and_apply(&corr, &stats);
+
+        let h = tuner.to_history();
+        assert!(!h.enabled);
+        assert_eq!(h.disable_count, 1);
+        assert_eq!(h.decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_tuner_to_history_multiple_decisions() {
+        let mut tuner = CacheTuner::with_default_config(600);
+
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        let stats = CacheStats::new();
+
+        // 三次延长
+        tuner.evaluate_and_apply(&corr, &stats); // 600 → 900
+        tuner.evaluate_and_apply(&corr, &stats); // 900 → 1350
+        tuner.evaluate_and_apply(&corr, &stats); // 1350 → 2025
+
+        let h = tuner.to_history();
+        assert_eq!(h.initial_ttl, 600);
+        assert_eq!(h.current_ttl, 2025);
+        assert_eq!(h.adjustment_count, 3);
+        assert_eq!(h.decisions.len(), 3);
+    }
+
+    #[test]
+    fn test_tuner_from_history_restores_ttl() {
+        let mut history = CacheTuningHistory::new();
+        history.current_ttl = 2700;
+        history.enabled = true;
+
+        let tuner = CacheTuner::from_history(history, CacheTuningConfig::default());
+
+        // 从历史 TTL 继续
+        assert_eq!(tuner.current_ttl(), 2700);
+        assert_eq!(tuner.initial_ttl(), 2700); // 新 session 的初始 = 上次的最终
+        assert!(tuner.is_enabled());
+    }
+
+    #[test]
+    fn test_tuner_from_history_restores_disabled() {
+        let mut history = CacheTuningHistory::new();
+        history.current_ttl = 1800;
+        history.enabled = false;
+
+        let tuner = CacheTuner::from_history(history, CacheTuningConfig::default());
+
+        assert!(!tuner.is_enabled());
+        assert_eq!(tuner.current_ttl(), 1800);
+    }
+
+    #[test]
+    fn test_tuner_from_history_resets_counts() {
+        let mut history = CacheTuningHistory::new();
+        history.current_ttl = 2700;
+        history.adjustment_count = 5;
+        history.disable_count = 2;
+        history.decisions = vec![
+            CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "a"),
+            CacheTuningDecision::disable_cache(2700, -0.2, "b"),
+        ];
+
+        let tuner = CacheTuner::from_history(history, CacheTuningConfig::default());
+
+        // 新 session, 计数从 0 开始
+        assert_eq!(tuner.adjustment_count(), 0);
+        assert_eq!(tuner.disable_count(), 0);
+        // 决策历史清空
+        assert_eq!(tuner.decisions().len(), 0);
+        assert!(tuner.last_decision().is_none());
+    }
+
+    #[test]
+    fn test_tuner_from_history_preserves_config() {
+        let history = CacheTuningHistory::new();
+        let config = CacheTuningConfig::aggressive();
+
+        let tuner = CacheTuner::from_history(history, config);
+
+        assert_eq!(tuner.config().min_samples, 2); // aggressive
+        assert_eq!(tuner.config().disable_threshold, -0.05);
+    }
+
+    #[test]
+    fn test_tuner_decisions_tracked() {
+        let mut tuner = CacheTuner::with_default_config(1800);
+
+        // KeepCurrent
+        let corr1 = CacheFixCorrelation::new();
+        let stats = CacheStats::new();
+        tuner.evaluate_and_apply(&corr1, &stats);
+        assert_eq!(tuner.decisions().len(), 1);
+        assert!(tuner.decisions()[0].is_keep());
+
+        // AdjustTtl
+        let mut corr2 = CacheFixCorrelation::new();
+        corr2.record_hit_check(true);
+        corr2.record_hit_check(true);
+        corr2.record_hit_check(true);
+        corr2.record_miss_check(true);
+        corr2.record_miss_check(true);
+        corr2.record_miss_check(false);
+        tuner.evaluate_and_apply(&corr2, &stats);
+        assert_eq!(tuner.decisions().len(), 2);
+        assert!(tuner.decisions()[1].is_adjust());
+    }
+
+    #[test]
+    fn test_tuner_initial_ttl_getter() {
+        let tuner = CacheTuner::new(CacheTuningConfig::default(), 3600);
+        assert_eq!(tuner.initial_ttl(), 3600);
+    }
+
+    #[test]
+    fn test_tuner_to_summary_includes_initial_ttl() {
+        let tuner = CacheTuner::with_default_config(1800);
+        let s = tuner.to_summary();
+        assert!(s.contains("初始TTL=1800s"));
+        assert!(s.contains("当前TTL=1800s"));
+    }
+
+    // ===== CacheTuner: save_to_workspace / load_from_workspace =====
+
+    #[test]
+    fn test_tuner_save_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        let mut tuner = CacheTuner::with_default_config(1800);
+
+        // 执行一次调整
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        let stats = CacheStats::new();
+        tuner.evaluate_and_apply(&corr, &stats);
+
+        tuner.save_to_workspace(dir.path()).unwrap();
+
+        let path = dir.path().join(".forge").join("cache_tuning_history.json");
+        assert!(path.exists());
+
+        // 验证文件内容
+        let loaded = CacheTuningHistory::load(&path).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert_eq!(loaded.decisions.len(), 1);
+        // save_to_workspace 会添加时间戳
+        assert!(loaded.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_tuner_load_from_workspace_with_history() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 先保存一个历史
+        let mut tuner = CacheTuner::with_default_config(1800);
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        let stats = CacheStats::new();
+        tuner.evaluate_and_apply(&corr, &stats);
+        tuner.save_to_workspace(dir.path()).unwrap();
+
+        // 从历史加载
+        let loaded =
+            CacheTuner::load_from_workspace(dir.path(), CacheTuningConfig::default(), 1800);
+
+        assert!(loaded.is_some());
+        let loaded_tuner = loaded.unwrap();
+        assert_eq!(loaded_tuner.current_ttl(), 2700); // 从历史 TTL 继续
+        assert_eq!(loaded_tuner.initial_ttl(), 2700); // 新初始 = 历史最终
+        assert!(loaded_tuner.is_enabled());
+        assert_eq!(loaded_tuner.adjustment_count(), 0); // 新 session, 重新计数
+    }
+
+    #[test]
+    fn test_tuner_load_from_workspace_without_history() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 无历史文件, 使用默认 TTL
+        let loaded =
+            CacheTuner::load_from_workspace(dir.path(), CacheTuningConfig::default(), 1800);
+
+        assert!(loaded.is_some());
+        let loaded_tuner = loaded.unwrap();
+        assert_eq!(loaded_tuner.current_ttl(), 1800);
+        assert_eq!(loaded_tuner.initial_ttl(), 1800);
+        assert!(loaded_tuner.is_enabled());
+    }
+
+    #[test]
+    fn test_tuner_load_from_workspace_disabled_history() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 保存一个被禁用的历史
+        let mut tuner = CacheTuner::with_default_config(1800);
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(false);
+        corr.record_hit_check(false);
+        corr.record_hit_check(false);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        let stats = CacheStats::new();
+        tuner.evaluate_and_apply(&corr, &stats);
+        assert!(!tuner.is_enabled());
+        tuner.save_to_workspace(dir.path()).unwrap();
+
+        // 从历史加载 — 应保留禁用状态
+        let loaded =
+            CacheTuner::load_from_workspace(dir.path(), CacheTuningConfig::default(), 1800);
+
+        assert!(loaded.is_some());
+        let loaded_tuner = loaded.unwrap();
+        assert!(!loaded_tuner.is_enabled()); // 禁用状态被保留
+        assert_eq!(loaded_tuner.current_ttl(), 1800);
+    }
+
+    #[test]
+    fn test_tuner_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 创建并调优
+        let mut tuner = CacheTuner::with_default_config(600);
+        let mut corr = CacheFixCorrelation::new();
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_hit_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(true);
+        corr.record_miss_check(false);
+        let stats = CacheStats::new();
+
+        // 多次调整
+        tuner.evaluate_and_apply(&corr, &stats); // 600 → 900
+        tuner.evaluate_and_apply(&corr, &stats); // 900 → 1350
+
+        // 保存
+        tuner.save_to_workspace(dir.path()).unwrap();
+
+        // 加载
+        let loaded =
+            CacheTuner::load_from_workspace(dir.path(), CacheTuningConfig::default(), 600).unwrap();
+
+        // 验证状态恢复
+        assert_eq!(loaded.current_ttl(), 1350);
+        assert_eq!(loaded.initial_ttl(), 1350); // 新初始 = 历史最终
+        assert!(loaded.is_enabled());
+
+        // 新 session 继续调优
+        let mut new_tuner = loaded;
+        new_tuner.evaluate_and_apply(&corr, &stats); // 1350 → 2025
+
+        assert_eq!(new_tuner.current_ttl(), 2025);
+        assert_eq!(new_tuner.adjustment_count(), 1); // 新 session 只调了 1 次
+        assert_eq!(new_tuner.decisions().len(), 1);
     }
 
     // ===== proptest 属性测试 =====
