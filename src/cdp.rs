@@ -2,16 +2,25 @@
 //!
 //! 通过 HTTP 发现标签页，通过 WebSocket 发送 CDP 命令
 
+use crate::deadline::Deadline;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, trace, warn};
+
+/// WebSocket keepalive ping interval (30 seconds).
+/// Prevents intermediate proxies/load balancers from dropping idle connections.
+const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+
+/// Default CDP command timeout if no Deadline is provided.
+const DEFAULT_CDP_TIMEOUT_SECS: u64 = 30;
 
 /// 从 Chrome 调试端口获取的标签页信息
 #[derive(Debug, Clone, Deserialize)]
@@ -51,12 +60,45 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
+/// 等待 CDP 响应的 pending 请求类型
+type PendingMap = Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>>;
+
+/// RAII guard for a pending CDP request entry.
+///
+/// When a `send_command` call is cancelled (e.g. by an outer timeout), the
+/// pending entry would leak until the connection closes — a response that
+/// never comes holds the map slot forever. `PendingGuard` removes the entry
+/// on drop if the response hasn't arrived, preventing the leak.
+///
+/// Normal completion disarms the guard via `done = true`.
+struct PendingGuard {
+    pending: PendingMap,
+    id: u32,
+    done: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let pending = self.pending.clone();
+        let id = self.id;
+        // Spawn async removal — can't block in Drop
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                pending.lock().await.remove(&id);
+            });
+        }
+    }
+}
+
 /// 到单个标签页的 CDP WebSocket 会话
 pub struct CdpSession {
-    ws_write: Mutex<WsSink>,
-    msg_id: Mutex<u32>,
+    ws_write: Arc<Mutex<WsSink>>,
+    msg_id: AtomicU64,
     /// 等待 CDP 响应的 pending 请求 — 用 Arc 以便 spawn 的任务也能访问
-    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>>,
+    pending: PendingMap,
 }
 
 impl CdpSession {
@@ -66,12 +108,11 @@ impl CdpSession {
         let (ws_stream, _) = connect_async(ws_url).await.context("WebSocket 连接失败")?;
 
         let (write, mut read) = ws_stream.split();
-        let pending: Arc<Mutex<HashMap<u32, oneshot::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         let session = Self {
-            ws_write: Mutex::new(write),
-            msg_id: Mutex::new(0),
+            ws_write: Arc::new(Mutex::new(write)),
+            msg_id: AtomicU64::new(0),
             pending: pending.clone(),
         };
 
@@ -100,6 +141,12 @@ impl CdpSession {
                         warn!("CDP WebSocket 已关闭");
                         break;
                     }
+                    Ok(Message::Ping(data)) => {
+                        // Respond to WebSocket pings from the server
+                        trace!("CDP WebSocket Ping received, responding with Pong");
+                        // Pong will be handled by tungstenite automatically
+                        let _ = data;
+                    }
                     Err(e) => {
                         warn!("CDP WebSocket 错误: {}", e);
                         break;
@@ -109,16 +156,47 @@ impl CdpSession {
             }
         });
 
+        // 启动 WebSocket keepalive — 定期发送 ping 防止代理/负载均衡器断连
+        let keepalive_ws_write = session.ws_write.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(WS_KEEPALIVE_INTERVAL_SECS));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let mut write = keepalive_ws_write.lock().await;
+                if write.send(Message::Ping(vec![1, 2, 3, 4])).await.is_err() {
+                    debug!("CDP keepalive: WebSocket send failed, stopping keepalive");
+                    break;
+                }
+                trace!("CDP keepalive: ping sent");
+            }
+        });
+
         Ok(session)
     }
 
-    /// 发送 CDP 命令并等待响应
+    /// 发送 CDP 命令并等待响应 (默认 30 秒超时)
     pub async fn send_command(&self, method: &str, params: Value) -> Result<Value> {
-        let id = {
-            let mut msg_id = self.msg_id.lock().await;
-            *msg_id += 1;
-            *msg_id
-        };
+        self.send_command_with_deadline(
+            method,
+            params,
+            Deadline::from_millis(DEFAULT_CDP_TIMEOUT_SECS * 1000),
+        )
+        .await
+    }
+
+    /// 发送 CDP 命令并等待响应, 使用 Deadline 控制超时
+    ///
+    /// 借鉴 us/crw 的 Deadline 传播设计: 调用方传入全局 Deadline,
+    /// 本方法 clamp 到剩余时间内, 防止超时雪崩。
+    pub async fn send_command_with_deadline(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Deadline,
+    ) -> Result<Value> {
+        let id = self.msg_id.fetch_add(1, Ordering::Relaxed) as u32 + 1;
 
         let command = build_command(id, method, params);
 
@@ -127,6 +205,13 @@ impl CdpSession {
             let mut pending = self.pending.lock().await;
             pending.insert(id, tx);
         }
+
+        // PendingGuard: 如果 rx 被取消 (如外部 timeout), 自动清理 pending map
+        let guard = PendingGuard {
+            pending: self.pending.clone(),
+            id,
+            done: false,
+        };
 
         // 发送命令
         {
@@ -137,11 +222,20 @@ impl CdpSession {
                 .context("发送 CDP 命令失败")?;
         }
 
-        // 等待响应 (超时 30 秒)
-        let result = tokio::time::timeout(Duration::from_secs(30), rx)
+        // 等待响应 — 使用 deadline 的剩余时间作为超时
+        let remaining = deadline.remaining();
+        if remaining.is_zero() {
+            // Deadline 已过期 — guard 会自动清理 pending entry
+            bail!("CDP 命令超时 (deadline 已过期): {}", method);
+        }
+
+        let result = tokio::time::timeout(remaining, rx)
             .await
-            .map_err(|_| anyhow!("CDP 命令超时 (30s): {}", method))?
+            .map_err(|_| anyhow!("CDP 命令超时 ({}ms): {}", remaining.as_millis(), method))?
             .map_err(|_| anyhow!("CDP 响应通道关闭"))?;
+
+        // 正常完成 — disarm guard
+        std::mem::forget(guard); // guard 不再 drop, 因为 pending 已在接收循环中移除
 
         extract_result(&result, method)
     }
@@ -1095,5 +1189,89 @@ mod tests {
         let response = json!({"id": 1});
         let result = extract_target_id(&response);
         assert!(result.is_err());
+    }
+
+    // ===== PendingGuard 测试 =====
+
+    #[tokio::test]
+    async fn test_pending_guard_cleans_up_on_drop() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().await.insert(42, tx);
+
+        // 创建 guard 但不 disarm — drop 时应移除 entry
+        {
+            let guard = PendingGuard {
+                pending: pending.clone(),
+                id: 42,
+                done: false,
+            };
+            drop(guard);
+        }
+
+        // 给 spawn 的清理任务一点时间
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(!pending.lock().await.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn test_pending_guard_done_does_not_clean_up() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().await.insert(99, tx);
+
+        // done = true — 不应清理
+        {
+            let mut guard = PendingGuard {
+                pending: pending.clone(),
+                id: 99,
+                done: false,
+            };
+            guard.done = true;
+            drop(guard);
+        }
+
+        // entry 应仍然存在
+        assert!(pending.lock().await.contains_key(&99));
+    }
+
+    #[tokio::test]
+    async fn test_pending_guard_nonexistent_id_no_panic() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // 清理不存在的 id 不应 panic
+        {
+            let guard = PendingGuard {
+                pending: pending.clone(),
+                id: 999,
+                done: false,
+            };
+            drop(guard);
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pending.lock().await.is_empty());
+    }
+
+    // ===== Deadline 集成测试 =====
+
+    #[test]
+    fn test_deadline_module_imported() {
+        let d = crate::deadline::Deadline::from_millis(100);
+        assert!(!d.expired());
+        assert!(d.remaining() > Duration::from_millis(50));
+    }
+
+    // ===== Keepalive 常量测试 =====
+
+    #[test]
+    fn test_keepalive_interval_is_30s() {
+        assert_eq!(WS_KEEPALIVE_INTERVAL_SECS, 30);
+    }
+
+    #[test]
+    fn test_default_cdp_timeout_is_30s() {
+        assert_eq!(DEFAULT_CDP_TIMEOUT_SECS, 30);
     }
 }

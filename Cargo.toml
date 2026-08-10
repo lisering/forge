@@ -32,6 +32,10 @@ async-trait = "0.1"
 tempfile = "3"
 toml = "0.8"
 
+# Unix 进程组管理 (Chrome 进程树 kill)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread"] }

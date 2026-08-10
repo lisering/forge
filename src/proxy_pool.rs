@@ -26,6 +26,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// 允许的代理 URL scheme
+#[allow(dead_code)]
+const ALLOWED_PROXY_SCHEMES: &[&str] = &["http", "https", "socks5", "socks4"];
+
 // ============================================================================
 //  ProxyConfig — 代理配置
 // ============================================================================
@@ -206,6 +210,129 @@ pub fn is_valid_proxy_url(url: &str) -> bool {
         || lower.starts_with("https://")
         || lower.starts_with("socks5://")
         || lower.starts_with("socks4://")
+}
+
+/// 已验证的代理条目 — 借鉴 us/crw ProxyEntry 设计
+///
+/// 包含原始 URL (用于 reqwest) 和解析后的各部分。
+/// 安全特性: scheme 白名单验证, 禁止 silent fallback 到直连。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEntry {
+    /// 原始代理 URL (含凭据)
+    pub raw: String,
+    /// scheme (http/https/socks5/socks4)
+    pub scheme: String,
+    /// host:port
+    pub host_port: String,
+    /// 是否包含认证信息
+    pub has_auth: bool,
+}
+
+impl ProxyEntry {
+    /// 解析和验证代理 URL
+    ///
+    /// # 安全
+    ///
+    /// 代理 URL 会被预先验证。格式错误的条目是硬错误 ——
+    /// 永远不会静默回退到直连 (无代理), 否则会泄露主机的真实 IP。
+    ///
+    /// # 错误
+    ///
+    /// - scheme 不支持
+    /// - host 缺失
+    /// - URL 格式无效
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::proxy_pool::ProxyEntry;
+    ///
+    /// let entry = ProxyEntry::parse("http://127.0.0.1:8080").unwrap();
+    /// assert_eq!(entry.scheme, "http");
+    /// assert_eq!(entry.host_port, "127.0.0.1:8080");
+    /// ```
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("empty proxy URL".to_string());
+        }
+
+        let lower = trimmed.to_lowercase();
+        let scheme = if lower.starts_with("https://") {
+            "https"
+        } else if lower.starts_with("http://") {
+            "http"
+        } else if lower.starts_with("socks5://") {
+            "socks5"
+        } else if lower.starts_with("socks4://") {
+            "socks4"
+        } else {
+            return Err(format!(
+                "unsupported proxy scheme in '{}' (allowed: http, https, socks5, socks4)",
+                trimmed
+            ));
+        };
+
+        // 去掉 scheme:// 前缀
+        let rest = &trimmed[scheme.len() + 3..];
+
+        // 分离认证信息和 host:port
+        let (auth_part, host_part) = match rest.find('@') {
+            Some(pos) => (Some(&rest[..pos]), &rest[pos + 1..]),
+            None => (None, rest),
+        };
+
+        // 去掉路径部分 (如果有)
+        let host_port = match host_part.find('/') {
+            Some(pos) => &host_part[..pos],
+            None => host_part,
+        };
+
+        if host_port.is_empty() {
+            return Err(format!("proxy URL '{}' has no host", trimmed));
+        }
+
+        Ok(Self {
+            raw: trimmed.to_string(),
+            scheme: scheme.to_string(),
+            host_port: host_port.to_string(),
+            has_auth: auth_part.is_some(),
+        })
+    }
+
+    /// 构建 Chrome `--proxy-server` 参数值
+    ///
+    /// Chrome 的 `--proxy-server` 参数格式: `scheme://host:port`
+    /// (不含凭据, 凭据通过 CDP `Fetch.authRequired` 传递)
+    pub fn chrome_proxy_arg(&self) -> String {
+        format!("--proxy-server={}://{}", self.scheme, self.host_port)
+    }
+}
+
+/// 验证代理列表, 返回有效条目和无效条目
+///
+/// 无效条目不会静默丢弃 —— 返回错误信息供调用方决策。
+/// 借鉴 us/crw 的设计: 格式错误的代理是硬错误, 不 fallback 到直连。
+///
+/// # 示例
+///
+/// ```
+/// use forge::proxy_pool::validate_proxy_list;
+///
+/// let (valid, invalid) = validate_proxy_list(&["http://valid:8080", "invalid"]);
+/// assert_eq!(valid.len(), 1);
+/// assert_eq!(invalid.len(), 1);
+/// ```
+pub fn validate_proxy_list(urls: &[&str]) -> (Vec<ProxyEntry>, Vec<(String, String)>) {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for url in urls {
+        match ProxyEntry::parse(url) {
+            Ok(entry) => valid.push(entry),
+            Err(e) => invalid.push((url.to_string(), e)),
+        }
+    }
+    (valid, invalid)
 }
 
 /// 从环境变量加载代理列表
@@ -523,5 +650,117 @@ mod tests {
     fn test_build_reqwest_proxy_empty() {
         let result = build_reqwest_proxy("");
         assert!(result.is_err());
+    }
+
+    // ===== ProxyEntry 测试 =====
+
+    #[test]
+    fn test_proxy_entry_parse_http() {
+        let entry = ProxyEntry::parse("http://127.0.0.1:8080").unwrap();
+        assert_eq!(entry.scheme, "http");
+        assert_eq!(entry.host_port, "127.0.0.1:8080");
+        assert!(!entry.has_auth);
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_socks5() {
+        let entry = ProxyEntry::parse("socks5://10.0.0.1:1080").unwrap();
+        assert_eq!(entry.scheme, "socks5");
+        assert_eq!(entry.host_port, "10.0.0.1:1080");
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_https() {
+        let entry = ProxyEntry::parse("https://proxy.example.com:443").unwrap();
+        assert_eq!(entry.scheme, "https");
+        assert_eq!(entry.host_port, "proxy.example.com:443");
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_with_auth() {
+        let entry = ProxyEntry::parse("http://user:pass@proxy:8080").unwrap();
+        assert_eq!(entry.scheme, "http");
+        assert_eq!(entry.host_port, "proxy:8080");
+        assert!(entry.has_auth);
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_invalid_scheme() {
+        assert!(ProxyEntry::parse("ftp://proxy:8080").is_err());
+        assert!(ProxyEntry::parse("invalid").is_err());
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_empty() {
+        assert!(ProxyEntry::parse("").is_err());
+        assert!(ProxyEntry::parse("   ").is_err());
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_no_host() {
+        assert!(ProxyEntry::parse("http://").is_err());
+        assert!(ProxyEntry::parse("http:///path").is_err());
+    }
+
+    #[test]
+    fn test_proxy_entry_parse_with_path() {
+        let entry = ProxyEntry::parse("http://proxy:8080/some/path").unwrap();
+        assert_eq!(entry.host_port, "proxy:8080");
+    }
+
+    #[test]
+    fn test_proxy_entry_chrome_proxy_arg() {
+        let entry = ProxyEntry::parse("http://127.0.0.1:8080").unwrap();
+        assert_eq!(
+            entry.chrome_proxy_arg(),
+            "--proxy-server=http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn test_proxy_entry_chrome_proxy_arg_socks5() {
+        let entry = ProxyEntry::parse("socks5://10.0.0.1:1080").unwrap();
+        assert_eq!(
+            entry.chrome_proxy_arg(),
+            "--proxy-server=socks5://10.0.0.1:1080"
+        );
+    }
+
+    #[test]
+    fn test_proxy_entry_case_insensitive_scheme() {
+        let entry = ProxyEntry::parse("HTTP://127.0.0.1:8080").unwrap();
+        assert_eq!(entry.scheme, "http");
+    }
+
+    // ===== validate_proxy_list 测试 =====
+
+    #[test]
+    fn test_validate_proxy_list_all_valid() {
+        let (valid, invalid) = validate_proxy_list(&["http://p1:8080", "socks5://p2:1080"]);
+        assert_eq!(valid.len(), 2);
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn test_validate_proxy_list_mixed() {
+        let (valid, invalid) =
+            validate_proxy_list(&["http://valid:8080", "invalid", "socks5://also:1080"]);
+        assert_eq!(valid.len(), 2);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].0, "invalid");
+    }
+
+    #[test]
+    fn test_validate_proxy_list_all_invalid() {
+        let (valid, invalid) = validate_proxy_list(&["invalid1", "invalid2"]);
+        assert!(valid.is_empty());
+        assert_eq!(invalid.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_proxy_list_empty() {
+        let (valid, invalid) = validate_proxy_list(&[]);
+        assert!(valid.is_empty());
+        assert!(invalid.is_empty());
     }
 }

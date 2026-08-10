@@ -34,6 +34,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// On Unix, Chrome spawns multiple helper processes (GPU, renderer, utility,
+/// crashpad). Killing only the parent leaves orphans that can block the user's
+/// normal Chrome. We launch Chrome in its own process group (`setsid`) so we
+/// can `kill(-pgid, SIGKILL)` the entire tree at once.
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 // ============================================================================
 //  纯函数 — 浏览器路径检测（可测试, 无 I/O 副作用）
 // ============================================================================
@@ -264,6 +271,9 @@ pub struct BrowserLauncher {
     /// Session 69: 用于将实际端口传递给 BrowserManager,
     /// 解决 find_available_port 可能返回不同于 cli.port 的问题。
     port: Option<u16>,
+    /// Unix 进程组 ID — 用于 kill 整个 Chrome 进程树
+    #[cfg(unix)]
+    pgid: Option<i32>,
 }
 
 impl BrowserLauncher {
@@ -273,6 +283,8 @@ impl BrowserLauncher {
             child: None,
             browser_path: None,
             port: None,
+            #[cfg(unix)]
+            pgid: None,
         }
     }
 
@@ -355,12 +367,33 @@ impl BrowserLauncher {
         );
         debug!("启动参数: {}", args.join(" "));
 
-        let child = Command::new(browser_path)
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let mut command = Command::new(browser_path);
+        command.args(&args);
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+
+        // Unix: 启动 Chrome 在新进程组中, 以便后续 kill 整个进程树
+        #[cfg(unix)]
+        {
+            // pre_exec 在 fork 后、exec 前调用
+            // setsid() 创建新会话和新进程组, 使 Chrome 成为进程组长
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+
+        let child = command
             .spawn()
             .context(format!("启动浏览器失败: {}", browser_path.display()))?;
+
+        // Unix: 记录进程组 ID (Chrome 的 PID 就是 pgid, 因为 setsid 使其成为组长)
+        #[cfg(unix)]
+        {
+            self.pgid = Some(child.id() as i32);
+        }
 
         info!("浏览器进程已启动 (PID: {})", child.id());
         self.child = Some(child);
@@ -424,17 +457,53 @@ impl BrowserLauncher {
     ///
     /// 先尝试优雅关闭 (kill), 再等待进程退出。
     /// 如果进程已退出则无操作。
+    ///
+    /// Unix 下会 kill 整个进程组 (kill -pgid), 确保 Chrome helper 进程
+    /// (GPU, renderer, utility, crashpad) 也被终止, 防止孤儿进程。
     pub fn cleanup(&mut self) {
         if let Some(mut child) = self.child.take() {
-            // 尝试关闭进程
+            // Unix: 先尝试 kill 整个进程组
+            #[cfg(unix)]
+            {
+                if let Some(pgid) = self.pgid {
+                    // kill(-pgid, SIGKILL) 杀死整个进程组
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGTERM);
+                    }
+                    debug!("已向进程组 {} 发送 SIGTERM", pgid);
+
+                    // 短暂等待优雅退出
+                    std::thread::sleep(Duration::from_millis(500));
+
+                    // 如果仍在运行, 强制 kill
+                    match child.try_wait() {
+                        Ok(Some(_)) => { /* 已退出 */ }
+                        _ => {
+                            unsafe {
+                                let _ = libc::kill(-pgid, libc::SIGKILL);
+                            }
+                            debug!("已向进程组 {} 发送 SIGKILL", pgid);
+                        }
+                    }
+                }
+            }
+
+            // 通用: kill 子进程
             match child.kill() {
                 Ok(_) => debug!("浏览器进程已发送 kill 信号"),
-                Err(e) => warn!("关闭浏览器进程失败: {}", e),
+                Err(e) => {
+                    // 进程可能已被进程组 kill 终止
+                    debug!("关闭浏览器进程失败 (可能已退出): {}", e)
+                }
             }
             // 等待进程退出 (避免僵尸进程)
             match child.wait() {
                 Ok(status) => debug!("浏览器进程已退出 (状态: {})", status),
                 Err(e) => warn!("等待浏览器进程退出失败: {}", e),
+            }
+            #[cfg(unix)]
+            {
+                self.pgid = None;
             }
             info!("浏览器进程已清理");
         }
@@ -461,6 +530,15 @@ impl BrowserLauncher {
     /// - `None`: 浏览器未启动
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+
+    /// 获取 Unix 进程组 ID (用于调试和诊断)
+    ///
+    /// 仅在 Unix 平台可用。Chrome 启动后, `pgid` 等于 Chrome 主进程 PID,
+    /// 因为 `setsid()` 使其成为进程组长。
+    #[cfg(unix)]
+    pub fn pgid(&self) -> Option<i32> {
+        self.pgid
     }
 
     /// 自动打开默认聊天网页
@@ -978,6 +1056,36 @@ mod tests {
     fn test_port_none_before_launch() {
         let launcher = BrowserLauncher::new();
         assert_eq!(launcher.port(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pgid_none_before_launch() {
+        let launcher = BrowserLauncher::new();
+        assert_eq!(launcher.pgid(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pgid_set_after_launch() {
+        // 使用 sleep 命令模拟浏览器进程
+        let mut launcher = BrowserLauncher::new();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("10");
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().unwrap();
+        launcher.pgid = Some(child.id() as i32);
+        assert!(launcher.pgid().is_some());
+        // 清理
+        unsafe {
+            libc::kill(-launcher.pgid().unwrap(), libc::SIGKILL);
+        }
+        let _ = child.wait();
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@
 //! Library modules can be used independently for testing and integration.
 
 pub mod auto_recovery;
+pub mod ax_snapshot;
 pub mod browser;
 pub mod browser_launcher;
 pub mod cdp;
@@ -67,6 +68,7 @@ pub mod clarify;
 pub mod config;
 pub mod connection_monitor;
 pub mod context_handoff;
+pub mod deadline;
 pub mod dev_trace;
 pub mod error_diagnosis;
 pub mod extract;
@@ -83,11 +85,13 @@ pub mod proxy_pool;
 pub mod response_handler;
 pub mod site_health;
 pub mod slash_command;
+pub mod stealth_patches;
 pub mod steer_reminder;
 pub mod task_graph;
 pub mod testrunner;
 pub mod trace_store;
 pub mod traits;
+pub mod watchdog;
 pub mod workspace;
 
 pub use auto_recovery::{
@@ -96,6 +100,10 @@ pub use auto_recovery::{
     make_success_result, recovery_efficiency, result_error, select_recovery_strategy,
     should_continue_retrying, AutoRecovery, AutoRecoverySummary, BackoffStrategy, RecoveryAction,
     RecoveryConfig, RecoveryResult, RecoveryStrategy, RecoveryUrgency,
+};
+pub use ax_snapshot::{
+    build_snapshot_js, is_content_role, is_interactive_role, is_known_role, is_structural_role,
+    AxNode, AxSnapshot, SnapshotOptions, CONTENT_ROLES, INTERACTIVE_ROLES, STRUCTURAL_ROLES,
 };
 pub use browser::{BrowserManager, ChatTab, SiteType};
 pub use browser_launcher::{
@@ -123,6 +131,7 @@ pub use context_handoff::{
     format_task_section, format_workspace_files_section, is_workspace_file_included,
     should_trigger_handoff, truncate_text, ContextHandoff,
 };
+pub use deadline::{no_deadline, Deadline};
 pub use dev_trace::{
     build_timeline, calculate_success_rate, format_action_stats_line, format_duration_human,
     format_success_rate_percent, format_timeline_line, group_entries_by_action, parse_jsonl_line,
@@ -174,6 +183,9 @@ pub use slash_command::{
     is_prefix_boundary, strip_command_from_text, SlashCommand, SlashCommandAction,
     SlashCommandSummary,
 };
+pub use stealth_patches::{
+    build_bootstrap_script, needs_stealth_patches, patch_names, validate_bootstrap_script,
+};
 pub use steer_reminder::{
     check_remind_needed, extract_phase_name, extract_task_name, format_constraints_section,
     format_goal_line, format_phase_task_line, SteerReminder,
@@ -188,5 +200,9 @@ pub use traits::{
     ChatClient, ChatResult, ClarificationChecker, ClarificationContext, ClarificationResult,
     Failoverable, FileExtractor, FixContext, HumanInteraction, Language, LanguageAdapter,
     PhaseInfo, PlanInfo, TaskAction, TaskInfo, TestRunner,
+};
+pub use watchdog::{
+    event_priority, should_handle_event, should_trigger_auto_recovery, CaptchaWatchdog,
+    ChromeWatchdog, PopupWatchdog, Watchdog, WatchdogRegistry,
 };
 pub use workspace::Workspace;
