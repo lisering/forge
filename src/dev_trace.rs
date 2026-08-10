@@ -36,7 +36,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use crate::evaluator_synergy::EvaluatorSynergySummary;
+use crate::evaluator_synergy::{EvaluatorSynergyHistorySummary, EvaluatorSynergySummary};
 use crate::trace_store::{StorageBackend, StorageConfig as TraceStorageConfig};
 
 // ============================================================================
@@ -2608,6 +2608,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有协同分析数据 (未启用评估器或无 DevTrace)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluator_synergy_summary: Option<EvaluatorSynergySummary>,
+
+    /// 协同分析历史摘要 (Session 92)
+    ///
+    /// 从 `EvaluatorSynergyHistory` (`.forge/evaluator_synergy_history.json`) 提取的
+    /// 跨 session 趋势数据, 展示协同评分和修复率的变化趋势。
+    /// `None` 表示没有历史数据 (首次运行或未启用评估器)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_synergy_history_summary: Option<EvaluatorSynergyHistorySummary>,
 }
 
 impl DevTraceSummary {
@@ -2629,6 +2637,7 @@ impl DevTraceSummary {
             memory_evaluation_summary: None,
             memory_evaluation_history_summary: None,
             evaluator_synergy_summary: None,
+            evaluator_synergy_history_summary: None,
         }
     }
 
@@ -2722,6 +2731,7 @@ impl DevTraceSummary {
             memory_evaluation_summary,
             memory_evaluation_history_summary: None,
             evaluator_synergy_summary: None,
+            evaluator_synergy_history_summary: None,
         }
     }
 
@@ -2778,6 +2788,19 @@ impl DevTraceSummary {
     /// - `summary`: 三评估器协同分析摘要
     pub fn with_evaluator_synergy(mut self, summary: EvaluatorSynergySummary) -> Self {
         self.evaluator_synergy_summary = Some(summary);
+        self
+    }
+
+    /// 附加协同分析历史摘要 (Session 92)
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 协同分析历史摘要
+    pub fn with_evaluator_synergy_history(
+        mut self,
+        summary: EvaluatorSynergyHistorySummary,
+    ) -> Self {
+        self.evaluator_synergy_history_summary = Some(summary);
         self
     }
 
@@ -3167,6 +3190,37 @@ impl DevTraceSummary {
                         inter.affected_evaluator.label(),
                         inter.description,
                     ));
+                }
+            }
+        }
+
+        // === 协同分析历史趋势 (Session 92) ===
+        if let Some(ref syh) = self.evaluator_synergy_history_summary {
+            if !syh.is_empty() {
+                report.push_str("\n  ── 协同分析历史趋势 (跨 Session) ──\n");
+                report.push_str(&format!("  Session 数: {}\n", syh.session_count));
+                report.push_str(&format!(
+                    "  最新协同评分: {:.0}% (平均 {:.0}%)\n",
+                    syh.latest_score * 100.0,
+                    syh.avg_score * 100.0,
+                ));
+                report.push_str(&format!(
+                    "  评分趋势: {} (变化 {:+.1}%)\n",
+                    syh.score_trend.label(),
+                    syh.score_delta * 100.0,
+                ));
+                report.push_str(&format!(
+                    "  最新修复率: {:.1}% (平均 {:.1}%)\n",
+                    syh.latest_fix_rate * 100.0,
+                    syh.avg_fix_rate * 100.0,
+                ));
+                report.push_str(&format!("  修复率趋势: {}\n", syh.fix_rate_trend.label(),));
+                report.push_str(&format!("  累计决策: {} 次\n", syh.total_decisions,));
+                if syh.total_disables > 0 {
+                    report.push_str(&format!("  累计禁用: {} 次\n", syh.total_disables,));
+                }
+                if let Some(ref saved_at) = syh.saved_at {
+                    report.push_str(&format!("  保存时间: {}\n", saved_at));
                 }
             }
         }

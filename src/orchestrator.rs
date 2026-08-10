@@ -3205,9 +3205,38 @@ where
                 summary = summary.with_memory_evaluation_history(me_summary);
             }
 
-            // 附加三评估器协同分析摘要 (Session 91)
+            // 附加三评估器协同分析摘要 (Session 91) + 历史持久化 (Session 92)
             let synergy = self.build_evaluator_synergy();
             if let Some(s) = synergy {
+                // 加载历史, 追加当前 session, 保存历史
+                use crate::evaluator_synergy::{
+                    build_synergy_history_summary, EvaluatorSynergyHistory,
+                };
+                let mut history =
+                    EvaluatorSynergyHistory::load_from_workspace(&self.workspace.root)
+                        .unwrap_or_default();
+                let now = chrono::Utc::now();
+                history.add_from_summary(&s, now);
+                history = history.with_timestamp(now);
+
+                // 构建历史摘要并附加到 DevTraceSummary
+                let history_summary = build_synergy_history_summary(&history);
+                if !history_summary.is_empty() {
+                    summary = summary.with_evaluator_synergy_history(history_summary);
+                }
+
+                // 保存历史到工作区
+                match history.save_to_workspace(&self.workspace.root) {
+                    Ok(()) => {
+                        if !history.is_empty() {
+                            println!("\n  🔗 协同分析历史已保存: {}", history.to_summary());
+                        }
+                    }
+                    Err(e) => {
+                        warn!("保存协同分析历史失败: {}", e);
+                    }
+                }
+
                 summary = summary.with_evaluator_synergy(s);
             }
 
@@ -8621,6 +8650,194 @@ mod tests {
         assert_eq!(export.meta.forge_version, env!("CARGO_PKG_VERSION"));
         // format_version 应为 "1.0"
         assert_eq!(export.meta.format_version, "1.0");
+    }
+
+    // ===== Session 92: 协同分析持久化集成测试 =====
+
+    #[test]
+    fn test_final_report_saves_synergy_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        // 同时启用三个评估器
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 验证协同分析历史文件已创建
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("evaluator_synergy_history.json");
+        assert!(history_path.exists(), "协同分析历史文件应存在");
+
+        // 验证可以加载
+        let loaded =
+            crate::evaluator_synergy::EvaluatorSynergyHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!(loaded.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_final_report_no_synergy_history_without_evaluators() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 不启用任何评估器
+        orch.final_report().unwrap();
+
+        // 不应创建协同分析历史文件
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("evaluator_synergy_history.json");
+        assert!(!history_path.exists(), "无评估器时不应创建协同分析历史文件");
+    }
+
+    #[test]
+    fn test_synergy_history_cross_session_accumulation() {
+        let dir = tempdir().unwrap();
+
+        // Session 1: 保存协同分析历史
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+                .with_cache_tuner(CacheTuner::with_default_config(1800))
+                .with_dev_trace(true);
+            setup_test_phase(&mut orch);
+
+            orch.final_report().unwrap();
+        }
+
+        // 验证 Session 1 的历史
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("evaluator_synergy_history.json");
+        let history1 =
+            crate::evaluator_synergy::EvaluatorSynergyHistory::load(&history_path).unwrap();
+        assert_eq!(history1.session_count(), 1);
+
+        // Session 2: 加载历史并追加
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+                .with_cache_tuner(CacheTuner::with_default_config(1800))
+                .with_dev_trace(true);
+            setup_test_phase(&mut orch);
+
+            orch.final_report().unwrap();
+        }
+
+        // 验证 Session 2 的历史 (应累积为 2 个 session)
+        let history2 =
+            crate::evaluator_synergy::EvaluatorSynergyHistory::load(&history_path).unwrap();
+        assert_eq!(history2.session_count(), 2);
+        assert_eq!(history2.sessions[0].session_index, 1);
+        assert_eq!(history2.sessions[1].session_index, 2);
+    }
+
+    #[test]
+    fn test_synergy_history_in_devtrace_json() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // DevTrace JSON 应包含协同分析历史
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // 协同分析摘要应存在
+        assert!(
+            export.summary.evaluator_synergy_summary.is_some(),
+            "JSON 应包含协同分析摘要"
+        );
+
+        // 协同分析历史摘要应存在
+        let syh = export
+            .summary
+            .evaluator_synergy_history_summary
+            .expect("JSON 应包含协同分析历史摘要");
+        assert_eq!(syh.session_count, 1);
+    }
+
+    #[test]
+    fn test_synergy_history_trend_after_multiple_sessions() {
+        let dir = tempdir().unwrap();
+
+        // 手动创建一个已有 2 个 session 的历史
+        use crate::evaluator_synergy::{EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry};
+        use chrono::Utc;
+
+        {
+            let mut history = EvaluatorSynergyHistory::new();
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                1,
+                Utc::now(),
+                1,
+                0.50,
+                0.60,
+                3,
+                0,
+                false,
+                true,
+            ));
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                2,
+                Utc::now(),
+                1,
+                0.65,
+                0.70,
+                3,
+                0,
+                false,
+                true,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        // Session 3: final_report 应加载历史并追加
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+                .with_cache_tuner(CacheTuner::with_default_config(1800))
+                .with_dev_trace(true);
+            setup_test_phase(&mut orch);
+
+            orch.final_report().unwrap();
+        }
+
+        // 验证历史累积为 3 个 session
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("evaluator_synergy_history.json");
+        let history =
+            crate::evaluator_synergy::EvaluatorSynergyHistory::load(&history_path).unwrap();
+        assert_eq!(history.session_count(), 3);
+        assert_eq!(history.sessions[2].session_index, 3);
+        // 前两个 session 的评分保留
+        assert!((history.sessions[0].synergy_score - 0.50).abs() < 0.001);
+        assert!((history.sessions[1].synergy_score - 0.65).abs() < 0.001);
+        // 第三个 session 的评分由 final_report 构建 (取决于 mock 数据)
+        // 趋势无法预测 (第三 session 评分取决于 mock 环境), 只验证累积正确
     }
 }
 

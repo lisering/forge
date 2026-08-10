@@ -533,7 +533,7 @@ fn test_devtrace_multiple_recovery_events() {
     assert!((stats.success_rate() - 0.25).abs() < 0.001);
 }
 
-/// 测试 21: TraceAction::all() 包含 Recovery + HealthCheck + SiteFailover + PerformanceStats
+/// 测试 21: TraceAction::all() 包含 Recovery + HealthCheck + SiteFailover + PerformanceStats + CacheTuning + SearchQuality + MemoryInjection + MemoryEvaluation
 #[test]
 fn test_trace_action_all_includes_recovery() {
     let all = TraceAction::all();
@@ -541,7 +541,7 @@ fn test_trace_action_all_includes_recovery() {
     assert!(all.contains(&TraceAction::HealthCheck));
     assert!(all.contains(&TraceAction::SiteFailover));
     assert!(all.contains(&TraceAction::PerformanceStats));
-    assert_eq!(all.len(), 18); // 18 种操作类型
+    assert_eq!(all.len(), 22); // 22 种操作类型
 }
 
 /// 测试 22: Recovery 事件与其他 trace 事件共存

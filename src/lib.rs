@@ -173,11 +173,13 @@ pub use error_search::{
 };
 pub use evaluator_synergy::{
     build_evaluator_interactions, build_evaluator_synergy_summary, build_evaluator_timeline,
-    compute_evaluator_action_stats, compute_evaluator_avg_diffs, compute_synergy_score,
-    parse_diff_value, parse_evaluator_timeline_action, save_synergy_summary_to_json,
-    synergy_summary_to_json, synergy_summary_to_json_compact, EvaluatorInteraction,
-    EvaluatorSnapshot, EvaluatorState, EvaluatorSynergySummary, EvaluatorTimelineAction,
-    EvaluatorTimelineEntry, EvaluatorType,
+    build_synergy_history_entry, build_synergy_history_summary, compute_evaluator_action_stats,
+    compute_evaluator_avg_diffs, compute_synergy_score, compute_synergy_trend, parse_diff_value,
+    parse_evaluator_timeline_action, save_synergy_summary_to_json, synergy_summary_to_json,
+    synergy_summary_to_json_compact, EvaluatorInteraction, EvaluatorSnapshot, EvaluatorState,
+    EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry, EvaluatorSynergyHistorySummary,
+    EvaluatorSynergySummary, EvaluatorTimelineAction, EvaluatorTimelineEntry, EvaluatorType,
+    ScoreTrend, EVALUATOR_SYNERGY_HISTORY_FILENAME, MAX_SYNERGY_HISTORY_SESSIONS,
 };
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};

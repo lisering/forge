@@ -1097,6 +1097,687 @@ pub fn save_synergy_summary_to_json(
 }
 
 // ============================================================================
+//  协同分析历史持久化 (Session 92)
+// ============================================================================
+
+/// 协同分析历史文件名
+pub const EVALUATOR_SYNERGY_HISTORY_FILENAME: &str = "evaluator_synergy_history.json";
+
+/// 最大保留的 session 记录数 (超出时移除最旧的)
+pub const MAX_SYNERGY_HISTORY_SESSIONS: usize = 50;
+
+// ============================================================================
+//  ScoreTrend — 趋势方向
+// ============================================================================
+
+/// 趋势方向 — 协同评分或修复率的变化趋势
+///
+/// # 变体
+///
+/// - `Improving` — 趋势上升 (评分提高)
+/// - `Declining` — 趋势下降 (评分降低)
+/// - `Stable` — 趋势稳定 (变化幅度 < 阈值)
+/// - `Insufficient` — 数据不足 (少于 2 个数据点)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScoreTrend {
+    /// 趋势上升
+    Improving,
+    /// 趋势下降
+    Declining,
+    /// 趋势稳定
+    Stable,
+    /// 数据不足
+    Insufficient,
+}
+
+impl ScoreTrend {
+    /// 获取中文描述
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Improving => "上升趋势 📈",
+            Self::Declining => "下降趋势 📉",
+            Self::Stable => "趋势稳定 ➡️",
+            Self::Insufficient => "数据不足",
+        }
+    }
+
+    /// 获取箭头符号
+    pub fn arrow(&self) -> &'static str {
+        match self {
+            Self::Improving => "↑",
+            Self::Declining => "↓",
+            Self::Stable => "→",
+            Self::Insufficient => "—",
+        }
+    }
+}
+
+impl std::fmt::Display for ScoreTrend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+// ============================================================================
+//  EvaluatorSynergyHistoryEntry — 单次 session 的协同分析快照
+// ============================================================================
+
+/// 单次 session 的协同分析快照 — 持久化到历史文件中
+///
+/// 每次 session 结束时从 `EvaluatorSynergySummary` 提取关键指标,
+/// 追加到历史记录中用于跨 session 趋势分析。
+///
+/// # 字段
+///
+/// - `session_index`: session 序号 (从 1 开始)
+/// - `timestamp`: session 结束时间 (UTC)
+/// - `active_evaluators`: 活跃评估器数量 (0~3)
+/// - `synergy_score`: 协同评分 (0.0~1.0)
+/// - `overall_fix_rate`: 总体修复率 (0.0~1.0)
+/// - `total_decisions`: 总决策数
+/// - `total_disables`: 总禁用数
+/// - `any_disabled`: 是否有评估器禁用了功能
+/// - `all_beneficial`: 是否所有评估器都判定功能有效
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorSynergyHistoryEntry {
+    /// session 序号 (从 1 开始)
+    pub session_index: usize,
+    /// session 结束时间 (UTC)
+    pub timestamp: DateTime<Utc>,
+    /// 活跃评估器数量 (0~3)
+    pub active_evaluators: usize,
+    /// 协同评分 (0.0~1.0)
+    pub synergy_score: f64,
+    /// 总体修复率 (0.0~1.0)
+    pub overall_fix_rate: f64,
+    /// 总决策数
+    pub total_decisions: usize,
+    /// 总禁用数
+    pub total_disables: usize,
+    /// 是否有评估器禁用了功能
+    pub any_disabled: bool,
+    /// 是否所有评估器都判定功能有效
+    pub all_beneficial: bool,
+}
+
+impl EvaluatorSynergyHistoryEntry {
+    /// 创建新的历史条目
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_index: usize,
+        timestamp: DateTime<Utc>,
+        active_evaluators: usize,
+        synergy_score: f64,
+        overall_fix_rate: f64,
+        total_decisions: usize,
+        total_disables: usize,
+        any_disabled: bool,
+        all_beneficial: bool,
+    ) -> Self {
+        Self {
+            session_index,
+            timestamp,
+            active_evaluators,
+            synergy_score,
+            overall_fix_rate,
+            total_decisions,
+            total_disables,
+            any_disabled,
+            all_beneficial,
+        }
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        format!(
+            "Session {}: 评分 {:.0}%, 修复率 {:.1}%, {} 决策, {} 禁用, {} 评估器",
+            self.session_index,
+            self.synergy_score * 100.0,
+            self.overall_fix_rate * 100.0,
+            self.total_decisions,
+            self.total_disables,
+            self.active_evaluators,
+        )
+    }
+}
+
+// ============================================================================
+//  EvaluatorSynergyHistory — 跨 session 协同分析历史
+// ============================================================================
+
+/// 跨 session 协同分析历史 — 追踪协同评分变化趋势
+///
+/// 每次 session 结束时将 `EvaluatorSynergySummary` 的关键指标
+/// 追加到历史记录中, 持久化到 `.forge/evaluator_synergy_history.json`。
+///
+/// # 字段
+///
+/// - `sessions`: 各 session 的协同分析快照列表 (按时间顺序)
+/// - `saved_at`: 最后保存时间
+///
+/// # 示例
+///
+/// ```
+/// # use forge::evaluator_synergy::{
+/// #     EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry,
+/// # };
+/// # use chrono::Utc;
+/// let mut history = EvaluatorSynergyHistory::new();
+/// assert!(history.is_empty());
+///
+/// let entry = EvaluatorSynergyHistoryEntry::new(
+///     1, Utc::now(), 3, 0.75, 0.8, 9, 0, false, true,
+/// );
+/// history.add_entry(entry);
+/// assert_eq!(history.session_count(), 1);
+/// assert!((history.latest_synergy_score() - 0.75).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorSynergyHistory {
+    /// 各 session 的协同分析快照列表 (按时间顺序)
+    pub sessions: Vec<EvaluatorSynergyHistoryEntry>,
+    /// 最后保存时间 (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl Default for EvaluatorSynergyHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EvaluatorSynergyHistory {
+    /// 创建空的协同分析历史
+    pub fn new() -> Self {
+        Self {
+            sessions: vec![],
+            saved_at: None,
+        }
+    }
+
+    /// 是否为空 (无 session 记录)
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// session 记录数
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 获取最新的历史条目
+    pub fn latest(&self) -> Option<&EvaluatorSynergyHistoryEntry> {
+        self.sessions.last()
+    }
+
+    /// 获取最新的协同评分
+    pub fn latest_synergy_score(&self) -> f64 {
+        self.latest().map(|e| e.synergy_score).unwrap_or(0.0)
+    }
+
+    /// 获取最新的总体修复率
+    pub fn latest_fix_rate(&self) -> f64 {
+        self.latest().map(|e| e.overall_fix_rate).unwrap_or(0.0)
+    }
+
+    /// 获取所有协同评分列表
+    pub fn synergy_scores(&self) -> Vec<f64> {
+        self.sessions.iter().map(|e| e.synergy_score).collect()
+    }
+
+    /// 获取所有修复率列表
+    pub fn fix_rates(&self) -> Vec<f64> {
+        self.sessions.iter().map(|e| e.overall_fix_rate).collect()
+    }
+
+    /// 计算平均协同评分
+    pub fn avg_synergy_score(&self) -> f64 {
+        if self.sessions.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.sessions.iter().map(|e| e.synergy_score).sum();
+        sum / self.sessions.len() as f64
+    }
+
+    /// 计算平均修复率
+    pub fn avg_fix_rate(&self) -> f64 {
+        if self.sessions.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.sessions.iter().map(|e| e.overall_fix_rate).sum();
+        sum / self.sessions.len() as f64
+    }
+
+    /// 获取下一个 session 序号
+    pub fn next_session_index(&self) -> usize {
+        self.sessions
+            .last()
+            .map(|e| e.session_index + 1)
+            .unwrap_or(1)
+    }
+
+    /// 添加一条 session 记录
+    ///
+    /// 超过 `MAX_SYNERGY_HISTORY_SESSIONS` 时移除最旧的记录。
+    pub fn add_entry(&mut self, entry: EvaluatorSynergyHistoryEntry) {
+        self.sessions.push(entry);
+        if self.sessions.len() > MAX_SYNERGY_HISTORY_SESSIONS {
+            self.sessions.remove(0);
+        }
+    }
+
+    /// 从 `EvaluatorSynergySummary` 添加当前 session 的记录
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 当前 session 的协同分析摘要
+    /// - `timestamp`: session 结束时间
+    pub fn add_from_summary(
+        &mut self,
+        summary: &EvaluatorSynergySummary,
+        timestamp: DateTime<Utc>,
+    ) {
+        let entry = build_synergy_history_entry(summary, self.next_session_index(), timestamp);
+        self.add_entry(entry);
+    }
+
+    /// 协同评分趋势
+    pub fn synergy_score_trend(&self) -> ScoreTrend {
+        compute_synergy_trend(&self.synergy_scores())
+    }
+
+    /// 修复率趋势
+    pub fn fix_rate_trend(&self) -> ScoreTrend {
+        compute_synergy_trend(&self.fix_rates())
+    }
+
+    /// 协同评分变化量 (最新 - 最早)
+    pub fn synergy_score_delta(&self) -> f64 {
+        if self.sessions.len() < 2 {
+            return 0.0;
+        }
+        let first = self.sessions.first().unwrap().synergy_score;
+        let last = self.sessions.last().unwrap().synergy_score;
+        last - first
+    }
+
+    /// 累计总决策数 (所有 session)
+    pub fn total_decisions_across_sessions(&self) -> usize {
+        self.sessions.iter().map(|e| e.total_decisions).sum()
+    }
+
+    /// 累计总禁用数 (所有 session)
+    pub fn total_disables_across_sessions(&self) -> usize {
+        self.sessions.iter().map(|e| e.total_disables).sum()
+    }
+
+    /// 设置保存时间戳
+    pub fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.saved_at = Some(timestamp.to_rfc3339());
+        self
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        if self.is_empty() {
+            return "协同分析历史: 无记录".to_string();
+        }
+        let trend = self.synergy_score_trend();
+        format!(
+            "协同分析历史: {} 个 session, 平均评分 {:.0}%, 最新 {:.0}%, 趋势 {}",
+            self.session_count(),
+            self.avg_synergy_score() * 100.0,
+            self.latest_synergy_score() * 100.0,
+            trend.label(),
+        )
+    }
+
+    // --- 持久化方法 ---
+
+    /// 从 JSON 文件加载历史
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    ///
+    /// # 错误
+    ///
+    /// 文件读取或反序列化失败时返回错误。
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(Self::new());
+        }
+        let history: Self = serde_json::from_str(&content)?;
+        Ok(history)
+    }
+
+    /// 保存历史到 JSON 文件
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    ///
+    /// # 错误
+    ///
+    /// 文件写入或序列化失败时返回错误。
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// 从工作区加载历史
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录路径
+    ///
+    /// # 返回
+    ///
+    /// 加载成功返回 `Some(Self)`, 文件不存在或解析失败返回 `None`。
+    pub fn load_from_workspace(workspace_root: &std::path::Path) -> Option<Self> {
+        let path = workspace_root
+            .join(".forge")
+            .join(EVALUATOR_SYNERGY_HISTORY_FILENAME);
+        match Self::load(&path) {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(_) => None,
+        }
+    }
+
+    /// 保存历史到工作区
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录路径
+    ///
+    /// # 错误
+    ///
+    /// 文件写入或序列化失败时返回错误。
+    pub fn save_to_workspace(&self, workspace_root: &std::path::Path) -> Result<()> {
+        let path = workspace_root
+            .join(".forge")
+            .join(EVALUATOR_SYNERGY_HISTORY_FILENAME);
+        self.save(&path)
+    }
+}
+
+// ============================================================================
+//  EvaluatorSynergyHistorySummary — 历史摘要 (用于 DevTraceSummary 面板)
+// ============================================================================
+
+/// 协同分析历史摘要 — 用于 DevTraceSummary 面板展示
+///
+/// 从 `EvaluatorSynergyHistory` 提取关键趋势信息,
+/// 展示协同评分和修复率的跨 session 变化趋势。
+///
+/// # 字段
+///
+/// - `session_count`: session 记录数
+/// - `latest_score`: 最新协同评分 (0.0~1.0)
+/// - `avg_score`: 平均协同评分 (0.0~1.0)
+/// - `score_trend`: 协同评分趋势
+/// - `score_delta`: 评分变化量 (最新 - 最早)
+/// - `latest_fix_rate`: 最新修复率 (0.0~1.0)
+/// - `avg_fix_rate`: 平均修复率 (0.0~1.0)
+/// - `fix_rate_trend`: 修复率趋势
+/// - `total_decisions`: 累计总决策数
+/// - `total_disables`: 累计总禁用数
+/// - `saved_at`: 保存时间 (ISO 8601, 可选)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::evaluator_synergy::{
+/// #     EvaluatorSynergyHistorySummary, ScoreTrend,
+/// # };
+/// let s = EvaluatorSynergyHistorySummary::new(
+///     3, 0.75, 0.70, ScoreTrend::Improving, 0.05,
+///     0.80, 0.78, ScoreTrend::Stable,
+///     27, 0, None,
+/// );
+/// assert_eq!(s.session_count, 3);
+/// assert!(!s.is_empty());
+/// assert!((s.avg_score - 0.70).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorSynergyHistorySummary {
+    /// session 记录数
+    pub session_count: usize,
+    /// 最新协同评分 (0.0~1.0)
+    pub latest_score: f64,
+    /// 平均协同评分 (0.0~1.0)
+    pub avg_score: f64,
+    /// 协同评分趋势
+    pub score_trend: ScoreTrend,
+    /// 评分变化量 (最新 - 最早)
+    pub score_delta: f64,
+    /// 最新修复率 (0.0~1.0)
+    pub latest_fix_rate: f64,
+    /// 平均修复率 (0.0~1.0)
+    pub avg_fix_rate: f64,
+    /// 修复率趋势
+    pub fix_rate_trend: ScoreTrend,
+    /// 累计总决策数 (所有 session)
+    pub total_decisions: usize,
+    /// 累计总禁用数 (所有 session)
+    pub total_disables: usize,
+    /// 保存时间 (ISO 8601, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl EvaluatorSynergyHistorySummary {
+    /// 创建协同分析历史摘要
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_count: usize,
+        latest_score: f64,
+        avg_score: f64,
+        score_trend: ScoreTrend,
+        score_delta: f64,
+        latest_fix_rate: f64,
+        avg_fix_rate: f64,
+        fix_rate_trend: ScoreTrend,
+        total_decisions: usize,
+        total_disables: usize,
+        saved_at: Option<String>,
+    ) -> Self {
+        Self {
+            session_count,
+            latest_score,
+            avg_score,
+            score_trend,
+            score_delta,
+            latest_fix_rate,
+            avg_fix_rate,
+            fix_rate_trend,
+            total_decisions,
+            total_disables,
+            saved_at,
+        }
+    }
+
+    /// 是否为空 (无 session 记录)
+    pub fn is_empty(&self) -> bool {
+        self.session_count == 0
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        if self.is_empty() {
+            return "协同分析历史: 无记录".to_string();
+        }
+        format!(
+            "协同分析历史: {} session, 最新 {:.0}% {} (均 {:.0}%), 修复率 {:.1}%",
+            self.session_count,
+            self.latest_score * 100.0,
+            self.score_trend.arrow(),
+            self.avg_score * 100.0,
+            self.latest_fix_rate * 100.0,
+        )
+    }
+}
+
+// ============================================================================
+//  纯函数
+// ============================================================================
+
+/// 从协同分析摘要构建历史条目
+///
+/// # 参数
+///
+/// - `summary`: 当前 session 的协同分析摘要
+/// - `session_index`: session 序号
+/// - `timestamp`: session 结束时间
+///
+/// # 返回
+///
+/// 可追加到历史记录的条目
+///
+/// # 示例
+///
+/// ```
+/// # use forge::evaluator_synergy::{
+/// #     EvaluatorSynergySummary, build_synergy_history_entry,
+/// # };
+/// # use chrono::Utc;
+/// let summary = EvaluatorSynergySummary::empty();
+/// let entry = build_synergy_history_entry(&summary, 1, Utc::now());
+/// assert_eq!(entry.session_index, 1);
+/// assert_eq!(entry.active_evaluators, 0);
+/// ```
+pub fn build_synergy_history_entry(
+    summary: &EvaluatorSynergySummary,
+    session_index: usize,
+    timestamp: DateTime<Utc>,
+) -> EvaluatorSynergyHistoryEntry {
+    EvaluatorSynergyHistoryEntry::new(
+        session_index,
+        timestamp,
+        summary.active_evaluators,
+        summary.synergy_score,
+        summary.overall_fix_rate,
+        summary.total_decisions,
+        summary.total_disables,
+        summary.any_disabled,
+        summary.all_beneficial,
+    )
+}
+
+/// 从评分列表计算趋势
+///
+/// # 参数
+///
+/// - `scores`: 评分列表 (按时间顺序)
+///
+/// # 返回
+///
+/// - 少于 2 个数据点 → `Insufficient`
+/// - 最新评分 > 最早评分 + 阈值 → `Improving`
+/// - 最新评分 < 最早评分 - 阈值 → `Declining`
+/// - 其他 → `Stable`
+///
+/// # 示例
+///
+/// ```
+/// # use forge::evaluator_synergy::{compute_synergy_trend, ScoreTrend};
+/// assert_eq!(compute_synergy_trend(&[]), ScoreTrend::Insufficient);
+/// assert_eq!(compute_synergy_trend(&[0.5]), ScoreTrend::Insufficient);
+/// assert_eq!(compute_synergy_trend(&[0.5, 0.8]), ScoreTrend::Improving);
+/// assert_eq!(compute_synergy_trend(&[0.8, 0.5]), ScoreTrend::Declining);
+/// assert_eq!(compute_synergy_trend(&[0.5, 0.52]), ScoreTrend::Stable);
+/// ```
+pub fn compute_synergy_trend(scores: &[f64]) -> ScoreTrend {
+    const TREND_THRESHOLD: f64 = 0.05; // 5% 变化阈值
+
+    if scores.len() < 2 {
+        return ScoreTrend::Insufficient;
+    }
+
+    let first = scores.first().unwrap();
+    let last = scores.last().unwrap();
+    let delta = last - first;
+
+    if delta > TREND_THRESHOLD {
+        ScoreTrend::Improving
+    } else if delta < -TREND_THRESHOLD {
+        ScoreTrend::Declining
+    } else {
+        ScoreTrend::Stable
+    }
+}
+
+/// 从协同分析历史构建历史摘要
+///
+/// # 参数
+///
+/// - `history`: 协同分析历史
+///
+/// # 返回
+///
+/// 可附加到 DevTraceSummary 的历史摘要
+///
+/// # 示例
+///
+/// ```
+/// # use forge::evaluator_synergy::{
+/// #     EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry,
+/// #     build_synergy_history_summary,
+/// # };
+/// # use chrono::Utc;
+/// let mut history = EvaluatorSynergyHistory::new();
+/// history.add_entry(EvaluatorSynergyHistoryEntry::new(
+///     1, Utc::now(), 3, 0.75, 0.8, 9, 0, false, true,
+/// ));
+/// let summary = build_synergy_history_summary(&history);
+/// assert_eq!(summary.session_count, 1);
+/// assert!((summary.latest_score - 0.75).abs() < 0.001);
+/// ```
+pub fn build_synergy_history_summary(
+    history: &EvaluatorSynergyHistory,
+) -> EvaluatorSynergyHistorySummary {
+    if history.is_empty() {
+        return EvaluatorSynergyHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0,
+            0,
+            history.saved_at.clone(),
+        );
+    }
+
+    EvaluatorSynergyHistorySummary::new(
+        history.session_count(),
+        history.latest_synergy_score(),
+        history.avg_synergy_score(),
+        history.synergy_score_trend(),
+        history.synergy_score_delta(),
+        history.latest_fix_rate(),
+        history.avg_fix_rate(),
+        history.fix_rate_trend(),
+        history.total_decisions_across_sessions(),
+        history.total_disables_across_sessions(),
+        history.saved_at.clone(),
+    )
+}
+
+// ============================================================================
 //  测试
 // ============================================================================
 
@@ -2747,5 +3428,1067 @@ mod tests {
         let summary = build_evaluator_synergy_summary(&states, 20, 12, &[]);
         assert!(summary.any_disabled);
         assert!(!summary.all_beneficial);
+    }
+
+    // ======================================================================
+    //  ScoreTrend 测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_score_trend_label() {
+        assert_eq!(ScoreTrend::Improving.label(), "上升趋势 📈");
+        assert_eq!(ScoreTrend::Declining.label(), "下降趋势 📉");
+        assert_eq!(ScoreTrend::Stable.label(), "趋势稳定 ➡️");
+        assert_eq!(ScoreTrend::Insufficient.label(), "数据不足");
+    }
+
+    #[test]
+    fn test_score_trend_arrow() {
+        assert_eq!(ScoreTrend::Improving.arrow(), "↑");
+        assert_eq!(ScoreTrend::Declining.arrow(), "↓");
+        assert_eq!(ScoreTrend::Stable.arrow(), "→");
+        assert_eq!(ScoreTrend::Insufficient.arrow(), "—");
+    }
+
+    #[test]
+    fn test_score_trend_display() {
+        assert_eq!(format!("{}", ScoreTrend::Improving), "上升趋势 📈");
+        assert_eq!(format!("{}", ScoreTrend::Declining), "下降趋势 📉");
+    }
+
+    #[test]
+    fn test_score_trend_serde() {
+        let json = serde_json::to_string(&ScoreTrend::Improving).unwrap();
+        let loaded: ScoreTrend = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, ScoreTrend::Improving);
+    }
+
+    // ======================================================================
+    //  EvaluatorSynergyHistoryEntry 测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_history_entry_new() {
+        let entry =
+            EvaluatorSynergyHistoryEntry::new(1, Utc::now(), 3, 0.75, 0.8, 9, 0, false, true);
+        assert_eq!(entry.session_index, 1);
+        assert_eq!(entry.active_evaluators, 3);
+        assert!((entry.synergy_score - 0.75).abs() < 0.001);
+        assert!((entry.overall_fix_rate - 0.8).abs() < 0.001);
+        assert_eq!(entry.total_decisions, 9);
+        assert_eq!(entry.total_disables, 0);
+        assert!(!entry.any_disabled);
+        assert!(entry.all_beneficial);
+    }
+
+    #[test]
+    fn test_history_entry_to_summary() {
+        let entry =
+            EvaluatorSynergyHistoryEntry::new(2, Utc::now(), 2, 0.60, 0.65, 5, 1, true, false);
+        let s = entry.to_summary();
+        assert!(s.contains("Session 2"));
+        assert!(s.contains("60%"));
+        assert!(s.contains("65.0%"));
+        assert!(s.contains("5 决策"));
+        assert!(s.contains("1 禁用"));
+        assert!(s.contains("2 评估器"));
+    }
+
+    #[test]
+    fn test_history_entry_serde() {
+        let entry =
+            EvaluatorSynergyHistoryEntry::new(1, Utc::now(), 3, 0.75, 0.8, 9, 0, false, true);
+        let json = serde_json::to_string(&entry).unwrap();
+        let loaded: EvaluatorSynergyHistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.session_index, 1);
+        assert_eq!(loaded.active_evaluators, 3);
+        assert!((loaded.synergy_score - 0.75).abs() < 0.001);
+    }
+
+    // ======================================================================
+    //  EvaluatorSynergyHistory 测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_history_new() {
+        let history = EvaluatorSynergyHistory::new();
+        assert!(history.is_empty());
+        assert_eq!(history.session_count(), 0);
+        assert!(history.saved_at.is_none());
+    }
+
+    #[test]
+    fn test_history_default() {
+        let history = EvaluatorSynergyHistory::default();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_history_add_entry() {
+        let mut history = EvaluatorSynergyHistory::new();
+        let entry =
+            EvaluatorSynergyHistoryEntry::new(1, Utc::now(), 3, 0.75, 0.8, 9, 0, false, true);
+        history.add_entry(entry);
+        assert_eq!(history.session_count(), 1);
+        assert!(!history.is_empty());
+    }
+
+    #[test]
+    fn test_history_add_multiple_entries() {
+        let mut history = EvaluatorSynergyHistory::new();
+        for i in 0..5 {
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                i + 1,
+                Utc::now(),
+                3,
+                0.5 + i as f64 * 0.05,
+                0.7,
+                9,
+                0,
+                false,
+                true,
+            ));
+        }
+        assert_eq!(history.session_count(), 5);
+        assert!((history.latest_synergy_score() - 0.70).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_max_sessions() {
+        let mut history = EvaluatorSynergyHistory::new();
+        for i in 0..(MAX_SYNERGY_HISTORY_SESSIONS + 10) {
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                i + 1,
+                Utc::now(),
+                3,
+                0.5,
+                0.7,
+                9,
+                0,
+                false,
+                true,
+            ));
+        }
+        assert_eq!(history.session_count(), MAX_SYNERGY_HISTORY_SESSIONS);
+        // 最旧的应被移除, session_index 从 11 开始
+        assert_eq!(history.sessions.first().unwrap().session_index, 11);
+    }
+
+    #[test]
+    fn test_history_latest() {
+        let mut history = EvaluatorSynergyHistory::new();
+        assert!(history.latest().is_none());
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert!(history.latest().is_some());
+        assert_eq!(history.latest().unwrap().session_index, 1);
+    }
+
+    #[test]
+    fn test_history_latest_synergy_score() {
+        let mut history = EvaluatorSynergyHistory::new();
+        assert!((history.latest_synergy_score() - 0.0).abs() < 0.001);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert!((history.latest_synergy_score() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_latest_fix_rate() {
+        let mut history = EvaluatorSynergyHistory::new();
+        assert!((history.latest_fix_rate() - 0.0).abs() < 0.001);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert!((history.latest_fix_rate() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_synergy_scores() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let scores = history.synergy_scores();
+        assert_eq!(scores.len(), 2);
+        assert!((scores[0] - 0.5).abs() < 0.001);
+        assert!((scores[1] - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_fix_rates() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let rates = history.fix_rates();
+        assert_eq!(rates.len(), 1);
+        assert!((rates[0] - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_avg_synergy_score() {
+        let mut history = EvaluatorSynergyHistory::new();
+        assert!((history.avg_synergy_score() - 0.0).abs() < 0.001);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.6,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            9,
+            0,
+            false,
+            true,
+        ));
+        // avg = (0.6 + 0.8) / 2 = 0.7
+        assert!((history.avg_synergy_score() - 0.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_avg_fix_rate() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.6,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        // avg = (0.7 + 0.8) / 2 = 0.75
+        assert!((history.avg_fix_rate() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_next_session_index() {
+        let mut history = EvaluatorSynergyHistory::new();
+        assert_eq!(history.next_session_index(), 1);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.6,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.next_session_index(), 2);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.next_session_index(), 3);
+    }
+
+    #[test]
+    fn test_history_add_from_summary() {
+        let mut history = EvaluatorSynergyHistory::new();
+        let summary = EvaluatorSynergySummary::empty();
+        history.add_from_summary(&summary, Utc::now());
+        assert_eq!(history.session_count(), 1);
+        assert_eq!(history.sessions[0].session_index, 1);
+        assert_eq!(history.sessions[0].active_evaluators, 0);
+
+        // 第二次添加
+        history.add_from_summary(&summary, Utc::now());
+        assert_eq!(history.session_count(), 2);
+        assert_eq!(history.sessions[1].session_index, 2);
+    }
+
+    #[test]
+    fn test_history_synergy_score_trend() {
+        let mut history = EvaluatorSynergyHistory::new();
+        // 0 个 → Insufficient
+        assert_eq!(history.synergy_score_trend(), ScoreTrend::Insufficient);
+
+        // 1 个 → Insufficient
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.synergy_score_trend(), ScoreTrend::Insufficient);
+
+        // 2 个, 上升 → Improving
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.synergy_score_trend(), ScoreTrend::Improving);
+    }
+
+    #[test]
+    fn test_history_fix_rate_trend() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.6,
+            0.5,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.fix_rate_trend(), ScoreTrend::Declining);
+    }
+
+    #[test]
+    fn test_history_synergy_score_delta() {
+        let mut history = EvaluatorSynergyHistory::new();
+        // 0 或 1 个 → 0.0
+        assert!((history.synergy_score_delta() - 0.0).abs() < 0.001);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        assert!((history.synergy_score_delta() - 0.0).abs() < 0.001);
+
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            9,
+            0,
+            false,
+            true,
+        ));
+        // delta = 0.8 - 0.5 = 0.3
+        assert!((history.synergy_score_delta() - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_total_decisions_across_sessions() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            12,
+            0,
+            false,
+            true,
+        ));
+        assert_eq!(history.total_decisions_across_sessions(), 21);
+    }
+
+    #[test]
+    fn test_history_total_disables_across_sessions() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.5,
+            0.7,
+            9,
+            1,
+            true,
+            false,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.8,
+            0.75,
+            12,
+            2,
+            true,
+            false,
+        ));
+        assert_eq!(history.total_disables_across_sessions(), 3);
+    }
+
+    #[test]
+    fn test_history_with_timestamp() {
+        let history = EvaluatorSynergyHistory::new().with_timestamp(Utc::now());
+        assert!(history.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_history_to_summary_empty() {
+        let history = EvaluatorSynergyHistory::new();
+        assert_eq!(history.to_summary(), "协同分析历史: 无记录");
+    }
+
+    #[test]
+    fn test_history_to_summary_with_data() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let s = history.to_summary();
+        assert!(s.contains("1 个 session"));
+        assert!(s.contains("75%"));
+    }
+
+    #[test]
+    fn test_history_serde_roundtrip() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let json = serde_json::to_string(&history).unwrap();
+        let loaded: EvaluatorSynergyHistory = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!((loaded.latest_synergy_score() - 0.75).abs() < 0.001);
+    }
+
+    // ======================================================================
+    //  EvaluatorSynergyHistory 持久化测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_history_load_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let history = EvaluatorSynergyHistory::load(&path).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_history_load_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        std::fs::write(&path, "").unwrap();
+        let history = EvaluatorSynergyHistory::load(&path).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_history_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synergy_history.json");
+
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.save(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = EvaluatorSynergyHistory::load(&path).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!((loaded.latest_synergy_score() - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_history_save_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("subdir")
+            .join("nested")
+            .join("synergy_history.json");
+
+        let history = EvaluatorSynergyHistory::new();
+        history.save(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_history_load_from_workspace_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(EvaluatorSynergyHistory::load_from_workspace(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_history_load_from_workspace_existing() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 先保存
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.save_to_workspace(dir.path()).unwrap();
+
+        // 加载
+        let loaded = EvaluatorSynergyHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().session_count(), 1);
+    }
+
+    #[test]
+    fn test_history_load_from_workspace_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 保存空历史
+        let history = EvaluatorSynergyHistory::new();
+        history.save_to_workspace(dir.path()).unwrap();
+
+        // 空历史 → None
+        assert!(EvaluatorSynergyHistory::load_from_workspace(dir.path()).is_none());
+    }
+
+    #[test]
+    fn test_history_save_to_workspace_creates_forge_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = EvaluatorSynergyHistory::new();
+        history.save_to_workspace(dir.path()).unwrap();
+
+        let path = dir
+            .path()
+            .join(".forge")
+            .join(EVALUATOR_SYNERGY_HISTORY_FILENAME);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_history_cross_session_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Session 1: 保存
+        {
+            let mut history = EvaluatorSynergyHistory::new();
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                1,
+                Utc::now(),
+                3,
+                0.60,
+                0.70,
+                9,
+                0,
+                false,
+                true,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        // Session 2: 加载并追加
+        {
+            let mut history =
+                EvaluatorSynergyHistory::load_from_workspace(dir.path()).unwrap_or_default();
+            assert_eq!(history.session_count(), 1);
+            assert_eq!(history.next_session_index(), 2);
+
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                2,
+                Utc::now(),
+                3,
+                0.75,
+                0.80,
+                9,
+                0,
+                false,
+                true,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        // Session 3: 加载验证
+        {
+            let history =
+                EvaluatorSynergyHistory::load_from_workspace(dir.path()).unwrap_or_default();
+            assert_eq!(history.session_count(), 2);
+            assert_eq!(history.synergy_score_trend(), ScoreTrend::Improving);
+            assert!((history.synergy_score_delta() - 0.15).abs() < 0.001);
+        }
+    }
+
+    // ======================================================================
+    //  EvaluatorSynergyHistorySummary 测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_history_summary_new() {
+        let s = EvaluatorSynergyHistorySummary::new(
+            3,
+            0.75,
+            0.70,
+            ScoreTrend::Improving,
+            0.05,
+            0.80,
+            0.78,
+            ScoreTrend::Stable,
+            27,
+            0,
+            None,
+        );
+        assert_eq!(s.session_count, 3);
+        assert!((s.latest_score - 0.75).abs() < 0.001);
+        assert!((s.avg_score - 0.70).abs() < 0.001);
+        assert_eq!(s.score_trend, ScoreTrend::Improving);
+        assert!((s.score_delta - 0.05).abs() < 0.001);
+        assert!((s.latest_fix_rate - 0.80).abs() < 0.001);
+        assert!((s.avg_fix_rate - 0.78).abs() < 0.001);
+        assert_eq!(s.fix_rate_trend, ScoreTrend::Stable);
+        assert_eq!(s.total_decisions, 27);
+        assert_eq!(s.total_disables, 0);
+        assert!(s.saved_at.is_none());
+    }
+
+    #[test]
+    fn test_history_summary_is_empty() {
+        let empty = EvaluatorSynergyHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0,
+            0,
+            None,
+        );
+        assert!(empty.is_empty());
+
+        let non_empty = EvaluatorSynergyHistorySummary::new(
+            1,
+            0.5,
+            0.5,
+            ScoreTrend::Insufficient,
+            0.0,
+            0.7,
+            0.7,
+            ScoreTrend::Insufficient,
+            5,
+            0,
+            None,
+        );
+        assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn test_history_summary_to_summary_empty() {
+        let empty = EvaluatorSynergyHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0,
+            0,
+            None,
+        );
+        assert_eq!(empty.to_summary(), "协同分析历史: 无记录");
+    }
+
+    #[test]
+    fn test_history_summary_to_summary_with_data() {
+        let s = EvaluatorSynergyHistorySummary::new(
+            3,
+            0.75,
+            0.70,
+            ScoreTrend::Improving,
+            0.05,
+            0.80,
+            0.78,
+            ScoreTrend::Stable,
+            27,
+            0,
+            None,
+        );
+        let summary = s.to_summary();
+        assert!(summary.contains("3 session"));
+        assert!(summary.contains("75%"));
+        assert!(summary.contains("↑"));
+        assert!(summary.contains("70%"));
+        assert!(summary.contains("80.0%"));
+    }
+
+    #[test]
+    fn test_history_summary_serde() {
+        let s = EvaluatorSynergyHistorySummary::new(
+            3,
+            0.75,
+            0.70,
+            ScoreTrend::Improving,
+            0.05,
+            0.80,
+            0.78,
+            ScoreTrend::Stable,
+            27,
+            0,
+            Some("2024-06-01T12:00:00Z".to_string()),
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: EvaluatorSynergyHistorySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.session_count, 3);
+        assert_eq!(loaded.score_trend, ScoreTrend::Improving);
+        assert_eq!(loaded.saved_at, Some("2024-06-01T12:00:00Z".to_string()));
+    }
+
+    // ======================================================================
+    //  纯函数测试 (Session 92)
+    // ======================================================================
+
+    #[test]
+    fn test_build_synergy_history_entry() {
+        let states = vec![EvaluatorState::new(
+            EvaluatorType::CacheTuner,
+            true,
+            0.8,
+            0.6,
+            0.2,
+            true,
+            10,
+            3,
+            0,
+        )];
+        let summary = build_evaluator_synergy_summary(&states, 10, 8, &[]);
+        let entry = build_synergy_history_entry(&summary, 1, Utc::now());
+        assert_eq!(entry.session_index, 1);
+        assert_eq!(entry.active_evaluators, 1);
+        assert!((entry.synergy_score - summary.synergy_score).abs() < 0.001);
+        assert!((entry.overall_fix_rate - 0.8).abs() < 0.001);
+        assert_eq!(entry.total_decisions, 3);
+    }
+
+    #[test]
+    fn test_build_synergy_history_entry_empty_summary() {
+        let summary = EvaluatorSynergySummary::empty();
+        let entry = build_synergy_history_entry(&summary, 1, Utc::now());
+        assert_eq!(entry.session_index, 1);
+        assert_eq!(entry.active_evaluators, 0);
+        assert!((entry.synergy_score - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_empty() {
+        assert_eq!(compute_synergy_trend(&[]), ScoreTrend::Insufficient);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_single() {
+        assert_eq!(compute_synergy_trend(&[0.5]), ScoreTrend::Insufficient);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_improving() {
+        assert_eq!(compute_synergy_trend(&[0.5, 0.8]), ScoreTrend::Improving);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_declining() {
+        assert_eq!(compute_synergy_trend(&[0.8, 0.5]), ScoreTrend::Declining);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_stable() {
+        assert_eq!(compute_synergy_trend(&[0.5, 0.52]), ScoreTrend::Stable);
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_multi_improving() {
+        assert_eq!(
+            compute_synergy_trend(&[0.3, 0.5, 0.7, 0.9]),
+            ScoreTrend::Improving
+        );
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_multi_declining() {
+        assert_eq!(
+            compute_synergy_trend(&[0.9, 0.7, 0.5, 0.3]),
+            ScoreTrend::Declining
+        );
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_multi_stable() {
+        assert_eq!(
+            compute_synergy_trend(&[0.5, 0.51, 0.52, 0.53]),
+            ScoreTrend::Stable
+        );
+    }
+
+    #[test]
+    fn test_compute_synergy_trend_exact_threshold() {
+        // delta = 0.04 → < 0.05 → Stable
+        assert_eq!(compute_synergy_trend(&[0.50, 0.54]), ScoreTrend::Stable);
+        // delta = 0.06 → > 0.05 → Improving
+        assert_eq!(compute_synergy_trend(&[0.50, 0.56]), ScoreTrend::Improving);
+    }
+
+    #[test]
+    fn test_build_synergy_history_summary_empty() {
+        let history = EvaluatorSynergyHistory::new();
+        let summary = build_synergy_history_summary(&history);
+        assert!(summary.is_empty());
+        assert_eq!(summary.score_trend, ScoreTrend::Insufficient);
+        assert_eq!(summary.fix_rate_trend, ScoreTrend::Insufficient);
+    }
+
+    #[test]
+    fn test_build_synergy_history_summary_single() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let summary = build_synergy_history_summary(&history);
+        assert_eq!(summary.session_count, 1);
+        assert!((summary.latest_score - 0.75).abs() < 0.001);
+        assert!((summary.avg_score - 0.75).abs() < 0.001);
+        assert_eq!(summary.score_trend, ScoreTrend::Insufficient);
+        assert_eq!(summary.total_decisions, 9);
+    }
+
+    #[test]
+    fn test_build_synergy_history_summary_multi() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.50,
+            0.70,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            2,
+            Utc::now(),
+            3,
+            0.60,
+            0.75,
+            9,
+            0,
+            false,
+            true,
+        ));
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            3,
+            Utc::now(),
+            3,
+            0.75,
+            0.80,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let summary = build_synergy_history_summary(&history);
+        assert_eq!(summary.session_count, 3);
+        assert!((summary.latest_score - 0.75).abs() < 0.001);
+        // avg = (0.50 + 0.60 + 0.75) / 3 = 0.6167
+        assert!((summary.avg_score - 0.6167).abs() < 0.001);
+        assert_eq!(summary.score_trend, ScoreTrend::Improving);
+        // delta = 0.75 - 0.50 = 0.25
+        assert!((summary.score_delta - 0.25).abs() < 0.001);
+        assert_eq!(summary.total_decisions, 27);
+    }
+
+    #[test]
+    fn test_build_synergy_history_summary_with_saved_at() {
+        let mut history = EvaluatorSynergyHistory::new();
+        history.add_entry(EvaluatorSynergyHistoryEntry::new(
+            1,
+            Utc::now(),
+            3,
+            0.75,
+            0.8,
+            9,
+            0,
+            false,
+            true,
+        ));
+        let history = history.with_timestamp(Utc::now());
+        let summary = build_synergy_history_summary(&history);
+        assert!(summary.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_history_filename_constant() {
+        assert_eq!(
+            EVALUATOR_SYNERGY_HISTORY_FILENAME,
+            "evaluator_synergy_history.json"
+        );
+    }
+
+    #[test]
+    fn test_max_sessions_constant() {
+        assert_eq!(MAX_SYNERGY_HISTORY_SESSIONS, 50);
     }
 }
