@@ -79,6 +79,8 @@ pub enum TraceAction {
     PerformanceStats,
     /// 网页搜索 — AI 通过 /search 指令主动搜索网页/查阅文档
     WebSearch,
+    /// 增量发送 — LiveContinuation / RadixTree 增量发送统计
+    IncrementalSend,
 }
 
 impl std::fmt::Display for TraceAction {
@@ -101,6 +103,7 @@ impl std::fmt::Display for TraceAction {
             TraceAction::SiteFailover => write!(f, "SiteFailover"),
             TraceAction::PerformanceStats => write!(f, "PerformanceStats"),
             TraceAction::WebSearch => write!(f, "WebSearch"),
+            TraceAction::IncrementalSend => write!(f, "IncrementalSend"),
         }
     }
 }
@@ -126,6 +129,7 @@ impl TraceAction {
             TraceAction::SiteFailover => "网站切换",
             TraceAction::PerformanceStats => "性能统计",
             TraceAction::WebSearch => "网页搜索",
+            TraceAction::IncrementalSend => "增量发送",
         }
     }
 
@@ -149,6 +153,7 @@ impl TraceAction {
             TraceAction::SiteFailover,
             TraceAction::PerformanceStats,
             TraceAction::WebSearch,
+            TraceAction::IncrementalSend,
         ]
     }
 }
@@ -233,6 +238,112 @@ impl DevTraceEntry {
 /// 截断字符串到指定字符数
 fn truncate_str(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+// ============================================================================
+//  IncrementalStats — 增量发送统计 (Session 75)
+// ============================================================================
+
+/// 增量发送统计 — 追踪 LiveContinuation / RadixTree 的节省效果
+///
+/// 记录每次增量发送的总消息数、实际发送数和跳过数,
+/// 提供累计统计和节省比例计算。
+///
+/// # 设计
+///
+/// 在 Orchestrator 的 `send_with_continuation` 方法中,
+/// 每次发送后更新统计, 并通过 `trace_dev` 写入 DevTrace。
+/// 24 小时运行后, 可以从 DevTrace 中查看增量发送的整体效果。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::IncrementalStats;
+/// let mut stats = IncrementalStats::new();
+///
+/// // 第一次发送: 全量 (5条消息)
+/// stats.record(5, 5); // total=5, sent=5, skipped=0
+/// assert_eq!(stats.total_messages, 5);
+/// assert_eq!(stats.skipped_messages, 0);
+/// assert!((stats.saved_ratio() - 0.0).abs() < 0.001);
+///
+/// // 第二次发送: 增量 (5条消息中3条已发送)
+/// stats.record(5, 2); // total=5, sent=2, skipped=3
+/// assert_eq!(stats.total_messages, 10);
+/// assert_eq!(stats.skipped_messages, 3);
+/// assert!((stats.saved_ratio() - 0.3).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IncrementalStats {
+    /// 累计总消息数 (含重复)
+    pub total_messages: usize,
+    /// 累计实际发送消息数 (增量)
+    pub sent_messages: usize,
+    /// 累计跳过消息数 (已发送过, 复用)
+    pub skipped_messages: usize,
+    /// 增量发送次数
+    pub send_count: usize,
+}
+
+impl IncrementalStats {
+    /// 创建新的统计计数器
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次增量发送
+    ///
+    /// - `total`: 本次发送的总消息数
+    /// - `sent`: 本次实际发送的消息数 (增量)
+    ///
+    /// skipped = total - sent
+    pub fn record(&mut self, total: usize, sent: usize) {
+        let skipped = total.saturating_sub(sent);
+        self.total_messages += total;
+        self.sent_messages += sent;
+        self.skipped_messages += skipped;
+        self.send_count += 1;
+    }
+
+    /// 节省比例 (0.0 ~ 1.0)
+    ///
+    /// 跳过的消息数占总消息数的比例。
+    /// 0.0 表示没有节省 (全部为增量发送),
+    /// 1.0 表示全部跳过 (无需发送任何消息)。
+    pub fn saved_ratio(&self) -> f64 {
+        if self.total_messages == 0 {
+            return 0.0;
+        }
+        self.skipped_messages as f64 / self.total_messages as f64
+    }
+
+    /// 平均每次发送的消息数
+    pub fn avg_messages_per_send(&self) -> f64 {
+        if self.send_count == 0 {
+            return 0.0;
+        }
+        self.total_messages as f64 / self.send_count as f64
+    }
+
+    /// 平均每次实际发送的消息数 (增量)
+    pub fn avg_sent_per_send(&self) -> f64 {
+        if self.send_count == 0 {
+            return 0.0;
+        }
+        self.sent_messages as f64 / self.send_count as f64
+    }
+
+    /// 格式化为可读字符串
+    pub fn to_summary(&self) -> String {
+        format!(
+            "增量发送统计: {} 次发送, 总消息 {} 条, 实际发送 {} 条, 跳过 {} 条, 节省比例 {:.1}%",
+            self.send_count,
+            self.total_messages,
+            self.sent_messages,
+            self.skipped_messages,
+            self.saved_ratio() * 100.0
+        )
+    }
 }
 
 // ============================================================================
@@ -1001,7 +1112,7 @@ mod tests {
     #[test]
     fn test_trace_action_all() {
         let all = TraceAction::all();
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 18);
         assert!(all.contains(&TraceAction::Planning));
         assert!(all.contains(&TraceAction::TaskExecution));
         assert!(all.contains(&TraceAction::FixAttempt));
@@ -1730,7 +1841,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 17); // 所有 17 种操作类型
+        assert_eq!(entries.len(), 18); // 所有 18 种操作类型
 
         let summary = writer.summary();
         for action in TraceAction::all() {
@@ -2159,7 +2270,7 @@ mod tests {
     fn test_trace_action_performance_stats_in_all() {
         let all = TraceAction::all();
         assert!(all.contains(&TraceAction::PerformanceStats));
-        assert_eq!(all.len(), 17);
+        assert_eq!(all.len(), 18);
     }
 
     #[test]
@@ -2272,7 +2383,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 17); // 所有 17 种操作类型
+        assert_eq!(entries.len(), 18); // 所有 18 种操作类型
 
         // 确保 PerformanceStats 被包含
         let has_performance_stats = entries
@@ -2881,7 +2992,7 @@ mod tests {
             })
             .collect();
         let grouped = group_entries_by_action(&entries);
-        assert_eq!(grouped.len(), 17);
+        assert_eq!(grouped.len(), 18);
         for action in TraceAction::all() {
             assert!(grouped.contains_key(&action));
         }
@@ -3524,5 +3635,192 @@ mod tests {
         let dir = tempdir().unwrap();
         let writer = DevTraceWriter::new(dir.path());
         assert_eq!(writer.backend_type(), StorageBackend::Jsonl);
+    }
+
+    // ===== IncrementalStats 测试 (Session 75) =====
+
+    #[test]
+    fn test_incremental_stats_new() {
+        let stats = IncrementalStats::new();
+        assert_eq!(stats.total_messages, 0);
+        assert_eq!(stats.sent_messages, 0);
+        assert_eq!(stats.skipped_messages, 0);
+        assert_eq!(stats.send_count, 0);
+    }
+
+    #[test]
+    fn test_incremental_stats_record_full_send() {
+        let mut stats = IncrementalStats::new();
+        stats.record(5, 5); // 全量发送: total=5, sent=5, skipped=0
+        assert_eq!(stats.total_messages, 5);
+        assert_eq!(stats.sent_messages, 5);
+        assert_eq!(stats.skipped_messages, 0);
+        assert_eq!(stats.send_count, 1);
+        assert!((stats.saved_ratio() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_incremental_stats_record_partial_send() {
+        let mut stats = IncrementalStats::new();
+        stats.record(5, 2); // 增量发送: total=5, sent=2, skipped=3
+        assert_eq!(stats.total_messages, 5);
+        assert_eq!(stats.sent_messages, 2);
+        assert_eq!(stats.skipped_messages, 3);
+        assert!((stats.saved_ratio() - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_incremental_stats_record_multiple() {
+        let mut stats = IncrementalStats::new();
+        stats.record(5, 5); // 第一次全量
+        stats.record(5, 2); // 第二次增量
+        stats.record(3, 0); // 第三次全部跳过
+
+        assert_eq!(stats.total_messages, 13); // 5 + 5 + 3
+        assert_eq!(stats.sent_messages, 7); // 5 + 2 + 0
+        assert_eq!(stats.skipped_messages, 6); // 0 + 3 + 3
+        assert_eq!(stats.send_count, 3);
+        assert!((stats.saved_ratio() - 6.0 / 13.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_incremental_stats_saved_ratio_empty() {
+        let stats = IncrementalStats::new();
+        assert_eq!(stats.saved_ratio(), 0.0);
+    }
+
+    #[test]
+    fn test_incremental_stats_avg_messages_per_send() {
+        let mut stats = IncrementalStats::new();
+        stats.record(5, 5);
+        stats.record(3, 1);
+        assert!((stats.avg_messages_per_send() - 4.0).abs() < 0.001); // (5+3)/2
+    }
+
+    #[test]
+    fn test_incremental_stats_avg_sent_per_send() {
+        let mut stats = IncrementalStats::new();
+        stats.record(5, 5);
+        stats.record(3, 1);
+        assert!((stats.avg_sent_per_send() - 3.0).abs() < 0.001); // (5+1)/2
+    }
+
+    #[test]
+    fn test_incremental_stats_avg_empty() {
+        let stats = IncrementalStats::new();
+        assert_eq!(stats.avg_messages_per_send(), 0.0);
+        assert_eq!(stats.avg_sent_per_send(), 0.0);
+    }
+
+    #[test]
+    fn test_incremental_stats_to_summary() {
+        let mut stats = IncrementalStats::new();
+        stats.record(10, 7);
+        let summary = stats.to_summary();
+        assert!(summary.contains("1 次发送"));
+        assert!(summary.contains("总消息 10 条"));
+        assert!(summary.contains("实际发送 7 条"));
+        assert!(summary.contains("跳过 3 条"));
+        assert!(summary.contains("30.0%"));
+    }
+
+    #[test]
+    fn test_incremental_stats_default() {
+        let stats = IncrementalStats::default();
+        assert_eq!(stats.send_count, 0);
+    }
+
+    #[test]
+    fn test_incremental_stats_serde_roundtrip() {
+        let mut stats = IncrementalStats::new();
+        stats.record(10, 7);
+        let json = serde_json::to_string(&stats).unwrap();
+        let deserialized: IncrementalStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.total_messages, 10);
+        assert_eq!(deserialized.sent_messages, 7);
+        assert_eq!(deserialized.skipped_messages, 3);
+        assert_eq!(deserialized.send_count, 1);
+    }
+
+    // ===== TraceAction::IncrementalSend 测试 (Session 75) =====
+
+    #[test]
+    fn test_trace_action_incremental_send_display() {
+        assert_eq!(TraceAction::IncrementalSend.to_string(), "IncrementalSend");
+    }
+
+    #[test]
+    fn test_trace_action_incremental_send_description() {
+        assert_eq!(TraceAction::IncrementalSend.description(), "增量发送");
+    }
+
+    #[test]
+    fn test_trace_action_incremental_send_in_all() {
+        let all = TraceAction::all();
+        assert!(
+            all.contains(&TraceAction::IncrementalSend),
+            "TraceAction::all() should contain IncrementalSend"
+        );
+    }
+
+    #[test]
+    fn test_trace_action_incremental_send_serde() {
+        let action = TraceAction::IncrementalSend;
+        let json = serde_json::to_string(&action).unwrap();
+        assert_eq!(json, "\"IncrementalSend\"");
+
+        let parsed: TraceAction = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, action);
+    }
+
+    #[test]
+    fn test_trace_action_incremental_send_hash() {
+        let mut map: HashMap<TraceAction, usize> = HashMap::new();
+        map.insert(TraceAction::IncrementalSend, 1);
+        assert_eq!(map.get(&TraceAction::IncrementalSend), Some(&1));
+    }
+
+    #[test]
+    fn test_dev_trace_entry_with_incremental_send() {
+        let entry = DevTraceEntry::new(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            "total=5, sent=2, skipped=3",
+            "AI response",
+            500,
+            true,
+            None,
+        );
+        assert_eq!(entry.action, TraceAction::IncrementalSend);
+        let json = entry.to_jsonl().unwrap();
+        assert!(json.contains("IncrementalSend"));
+
+        let parsed = DevTraceEntry::from_jsonl(&json).unwrap();
+        assert_eq!(parsed.action, TraceAction::IncrementalSend);
+    }
+
+    #[test]
+    fn test_incremental_send_trace_in_report() {
+        let (_dir, writer) = make_writer();
+        writer
+            .trace(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=10, sent=3, skipped=7",
+                "response",
+                1000,
+                true,
+                None,
+            )
+            .unwrap();
+
+        let summary = writer.summary();
+        assert_eq!(summary.total_entries, 1);
+        let report = summary.to_report();
+        assert!(report.contains("增量发送"));
     }
 }

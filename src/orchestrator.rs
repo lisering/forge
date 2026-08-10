@@ -475,6 +475,12 @@ where
     /// 启用后, 在对话级增量计算中使用 Radix Tree 查找最长公共前缀。
     /// None 表示禁用 (默认, 向后兼容)。
     pub conversation_tracker: Option<crate::radix_tree::ConversationTracker>,
+
+    /// 增量发送统计 — 追踪 LiveContinuation / RadixTree 的节省效果 (Session 75)
+    ///
+    /// 记录每次增量发送的总消息数、实际发送数和跳过数。
+    /// 在 `send_with_continuation` 方法中自动更新。
+    pub incremental_stats: crate::dev_trace::IncrementalStats,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -519,6 +525,7 @@ where
             compaction_config: None,
             live_continuation: None,
             conversation_tracker: None,
+            incremental_stats: crate::dev_trace::IncrementalStats::new(),
         }
     }
 }
@@ -579,6 +586,7 @@ where
             compaction_config: self.compaction_config,
             live_continuation: self.live_continuation,
             conversation_tracker: self.conversation_tracker,
+            incremental_stats: self.incremental_stats,
         }
     }
 
@@ -819,6 +827,152 @@ where
         if let Some(ref mut tracker) = self.conversation_tracker {
             tracker.clear();
         }
+    }
+
+    /// 带增量跟踪的消息发送 — Session 75 实战集成
+    ///
+    /// 结合 LiveContinuation 和 ConversationTracker 的增量计算能力,
+    /// 只发送未发送过的增量消息, 而非完整上下文。
+    ///
+    /// ## 工作流
+    ///
+    /// 1. 调用 `compute_incremental_messages` 计算增量
+    /// 2. 将增量消息拼接为单条消息发送 (通过 `send_message_safe`)
+    /// 3. 发送成功后调用 `mark_messages_sent` 更新跟踪器状态
+    /// 4. 更新 `incremental_stats` 统计计数器
+    /// 5. 通过 `trace_dev` 记录增量发送统计到 DevTrace
+    ///
+    /// ## 向后兼容
+    ///
+    /// 如果 `live_continuation` 和 `conversation_tracker` 均未启用,
+    /// 退化为将所有消息拼接后通过 `send_message_safe` 发送。
+    ///
+    /// ## 参数
+    ///
+    /// - `messages`: 要发送的消息列表 (按顺序)
+    /// - `timeout`: 发送超时 (秒)
+    ///
+    /// ## 返回
+    ///
+    /// 返回 `ChatResult` 或错误。
+    pub async fn send_with_continuation(
+        &mut self,
+        messages: &[String],
+        timeout: u64,
+    ) -> Result<crate::traits::ChatResult> {
+        if messages.is_empty() {
+            return Err(anyhow::anyhow!("send_with_continuation: 消息列表为空"));
+        }
+
+        let total_count = messages.len();
+
+        // 1. 计算增量消息
+        let delta_messages = self.compute_incremental_messages(messages);
+        let sent_count = delta_messages.len();
+        let skipped_count = total_count.saturating_sub(sent_count);
+
+        // 2. 更新统计计数器
+        self.incremental_stats.record(total_count, sent_count);
+
+        // 3. 如果增量为空 (全部已发送), 返回一个虚拟结果
+        if delta_messages.is_empty() {
+            info!(
+                "📦 增量发送: 全部 {} 条消息已发送过, 跳过 (节省 100%)",
+                total_count
+            );
+
+            // 记录 DevTrace
+            self.trace_dev(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                &format!(
+                    "[全部跳过] total={}, sent=0, skipped={}",
+                    total_count, total_count
+                ),
+                "[无增量发送]",
+                0,
+                true,
+                None,
+            );
+
+            // 返回一个空结果 (调用方应检查 text 是否为空)
+            return Ok(crate::traits::ChatResult {
+                text: String::new(),
+                timed_out: false,
+            });
+        }
+
+        // 4. 将增量消息拼接为单条消息
+        let combined_msg = if delta_messages.len() == 1 {
+            delta_messages[0].clone()
+        } else {
+            // 多条消息用换行分隔
+            delta_messages.join("\n\n")
+        };
+
+        // 5. 记录增量发送信息
+        if skipped_count > 0 {
+            info!(
+                "📦 增量发送: 总 {} 条, 发送 {} 条, 跳过 {} 条 (节省 {:.1}%)",
+                total_count,
+                sent_count,
+                skipped_count,
+                (skipped_count as f64 / total_count as f64) * 100.0
+            );
+        } else {
+            info!("📦 全量发送: {} 条消息 (无增量优化)", total_count);
+        }
+
+        // 6. 发送消息 (通过 send_message_safe 带连接监控)
+        let send_start = Instant::now();
+        let result = self.send_message_safe(&combined_msg, timeout).await?;
+        let send_duration = send_start.elapsed().as_millis() as u64;
+
+        // 7. 发送成功后, 标记所有消息为已发送
+        self.mark_messages_sent(messages);
+
+        // 8. 记录 DevTrace
+        let stats_summary = format!(
+            "total={}, sent={}, skipped={}, saved_ratio={:.1}%, cumulative: total={}, skipped={}",
+            total_count,
+            sent_count,
+            skipped_count,
+            if total_count > 0 {
+                skipped_count as f64 / total_count as f64 * 100.0
+            } else {
+                0.0
+            },
+            self.incremental_stats.total_messages,
+            self.incremental_stats.skipped_messages
+        );
+
+        self.trace_dev(
+            TraceAction::IncrementalSend,
+            None,
+            None,
+            None,
+            &stats_summary,
+            &result.text,
+            send_duration,
+            !result.timed_out,
+            if result.timed_out {
+                Some("增量发送超时")
+            } else {
+                None
+            },
+        );
+
+        Ok(result)
+    }
+
+    /// 获取增量发送统计的只读引用
+    ///
+    /// 返回累计的增量发送统计数据, 包括总消息数、实际发送数、
+    /// 跳过数和节省比例。
+    pub fn incremental_stats(&self) -> &crate::dev_trace::IncrementalStats {
+        &self.incremental_stats
     }
 
     /// memory.json 路径
@@ -1091,6 +1245,12 @@ where
 
         // 3. 新开对话 (CDP 导航到 chat.z.ai/)
         self.chat.start_new_conversation().await?;
+
+        // 3.5 重置增量跟踪状态 — 新开对话后, 之前发送的消息不再有效
+        if self.live_continuation.is_some() || self.conversation_tracker.is_some() {
+            info!("🔄 重置增量跟踪状态 (上下文衔接)");
+            self.reset_continuation();
+        }
 
         // 4. 发送交接 prompt 作为新对话的第一条消息
         info!("发送交接 prompt ({}字符)...", handoff_prompt.len());
@@ -1431,6 +1591,12 @@ where
 
         // 3. 新开对话
         self.chat.start_new_conversation().await?;
+
+        // 3.5 重置增量跟踪状态 — 新开对话后, 之前发送的消息不再有效
+        if self.live_continuation.is_some() || self.conversation_tracker.is_some() {
+            info!("🔄 重置增量跟踪状态 (/compact 强制上下文衔接)");
+            self.reset_continuation();
+        }
 
         // 4. 发送交接 prompt
         let handoff_start = Instant::now();
@@ -3900,6 +4066,399 @@ mod tests {
         let content = FixPromptBuilder::get_files_full_content(&ws, &[]);
         assert_eq!(content, "(无文件)");
     }
+
+    // ===== Session 75: send_with_continuation + IncrementalStats 测试 =====
+
+    /// Mock ChatClient for testing send_with_continuation
+    use std::sync::{Arc, Mutex};
+
+    struct MockChatClient {
+        sent_messages: Arc<Mutex<Vec<String>>>,
+        responses: Arc<Mutex<Vec<String>>>,
+        turn_count: Arc<std::sync::atomic::AtomicUsize>,
+        new_conversation_called: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockChatClient {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                sent_messages: Arc::new(Mutex::new(vec![])),
+                responses: Arc::new(Mutex::new(
+                    responses.into_iter().map(String::from).collect(),
+                )),
+                turn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                new_conversation_called: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn sent_messages(&self) -> Vec<String> {
+            self.sent_messages.lock().unwrap().clone()
+        }
+
+        fn new_conversation_count(&self) -> usize {
+            self.new_conversation_called
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::ChatClient for MockChatClient {
+        async fn send_message(
+            &self,
+            msg: &str,
+            _timeout: u64,
+        ) -> Result<crate::traits::ChatResult> {
+            self.sent_messages.lock().unwrap().push(msg.to_string());
+            self.turn_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let text = {
+                let mut queue = self.responses.lock().unwrap();
+                if queue.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    queue.remove(0)
+                }
+            };
+            Ok(crate::traits::ChatResult {
+                text,
+                timed_out: false,
+            })
+        }
+
+        async fn start_new_conversation(&self) -> Result<()> {
+            self.new_conversation_called
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.turn_count
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn conversation_turn_count(&self) -> usize {
+            self.turn_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Mock TestRunner for testing
+    struct MockTestRunner;
+    impl crate::traits::TestRunner for MockTestRunner {
+        fn check(&self, _dir: &std::path::Path) -> Result<crate::testrunner::TestResult> {
+            Ok(crate::testrunner::TestResult {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                errors: vec![],
+                test_summary: None,
+            })
+        }
+        fn test(&self, _dir: &std::path::Path) -> Result<crate::testrunner::TestResult> {
+            Ok(crate::testrunner::TestResult {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                errors: vec![],
+                test_summary: None,
+            })
+        }
+    }
+
+    /// Mock FileExtractor for testing
+    struct MockExtractor;
+    impl crate::traits::FileExtractor for MockExtractor {
+        fn extract(&self, _text: &str) -> Vec<crate::extract::ExtractedFile> {
+            vec![]
+        }
+    }
+
+    /// 创建测试用 Orchestrator
+    fn make_orchestrator<'a>(
+        chat: &'a MockChatClient,
+        workspace_dir: &'a str,
+    ) -> Orchestrator<'a, MockChatClient, MockTestRunner, MockExtractor> {
+        Orchestrator::new(
+            chat,
+            MockTestRunner,
+            MockExtractor,
+            workspace_dir,
+            "test goal",
+            3,
+            60,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_no_live_continuation() {
+        // 未启用 live_continuation 时, 退化为全量发送
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let messages = vec!["msg1".to_string(), "msg2".to_string()];
+        let result = orch.send_with_continuation(&messages, 30).await.unwrap();
+
+        assert_eq!(result.text, "AI response");
+        // 应该发送拼接后的消息
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("msg1"));
+        assert!(sent[0].contains("msg2"));
+        // 统计: total=2, sent=2 (全量, 无增量优化)
+        assert_eq!(orch.incremental_stats().total_messages, 2);
+        assert_eq!(orch.incremental_stats().sent_messages, 2);
+        assert_eq!(orch.incremental_stats().skipped_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_with_live_continuation_first_send() {
+        // 启用 live_continuation, 第一次发送应该是全量
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        let messages = vec!["system_prompt".to_string(), "task_description".to_string()];
+        let result = orch.send_with_continuation(&messages, 30).await.unwrap();
+
+        assert_eq!(result.text, "AI response 1");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        // 全量发送: total=2, sent=2
+        assert_eq!(orch.incremental_stats().total_messages, 2);
+        assert_eq!(orch.incremental_stats().sent_messages, 2);
+        assert_eq!(orch.incremental_stats().skipped_messages, 0);
+        assert!(orch.incremental_stats().saved_ratio() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_with_live_continuation_incremental() {
+        // 启用 live_continuation, 第二次发送应该是增量
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1", "AI response 2"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        // 第一次发送: 全量
+        let msgs1 = vec![
+            "system".to_string(),
+            "task1".to_string(),
+            "result1".to_string(),
+        ];
+        orch.send_with_continuation(&msgs1, 30).await.unwrap();
+
+        // 第二次发送: 有增量 (system/task1/result1 已发送, 只有 task2 是新的)
+        let msgs2 = vec![
+            "system".to_string(),
+            "task1".to_string(),
+            "result1".to_string(),
+            "task2".to_string(),
+        ];
+        let result = orch.send_with_continuation(&msgs2, 30).await.unwrap();
+
+        assert_eq!(result.text, "AI response 2");
+        let sent = chat.sent_messages();
+        // 第二次应该只发送增量 (task2)
+        assert_eq!(sent.len(), 2); // 两次 send_message 调用
+        assert_eq!(sent[1], "task2"); // 第二次只发送了 task2
+
+        // 累计统计: total=7, sent=4 (3+1), skipped=3
+        assert_eq!(orch.incremental_stats().total_messages, 7);
+        assert_eq!(orch.incremental_stats().sent_messages, 4);
+        assert_eq!(orch.incremental_stats().skipped_messages, 3);
+        assert!((orch.incremental_stats().saved_ratio() - 3.0 / 7.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_all_skipped() {
+        // 所有消息都已发送过 → 全部跳过
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        let msgs = vec!["msg1".to_string(), "msg2".to_string()];
+        // 第一次发送
+        orch.send_with_continuation(&msgs, 30).await.unwrap();
+
+        // 第二次发送相同消息 → 全部跳过
+        let result = orch.send_with_continuation(&msgs, 30).await.unwrap();
+
+        // 应该返回空结果
+        assert!(result.text.is_empty());
+        assert!(!result.timed_out);
+
+        // 只调用了一次 send_message (第一次)
+        assert_eq!(chat.sent_messages().len(), 1);
+
+        // 统计: total=4, sent=2, skipped=2
+        assert_eq!(orch.incremental_stats().total_messages, 4);
+        assert_eq!(orch.incremental_stats().sent_messages, 2);
+        assert_eq!(orch.incremental_stats().skipped_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_empty_messages() {
+        // 空消息列表应返回错误
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let result = orch.send_with_continuation(&[], 30).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_single_message() {
+        // 单条消息应直接发送
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        let msgs = vec!["hello world".to_string()];
+        let result = orch.send_with_continuation(&msgs, 30).await.unwrap();
+
+        assert_eq!(result.text, "AI response");
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0], "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_reset_continuation_after_context_handoff() {
+        // 验证上下文衔接后 reset_continuation 被调用
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response 1", "AI response 2", "AI response 3"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_context_handoff(1); // 1轮就触发上下文衔接
+
+        // 第一次发送
+        let msgs1 = vec!["msg1".to_string()];
+        orch.send_with_continuation(&msgs1, 30).await.unwrap();
+
+        // 验证 live_continuation 已追踪
+        assert!(orch.live_continuation.as_ref().unwrap().sent_count() > 0);
+
+        // 触发上下文衔接 (turn_count >= 1)
+        // maybe_context_handoff 会在 start_new_conversation 后调用 reset_continuation
+        orch.maybe_context_handoff().await.unwrap();
+
+        // 验证 new_conversation 被调用
+        assert!(chat.new_conversation_count() > 0);
+
+        // 验证 live_continuation 被重置
+        assert!(orch.live_continuation.as_ref().unwrap().is_reset());
+        assert_eq!(orch.live_continuation.as_ref().unwrap().sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_incremental_stats_accessor() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["AI response"]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        // 初始统计应为空
+        assert_eq!(orch.incremental_stats().send_count, 0);
+        assert_eq!(orch.incremental_stats().total_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_stats_accumulate() {
+        // 多次发送后统计应正确累积
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2", "resp3"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        // 第一次: 全量 (3条)
+        orch.send_with_continuation(&["a".to_string(), "b".to_string(), "c".to_string()], 30)
+            .await
+            .unwrap();
+
+        // 第二次: 增量 (只有 d 是新的)
+        orch.send_with_continuation(
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            30,
+        )
+        .await
+        .unwrap();
+
+        // 第三次: 全量 (新对话, 有 e/f)
+        orch.send_with_continuation(&["e".to_string(), "f".to_string()], 30)
+            .await
+            .unwrap();
+
+        // 累计统计
+        let stats = orch.incremental_stats();
+        assert_eq!(stats.send_count, 3);
+        assert_eq!(stats.total_messages, 9); // 3 + 4 + 2
+        assert_eq!(stats.sent_messages, 6); // 3 + 1 + 2
+        assert_eq!(stats.skipped_messages, 3); // 0 + 3 + 0
+    }
+
+    #[tokio::test]
+    async fn test_send_with_continuation_with_conversation_tracker() {
+        // 启用 conversation_tracker (Radix Tree) + live_continuation
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_live_continuation()
+            .with_conversation_tracker();
+
+        let msgs1 = vec![
+            "system".to_string(),
+            "task1".to_string(),
+            "result1".to_string(),
+        ];
+        orch.send_with_continuation(&msgs1, 30).await.unwrap();
+
+        let msgs2 = vec![
+            "system".to_string(),
+            "task1".to_string(),
+            "result1".to_string(),
+            "task2".to_string(),
+        ];
+        let result = orch.send_with_continuation(&msgs2, 30).await.unwrap();
+
+        assert_eq!(result.text, "resp2");
+        // 增量应该只包含 task2
+        let sent = chat.sent_messages();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], "task2");
+
+        // 统计
+        assert_eq!(orch.incremental_stats().skipped_messages, 3);
+    }
+
+    #[tokio::test]
+    async fn test_reset_continuation_manual() {
+        // 手动调用 reset_continuation
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec!["resp1", "resp2"]);
+        let mut orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_live_continuation();
+
+        let msgs = vec!["msg1".to_string(), "msg2".to_string()];
+        orch.send_with_continuation(&msgs, 30).await.unwrap();
+        assert!(orch.live_continuation.as_ref().unwrap().sent_count() > 0);
+
+        // 手动重置
+        orch.reset_continuation();
+        assert!(orch.live_continuation.as_ref().unwrap().is_reset());
+        assert_eq!(orch.live_continuation.as_ref().unwrap().sent_count(), 0);
+
+        // 重置后再次发送应该是全量
+        let result = orch.send_with_continuation(&msgs, 30).await.unwrap();
+        assert_eq!(result.text, "resp2");
+        // 两次 send_message 调用 (重置后全量发送)
+        assert_eq!(chat.sent_messages().len(), 2);
+    }
 }
 
 // ============================================================================
@@ -4001,6 +4560,12 @@ where
 
         // 3. 新开对话
         self.chat.start_new_conversation().await?;
+
+        // 3.5 重置增量跟踪状态 — 压缩后新开对话, 之前发送的消息不再有效
+        if self.live_continuation.is_some() || self.conversation_tracker.is_some() {
+            info!("🔄 重置增量跟踪状态 (上下文压缩)");
+            self.reset_continuation();
+        }
 
         // 4. 发送 AI 生成的摘要作为新对话的上下文
         let handoff_prompt = format!("# 开发会话摘要\n\n{}", summary_result.text);
