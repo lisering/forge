@@ -23,7 +23,7 @@
 //! use forge::watchdog::{WatchdogRegistry, ChromeWatchdog};
 //!
 //! let mut registry = WatchdogRegistry::new();
-//! registry.register("chrome", Box::new(ChromeWatchdog::new()));
+//! registry.register("chrome", Box::new(ChromeWatchdog::new(9222)));
 //! registry.start_all();
 //! ```
 

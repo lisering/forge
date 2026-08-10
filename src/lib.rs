@@ -76,6 +76,7 @@ pub mod extract;
 pub mod failover_chat;
 pub mod interaction;
 pub mod language;
+pub mod live_continuation;
 pub mod llm_clarify;
 pub mod loop_detector;
 pub mod memory;
@@ -83,6 +84,7 @@ pub mod orchestrator;
 pub mod package;
 pub mod prompt_builder;
 pub mod proxy_pool;
+pub mod radix_tree;
 pub mod response_handler;
 pub mod site_health;
 pub mod slash_command;
@@ -150,6 +152,10 @@ pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteracti
 pub use language::{
     detect_language, GoAdapter, MultiLanguageTestRunner, NodeAdapter, PythonAdapter, RustAdapter,
 };
+pub use live_continuation::{
+    compute_diff, compute_message_ids, deduplicate, find_duplicates, IncrementalResult,
+    LiveContinuation, MessageId, MessageTracker,
+};
 pub use llm_clarify::{
     build_default_follow_up_message, build_judge_prompt_text, classify_llm_failure,
     is_duplicate_question, parse_llm_judge_result, should_retry_llm, truncate_response,
@@ -167,6 +173,10 @@ pub use prompt_builder::SystemPrompt;
 pub use proxy_pool::{
     build_reqwest_proxy, is_valid_proxy_url, load_proxies_from_env, ProxyConfig, ProxyPool,
     ProxyRefresh,
+};
+pub use radix_tree::{
+    common_prefix_length, compute_delta_with_stats, compute_fingerprints,
+    compute_fingerprints_owned, ConversationTracker, DeltaResult, MessageFingerprint, RadixTree,
 };
 pub use response_handler::{
     CodeExtractorHandler, HandlerChain, HandlerResult, MemoryUpdaterHandler, ResponseHandler,

@@ -461,6 +461,20 @@ where
     /// 启用后, 基于 token 数量而非对话轮数触发上下文压缩。
     /// None 表示禁用 (使用原有的基于对话轮数的上下文衔接)。
     pub compaction_config: Option<crate::context_handoff::CompactionConfig>,
+
+    /// Live Continuation — 借鉴 ds4 `ANTHROPIC_LIVE_CONTINUATION.md`
+    ///
+    /// 追踪已发送的消息 ID，只发送增量部分而非完整上下文。
+    /// 启用后, 在每次发送消息前检查是否已发送过，跳过重复消息。
+    /// None 表示禁用 (默认, 向后兼容)。
+    pub live_continuation: Option<crate::live_continuation::LiveContinuation>,
+
+    /// Radix Tree 对话状态跟踪 — 借鉴 ds4 `rax.h`
+    ///
+    /// 用基数树存储对话前缀，避免重复发送相同上下文。
+    /// 启用后, 在对话级增量计算中使用 Radix Tree 查找最长公共前缀。
+    /// None 表示禁用 (默认, 向后兼容)。
+    pub conversation_tracker: Option<crate::radix_tree::ConversationTracker>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -503,6 +517,8 @@ where
             handler_chain: None,
             web_tool: None,
             compaction_config: None,
+            live_continuation: None,
+            conversation_tracker: None,
         }
     }
 }
@@ -561,6 +577,8 @@ where
             handler_chain: self.handler_chain,
             web_tool: self.web_tool,
             compaction_config: self.compaction_config,
+            live_continuation: self.live_continuation,
+            conversation_tracker: self.conversation_tracker,
         }
     }
 
@@ -731,6 +749,76 @@ where
     pub fn with_response_handlers(mut self, chain: HandlerChain) -> Self {
         self.handler_chain = Some(chain);
         self
+    }
+
+    /// 启用 Live Continuation — 借鉴 ds4 `ANTHROPIC_LIVE_CONTINUATION.md`
+    ///
+    /// 启用后, 追踪已发送的消息 ID，只发送增量部分而非完整上下文。
+    /// 在对话被压缩或重置时自动重置跟踪状态。
+    pub fn with_live_continuation(mut self) -> Self {
+        self.live_continuation = Some(crate::live_continuation::LiveContinuation::new());
+        self
+    }
+
+    /// 启用 Radix Tree 对话状态跟踪 — 借鉴 ds4 `rax.h`
+    ///
+    /// 启用后, 用基数树存储对话前缀，在对话级增量计算中
+    /// 查找最长公共前缀，避免重复发送相同上下文。
+    pub fn with_conversation_tracker(mut self) -> Self {
+        self.conversation_tracker = Some(crate::radix_tree::ConversationTracker::new());
+        self
+    }
+
+    /// 计算增量消息 — 使用 LiveContinuation 和 ConversationTracker
+    ///
+    /// 1. 如果启用了 ConversationTracker, 先用 Radix Tree 查找最长公共前缀
+    /// 2. 对增量部分, 用 LiveContinuation 检查单条消息是否已发送
+    /// 3. 返回最终的增量消息
+    ///
+    /// 如果两者都未启用, 返回完整消息 (向后兼容)。
+    pub fn compute_incremental_messages(&self, messages: &[String]) -> Vec<String> {
+        if messages.is_empty() {
+            return vec![];
+        }
+
+        // 第一步: 对话级增量 (Radix Tree)
+        let after_conversation_delta = if let Some(ref tracker) = self.conversation_tracker {
+            tracker.compute_delta(messages)
+        } else {
+            messages.to_vec()
+        };
+
+        // 第二步: 消息级增量 (LiveContinuation)
+        if let Some(ref lc) = self.live_continuation {
+            lc.compute_delta(&after_conversation_delta).delta_messages
+        } else {
+            after_conversation_delta
+        }
+    }
+
+    /// 标记消息为已发送 — 更新 LiveContinuation 和 ConversationTracker
+    ///
+    /// 在消息成功发送后调用, 将消息注册到跟踪器中。
+    pub fn mark_messages_sent(&mut self, messages: &[String]) {
+        if let Some(ref mut lc) = self.live_continuation {
+            lc.mark_sent(messages);
+        }
+        if let Some(ref mut tracker) = self.conversation_tracker {
+            tracker.mark_sent(messages);
+        }
+    }
+
+    /// 重置增量跟踪状态 — 对话被压缩或新开后调用
+    ///
+    /// 清空 LiveContinuation 和 ConversationTracker 的跟踪状态,
+    /// 使下次发送为全量发送。
+    pub fn reset_continuation(&mut self) {
+        if let Some(ref mut lc) = self.live_continuation {
+            lc.reset();
+        }
+        if let Some(ref mut tracker) = self.conversation_tracker {
+            tracker.clear();
+        }
     }
 
     /// memory.json 路径
