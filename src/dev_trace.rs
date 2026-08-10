@@ -997,6 +997,362 @@ pub fn build_cache_fix_correlation(entries: &[DevTraceEntry]) -> CacheFixCorrela
 }
 
 // ============================================================================
+//  缓存调优效果可视化纯函数 (Session 83)
+// ============================================================================
+
+/// 从 `CacheTuning` trace 条目中解析的调优动作信息
+///
+/// 由 [`parse_cache_tuning_entry`][] 生成, 表示单次缓存调优决策的动作类型。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TuningActionInfo {
+    /// 保持当前配置
+    KeepCurrent,
+    /// 调整 TTL
+    AdjustTtl {
+        /// 调整前的 TTL (秒)
+        old_ttl: u64,
+        /// 调整后的 TTL (秒)
+        new_ttl: u64,
+    },
+    /// 禁用缓存
+    DisableCache,
+}
+
+/// 从单个 `CacheTuning` trace 条目解析的调优信息
+///
+/// 包含调优动作、关联差值和缓存命中/未命中的修复检查数据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheTuningEntryInfo {
+    /// 调优动作
+    pub action: TuningActionInfo,
+    /// 缓存命中与未命中的修复成功率差值 (-1.0 ~ 1.0)
+    pub correlation_diff: f64,
+    /// 缓存命中后编译检查成功数
+    pub hit_successes: usize,
+    /// 缓存命中后编译检查总数
+    pub hit_checks: usize,
+    /// 缓存未命中后编译检查成功数
+    pub miss_successes: usize,
+    /// 缓存未命中后编译检查总数
+    pub miss_checks: usize,
+}
+
+/// 缓存调优效果摘要 — 从 `CacheTuning` trace 条目中解析的调优历史统计
+///
+/// 追踪 CacheTuner 的所有调优决策, 用于在 DevTraceSummary 报告中
+/// 展示调优历史和效果 (Session 83)。
+///
+/// # 字段
+///
+/// | 字段 | 含义 |
+/// |------|------|
+/// | `total_evaluations` | 总评估次数 |
+/// | `keep_current_count` | "保持当前" 次数 |
+/// | `adjust_ttl_count` | "调整 TTL" 次数 |
+/// | `disable_count` | "禁用缓存" 次数 |
+/// | `ttl_history` | TTL 调整历史 `(old_ttl, new_ttl)` 对 |
+/// | `final_ttl` | 最终 TTL (最后一次 `AdjustTtl` 的 `new_ttl`) |
+/// | `cache_disabled` | 缓存是否已被禁用 |
+/// | `correlation_diffs` | 所有评估的差值列表 (趋势分析) |
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_cache_tuning_summary, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::CacheTuning, Some(0), Some(0), Some("task"),
+///         "hit=2/3 miss=3/3",
+///         "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+///         0, true, Some("缓存有效"),
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CacheTuning, Some(0), Some(1), Some("task2"),
+///         "hit=1/3 miss=3/3",
+///         "缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)",
+///         0, true, Some("缓存有害"),
+///     ),
+/// ];
+/// let summary = build_cache_tuning_summary(&entries);
+/// assert_eq!(summary.total_evaluations, 2);
+/// assert_eq!(summary.adjust_ttl_count, 1);
+/// assert_eq!(summary.disable_count, 1);
+/// assert!(summary.cache_disabled);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheTuningSummary {
+    /// 总评估次数
+    pub total_evaluations: usize,
+    /// "保持当前" 次数
+    pub keep_current_count: usize,
+    /// "调整 TTL" 次数
+    pub adjust_ttl_count: usize,
+    /// "禁用缓存" 次数
+    pub disable_count: usize,
+    /// TTL 调整历史 `(old_ttl, new_ttl)` 对
+    pub ttl_history: Vec<(u64, u64)>,
+    /// 最终 TTL (最后一次 `AdjustTtl` 的 `new_ttl`)
+    ///
+    /// `None` 表示从未调整过 TTL。
+    pub final_ttl: Option<u64>,
+    /// 缓存是否已被禁用 (任一决策为 `DisableCache` 时为 `true`)
+    pub cache_disabled: bool,
+    /// 所有评估的差值列表 (用于趋势分析)
+    pub correlation_diffs: Vec<f64>,
+}
+
+impl CacheTuningSummary {
+    /// 创建空调优摘要
+    pub fn new() -> Self {
+        Self {
+            total_evaluations: 0,
+            keep_current_count: 0,
+            adjust_ttl_count: 0,
+            disable_count: 0,
+            ttl_history: vec![],
+            final_ttl: None,
+            cache_disabled: false,
+            correlation_diffs: vec![],
+        }
+    }
+
+    /// 是否为空 (无评估记录)
+    pub fn is_empty(&self) -> bool {
+        self.total_evaluations == 0
+    }
+
+    /// 平均关联差值
+    ///
+    /// 返回所有评估差值的算术平均。无评估时返回 `0.0`。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::dev_trace::CacheTuningSummary;
+    /// let mut s = CacheTuningSummary::new();
+    /// s.correlation_diffs = vec![0.1, -0.2, 0.3];
+    /// assert!((s.avg_correlation_diff() - 0.0667).abs() < 0.001);
+    /// ```
+    pub fn avg_correlation_diff(&self) -> f64 {
+        if self.correlation_diffs.is_empty() {
+            return 0.0;
+        }
+        self.correlation_diffs.iter().sum::<f64>() / self.correlation_diffs.len() as f64
+    }
+
+    /// 初始 TTL (第一次 `AdjustTtl` 的 `old_ttl`)
+    ///
+    /// `None` 表示从未调整过 TTL。
+    pub fn initial_ttl(&self) -> Option<u64> {
+        self.ttl_history.first().map(|(old, _)| *old)
+    }
+
+    /// 从单次调优信息记录
+    pub fn record(&mut self, info: CacheTuningEntryInfo) {
+        self.total_evaluations += 1;
+        self.correlation_diffs.push(info.correlation_diff);
+
+        match info.action {
+            TuningActionInfo::KeepCurrent => {
+                self.keep_current_count += 1;
+            }
+            TuningActionInfo::AdjustTtl { old_ttl, new_ttl } => {
+                self.adjust_ttl_count += 1;
+                self.ttl_history.push((old_ttl, new_ttl));
+                self.final_ttl = Some(new_ttl);
+            }
+            TuningActionInfo::DisableCache => {
+                self.disable_count += 1;
+                self.cache_disabled = true;
+            }
+        }
+    }
+}
+
+impl Default for CacheTuningSummary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 从 `output_summary` 中解析调优动作
+///
+/// `output_summary` 格式由 `CacheTuningDecision::to_summary()` 生成:
+/// - `"缓存调优: 保持当前配置 (差值 {diff}%, 原因: {reason})"`
+/// - `"缓存调优: 调整 TTL: {old}s → {new}s (差值 {diff}%, 原因: {reason})"`
+/// - `"缓存调优: 禁用缓存 (差值 {diff}%, 原因: {reason})"`
+///
+/// 解析失败时返回 `None`。
+fn parse_tuning_action(output_summary: &str) -> Option<TuningActionInfo> {
+    if output_summary.contains("禁用缓存") {
+        Some(TuningActionInfo::DisableCache)
+    } else if output_summary.contains("保持当前配置") {
+        Some(TuningActionInfo::KeepCurrent)
+    } else if output_summary.contains("调整 TTL") {
+        // 格式: "调整 TTL: 1800s → 2700s"
+        let ttl_part = output_summary.split("调整 TTL:").nth(1)?;
+        let after_ttl = ttl_part.split("(差值").next()?;
+        let parts: Vec<&str> = after_ttl.split('→').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let old_ttl = parse_ttl_value(parts[0])?;
+        let new_ttl = parse_ttl_value(parts[1])?;
+        Some(TuningActionInfo::AdjustTtl { old_ttl, new_ttl })
+    } else {
+        None
+    }
+}
+
+/// 从字符串中解析 TTL 值 (如 `"1800s"` → `1800`)
+fn parse_ttl_value(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    let without_s = trimmed.strip_suffix('s')?;
+    without_s.trim().parse().ok()
+}
+
+/// 从 `output_summary` 中解析关联差值 (百分比 → 小数)
+///
+/// 格式: `"差值 +67.0%"` 或 `"差值 -100.0%"`
+fn parse_correlation_diff(output_summary: &str) -> Option<f64> {
+    let diff_part = output_summary.split("差值").nth(1)?;
+    let after_diff = diff_part.trim_start();
+    let num_str: String = after_diff
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '+' || *c == '-' || *c == '.')
+        .collect();
+    if num_str.is_empty() {
+        return None;
+    }
+    let percent: f64 = num_str.parse().ok()?;
+    Some(percent / 100.0)
+}
+
+/// 从 `input_summary` 中解析 hit/miss 修复检查数据
+///
+/// 格式: `"hit=2/3 miss=3/3"`
+///
+/// 返回 `(hit_successes, hit_checks, miss_successes, miss_checks)`。
+fn parse_hit_miss(input_summary: &str) -> Option<(usize, usize, usize, usize)> {
+    let hit_part = input_summary
+        .split("hit=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?;
+    let hit_parts: Vec<&str> = hit_part.split('/').collect();
+    if hit_parts.len() < 2 {
+        return None;
+    }
+    let hit_successes: usize = hit_parts[0].parse().ok()?;
+    let hit_checks: usize = hit_parts[1].parse().ok()?;
+
+    let miss_part = input_summary
+        .split("miss=")
+        .nth(1)?
+        .split_whitespace()
+        .next()?;
+    let miss_parts: Vec<&str> = miss_part.split('/').collect();
+    if miss_parts.len() < 2 {
+        return None;
+    }
+    let miss_successes: usize = miss_parts[0].parse().ok()?;
+    let miss_checks: usize = miss_parts[1].parse().ok()?;
+
+    Some((hit_successes, hit_checks, miss_successes, miss_checks))
+}
+
+/// 从单个 `CacheTuning` trace 条目解析调优信息
+///
+/// 根据 trace 条目的 `action`、`input_summary` 和 `output_summary` 字段
+/// 解析调优决策的详细信息。
+///
+/// # 解析规则
+///
+/// - `action` 必须为 `CacheTuning`
+/// - `output_summary` 包含调优动作和关联差值
+/// - `input_summary` 包含 hit/miss 修复检查数据 (可选, 解析失败时默认为 `0`)
+///
+/// # 参数
+///
+/// - `entry`: DevTrace 条目
+///
+/// # 返回
+///
+/// 解析成功返回 `Some(CacheTuningEntryInfo)`, 否则返回 `None`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{parse_cache_tuning_entry, DevTraceEntry, TraceAction, TuningActionInfo};
+/// let entry = DevTraceEntry::new(
+///     TraceAction::CacheTuning, Some(0), Some(0), Some("task"),
+///     "hit=2/3 miss=3/3",
+///     "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+///     0, true, Some("缓存有效"),
+/// );
+/// let info = parse_cache_tuning_entry(&entry).unwrap();
+/// assert_eq!(info.action, TuningActionInfo::AdjustTtl { old_ttl: 1800, new_ttl: 2700 });
+/// assert!((info.correlation_diff - 0.67).abs() < 0.001);
+/// assert_eq!(info.hit_successes, 2);
+/// assert_eq!(info.hit_checks, 3);
+/// ```
+pub fn parse_cache_tuning_entry(entry: &DevTraceEntry) -> Option<CacheTuningEntryInfo> {
+    if entry.action != TraceAction::CacheTuning {
+        return None;
+    }
+
+    let action = parse_tuning_action(&entry.output_summary)?;
+    let correlation_diff = parse_correlation_diff(&entry.output_summary).unwrap_or(0.0);
+
+    let (hit_successes, hit_checks, miss_successes, miss_checks) =
+        parse_hit_miss(&entry.input_summary).unwrap_or((0, 0, 0, 0));
+
+    Some(CacheTuningEntryInfo {
+        action,
+        correlation_diff,
+        hit_successes,
+        hit_checks,
+        miss_successes,
+        miss_checks,
+    })
+}
+
+/// 从 DevTrace 条目列表构建缓存调优效果摘要
+///
+/// 遍历所有 `CacheTuning` 条目, 解析调优决策信息,
+/// 汇总为 `CacheTuningSummary`。
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_cache_tuning_summary, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::CacheTuning, None, None, None,
+///         "hit=2/3 miss=3/3",
+///         "缓存调优: 保持当前配置 (差值 +5.0%, 原因: 数据不足)",
+///         0, true, Some("数据不足"),
+///     ),
+/// ];
+/// let summary = build_cache_tuning_summary(&entries);
+/// assert_eq!(summary.total_evaluations, 1);
+/// assert_eq!(summary.keep_current_count, 1);
+/// ```
+pub fn build_cache_tuning_summary(entries: &[DevTraceEntry]) -> CacheTuningSummary {
+    entries.iter().filter_map(parse_cache_tuning_entry).fold(
+        CacheTuningSummary::new(),
+        |mut acc, info| {
+            acc.record(info);
+            acc
+        },
+    )
+}
+
+// ============================================================================
 //  纯逻辑函数 — 统计计算
 // ============================================================================
 
@@ -1262,6 +1618,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有关联数据 (无 WebSearch 或无后续 CompileCheck)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_fix_correlation: Option<CacheFixCorrelation>,
+
+    /// 缓存调优效果摘要 (Session 83)
+    ///
+    /// 从 `CacheTuning` trace 条目中解析的调优历史统计,
+    /// 展示 CacheTuner 的调整历史和效果。
+    /// `None` 表示没有缓存调优记录 (未启用 CacheTuner 或无 trace 数据)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_tuning_summary: Option<CacheTuningSummary>,
 }
 
 impl DevTraceSummary {
@@ -1276,6 +1640,7 @@ impl DevTraceSummary {
             incremental_summary: None,
             cache_summary: None,
             cache_fix_correlation: None,
+            cache_tuning_summary: None,
         }
     }
 
@@ -1328,6 +1693,14 @@ impl DevTraceSummary {
             Some(correlation)
         };
 
+        // 从 CacheTuning 条目中解析缓存调优效果 (Session 83)
+        let tuning_stats = build_cache_tuning_summary(entries);
+        let cache_tuning_summary = if tuning_stats.is_empty() {
+            None
+        } else {
+            Some(tuning_stats)
+        };
+
         Self {
             total_entries,
             total_duration_ms,
@@ -1337,6 +1710,7 @@ impl DevTraceSummary {
             incremental_summary,
             cache_summary,
             cache_fix_correlation,
+            cache_tuning_summary,
         }
     }
 
@@ -1455,6 +1829,45 @@ impl DevTraceSummary {
                     } else {
                         "缓存效果不足"
                     }
+                ));
+            }
+        }
+
+        // === 缓存调优效果 (Session 83) ===
+        if let Some(ref tuning) = self.cache_tuning_summary {
+            report.push_str("\n  ── 缓存调优效果 ──\n");
+            report.push_str(&format!("  总评估: {} 次\n", tuning.total_evaluations));
+            if tuning.keep_current_count > 0 {
+                report.push_str(&format!("  保持当前: {} 次\n", tuning.keep_current_count));
+            }
+            if tuning.adjust_ttl_count > 0 {
+                report.push_str(&format!("  调整 TTL: {} 次\n", tuning.adjust_ttl_count));
+            }
+            if tuning.disable_count > 0 {
+                report.push_str(&format!("  禁用缓存: {} 次\n", tuning.disable_count));
+            }
+            // TTL 变化轨迹
+            if !tuning.ttl_history.is_empty() {
+                report.push_str("  TTL 变化: ");
+                if let Some(initial) = tuning.initial_ttl() {
+                    report.push_str(&format!("{}s", initial));
+                }
+                for (_, new_ttl) in &tuning.ttl_history {
+                    report.push_str(&format!(" → {}s", new_ttl));
+                }
+                report.push('\n');
+            }
+            // 最终状态
+            if tuning.cache_disabled {
+                report.push_str("  缓存状态: 已禁用\n");
+            } else if let Some(final_ttl) = tuning.final_ttl {
+                report.push_str(&format!("  最终 TTL: {}s\n", final_ttl));
+            }
+            // 平均差值
+            if !tuning.correlation_diffs.is_empty() {
+                report.push_str(&format!(
+                    "  平均差值: {:+.1}%\n",
+                    tuning.avg_correlation_diff() * 100.0
                 ));
             }
         }
@@ -6763,5 +7176,814 @@ mod tests {
         assert_eq!(corr.checks_after_hit, 1);
         assert_eq!(corr.successes_after_hit, 1);
         assert!(!corr.is_cache_effective()); // 没有 miss 数据
+    }
+
+    // ===== Session 83: CacheTuner 调优效果可视化 测试 =====
+
+    // --- parse_tuning_action 测试 ---
+
+    #[test]
+    fn test_parse_tuning_action_keep_current() {
+        let action = parse_tuning_action("缓存调优: 保持当前配置 (差值 +5.0%, 原因: 数据不足)");
+        assert_eq!(action, Some(TuningActionInfo::KeepCurrent));
+    }
+
+    #[test]
+    fn test_parse_tuning_action_adjust_ttl() {
+        let action =
+            parse_tuning_action("缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)");
+        assert_eq!(
+            action,
+            Some(TuningActionInfo::AdjustTtl {
+                old_ttl: 1800,
+                new_ttl: 2700
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_tuning_action_disable_cache() {
+        let action = parse_tuning_action("缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)");
+        assert_eq!(action, Some(TuningActionInfo::DisableCache));
+    }
+
+    #[test]
+    fn test_parse_tuning_action_invalid() {
+        assert_eq!(parse_tuning_action("not a valid format"), None);
+        assert_eq!(parse_tuning_action(""), None);
+    }
+
+    #[test]
+    fn test_parse_tuning_action_reduce_ttl() {
+        let action =
+            parse_tuning_action("缓存调优: 调整 TTL: 1800s → 900s (差值 -8.0%, 原因: 缓存略差)");
+        assert_eq!(
+            action,
+            Some(TuningActionInfo::AdjustTtl {
+                old_ttl: 1800,
+                new_ttl: 900
+            })
+        );
+    }
+
+    // --- parse_ttl_value 测试 ---
+
+    #[test]
+    fn test_parse_ttl_value_valid() {
+        assert_eq!(parse_ttl_value("1800s"), Some(1800));
+        assert_eq!(parse_ttl_value(" 2700s "), Some(2700));
+        assert_eq!(parse_ttl_value("60s"), Some(60));
+    }
+
+    #[test]
+    fn test_parse_ttl_value_invalid() {
+        assert_eq!(parse_ttl_value("1800"), None); // missing 's'
+        assert_eq!(parse_ttl_value("abc"), None);
+        assert_eq!(parse_ttl_value(""), None);
+    }
+
+    // --- parse_correlation_diff 测试 ---
+
+    #[test]
+    fn test_parse_correlation_diff_positive() {
+        let diff = parse_correlation_diff(
+            "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+        );
+        assert!(diff.is_some());
+        assert!((diff.unwrap() - 0.67).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_correlation_diff_negative() {
+        let diff = parse_correlation_diff("缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)");
+        assert!(diff.is_some());
+        assert!((diff.unwrap() - (-1.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_correlation_diff_zero() {
+        let diff = parse_correlation_diff("缓存调优: 保持当前配置 (差值 +0.0%, 原因: 持平)");
+        assert!(diff.is_some());
+        assert!((diff.unwrap() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_correlation_diff_invalid() {
+        assert_eq!(parse_correlation_diff("no diff here"), None);
+        assert_eq!(parse_correlation_diff(""), None);
+    }
+
+    // --- parse_hit_miss 测试 ---
+
+    #[test]
+    fn test_parse_hit_miss_valid() {
+        let result = parse_hit_miss("hit=2/3 miss=3/3");
+        assert_eq!(result, Some((2, 3, 3, 3)));
+    }
+
+    #[test]
+    fn test_parse_hit_miss_zeros() {
+        let result = parse_hit_miss("hit=0/0 miss=0/0");
+        assert_eq!(result, Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn test_parse_hit_miss_invalid() {
+        assert_eq!(parse_hit_miss("not a valid format"), None);
+        assert_eq!(parse_hit_miss(""), None);
+        assert_eq!(parse_hit_miss("hit=2 miss=3"), None); // missing /
+    }
+
+    // --- parse_cache_tuning_entry 测试 ---
+
+    #[test]
+    fn test_parse_cache_tuning_entry_adjust_ttl() {
+        let entry = DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            Some(0),
+            Some(0),
+            Some("task"),
+            "hit=2/3 miss=1/3",
+            "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+            0,
+            true,
+            Some("缓存有效"),
+        );
+        let info = parse_cache_tuning_entry(&entry).unwrap();
+        assert_eq!(
+            info.action,
+            TuningActionInfo::AdjustTtl {
+                old_ttl: 1800,
+                new_ttl: 2700
+            }
+        );
+        assert!((info.correlation_diff - 0.67).abs() < 0.001);
+        assert_eq!(info.hit_successes, 2);
+        assert_eq!(info.hit_checks, 3);
+        assert_eq!(info.miss_successes, 1);
+        assert_eq!(info.miss_checks, 3);
+    }
+
+    #[test]
+    fn test_parse_cache_tuning_entry_keep_current() {
+        let entry = DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=1/3 miss=1/3",
+            "缓存调优: 保持当前配置 (差值 +0.0%, 原因: 数据不足)",
+            0,
+            true,
+            Some("数据不足"),
+        );
+        let info = parse_cache_tuning_entry(&entry).unwrap();
+        assert_eq!(info.action, TuningActionInfo::KeepCurrent);
+        assert!((info.correlation_diff - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_cache_tuning_entry_disable_cache() {
+        let entry = DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            Some(0),
+            Some(0),
+            Some("task"),
+            "hit=0/3 miss=3/3",
+            "缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)",
+            0,
+            true,
+            Some("缓存有害"),
+        );
+        let info = parse_cache_tuning_entry(&entry).unwrap();
+        assert_eq!(info.action, TuningActionInfo::DisableCache);
+        assert!((info.correlation_diff - (-1.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_cache_tuning_entry_wrong_action() {
+        let entry = DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            None,
+            None,
+            None,
+            "hit=2/3 miss=3/3",
+            "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+            0,
+            true,
+            None,
+        );
+        assert!(parse_cache_tuning_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn test_parse_cache_tuning_entry_malformed_output() {
+        let entry = DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=2/3 miss=3/3",
+            "not a valid output",
+            0,
+            true,
+            None,
+        );
+        assert!(parse_cache_tuning_entry(&entry).is_none());
+    }
+
+    #[test]
+    fn test_parse_cache_tuning_entry_missing_hit_miss_defaults_to_zero() {
+        // input_summary 格式错误时, hit/miss 默认为 0
+        let entry = DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "malformed input",
+            "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+            0,
+            true,
+            None,
+        );
+        let info = parse_cache_tuning_entry(&entry).unwrap();
+        assert_eq!(info.hit_successes, 0);
+        assert_eq!(info.hit_checks, 0);
+        assert_eq!(info.miss_successes, 0);
+        assert_eq!(info.miss_checks, 0);
+    }
+
+    // --- CacheTuningSummary 方法测试 ---
+
+    #[test]
+    fn test_cache_tuning_summary_new() {
+        let s = CacheTuningSummary::new();
+        assert_eq!(s.total_evaluations, 0);
+        assert_eq!(s.keep_current_count, 0);
+        assert_eq!(s.adjust_ttl_count, 0);
+        assert_eq!(s.disable_count, 0);
+        assert!(s.ttl_history.is_empty());
+        assert!(s.final_ttl.is_none());
+        assert!(!s.cache_disabled);
+        assert!(s.correlation_diffs.is_empty());
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_is_empty() {
+        let s = CacheTuningSummary::new();
+        assert!(s.is_empty());
+
+        let mut s = CacheTuningSummary::new();
+        s.total_evaluations = 1;
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_avg_correlation_diff() {
+        let mut s = CacheTuningSummary::new();
+        assert_eq!(s.avg_correlation_diff(), 0.0); // empty
+
+        s.correlation_diffs = vec![0.1, -0.2, 0.3];
+        // (0.1 - 0.2 + 0.3) / 3 = 0.2 / 3 ≈ 0.0667
+        assert!((s.avg_correlation_diff() - 0.0667).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_initial_ttl() {
+        let s = CacheTuningSummary::new();
+        assert!(s.initial_ttl().is_none());
+
+        let mut s = CacheTuningSummary::new();
+        s.ttl_history = vec![(1800, 2700), (2700, 4050)];
+        assert_eq!(s.initial_ttl(), Some(1800));
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_record_keep_current() {
+        let mut s = CacheTuningSummary::new();
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::KeepCurrent,
+            correlation_diff: 0.05,
+            hit_successes: 2,
+            hit_checks: 3,
+            miss_successes: 2,
+            miss_checks: 3,
+        });
+        assert_eq!(s.total_evaluations, 1);
+        assert_eq!(s.keep_current_count, 1);
+        assert_eq!(s.adjust_ttl_count, 0);
+        assert_eq!(s.disable_count, 0);
+        assert!(!s.cache_disabled);
+        assert_eq!(s.correlation_diffs, vec![0.05]);
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_record_adjust_ttl() {
+        let mut s = CacheTuningSummary::new();
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::AdjustTtl {
+                old_ttl: 1800,
+                new_ttl: 2700,
+            },
+            correlation_diff: 0.67,
+            hit_successes: 3,
+            hit_checks: 3,
+            miss_successes: 1,
+            miss_checks: 3,
+        });
+        assert_eq!(s.total_evaluations, 1);
+        assert_eq!(s.adjust_ttl_count, 1);
+        assert_eq!(s.ttl_history, vec![(1800, 2700)]);
+        assert_eq!(s.final_ttl, Some(2700));
+        assert!(!s.cache_disabled);
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_record_disable_cache() {
+        let mut s = CacheTuningSummary::new();
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::DisableCache,
+            correlation_diff: -1.0,
+            hit_successes: 0,
+            hit_checks: 3,
+            miss_successes: 3,
+            miss_checks: 3,
+        });
+        assert_eq!(s.total_evaluations, 1);
+        assert_eq!(s.disable_count, 1);
+        assert!(s.cache_disabled);
+    }
+
+    #[test]
+    fn test_cache_tuning_summary_record_multiple() {
+        let mut s = CacheTuningSummary::new();
+
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::KeepCurrent,
+            correlation_diff: 0.0,
+            hit_successes: 1,
+            hit_checks: 3,
+            miss_successes: 1,
+            miss_checks: 3,
+        });
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::AdjustTtl {
+                old_ttl: 1800,
+                new_ttl: 2700,
+            },
+            correlation_diff: 0.67,
+            hit_successes: 3,
+            hit_checks: 3,
+            miss_successes: 1,
+            miss_checks: 3,
+        });
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::AdjustTtl {
+                old_ttl: 2700,
+                new_ttl: 4050,
+            },
+            correlation_diff: 0.8,
+            hit_successes: 3,
+            hit_checks: 3,
+            miss_successes: 0,
+            miss_checks: 3,
+        });
+        s.record(CacheTuningEntryInfo {
+            action: TuningActionInfo::DisableCache,
+            correlation_diff: -0.5,
+            hit_successes: 0,
+            hit_checks: 3,
+            miss_successes: 3,
+            miss_checks: 3,
+        });
+
+        assert_eq!(s.total_evaluations, 4);
+        assert_eq!(s.keep_current_count, 1);
+        assert_eq!(s.adjust_ttl_count, 2);
+        assert_eq!(s.disable_count, 1);
+        assert_eq!(s.ttl_history, vec![(1800, 2700), (2700, 4050)]);
+        assert_eq!(s.final_ttl, Some(4050));
+        assert!(s.cache_disabled);
+        assert_eq!(s.correlation_diffs, vec![0.0, 0.67, 0.8, -0.5]);
+        assert_eq!(s.initial_ttl(), Some(1800));
+    }
+
+    // --- build_cache_tuning_summary 测试 ---
+
+    #[test]
+    fn test_build_cache_tuning_summary_empty() {
+        let summary = build_cache_tuning_summary(&[]);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn test_build_cache_tuning_summary_no_tuning_entries() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = build_cache_tuning_summary(&entries);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn test_build_cache_tuning_summary_single_keep_current() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=1/3 miss=1/3",
+            "缓存调优: 保持当前配置 (差值 +0.0%, 原因: 数据不足)",
+            0,
+            true,
+            Some("数据不足"),
+        )];
+        let summary = build_cache_tuning_summary(&entries);
+        assert_eq!(summary.total_evaluations, 1);
+        assert_eq!(summary.keep_current_count, 1);
+        assert_eq!(summary.adjust_ttl_count, 0);
+        assert_eq!(summary.disable_count, 0);
+    }
+
+    #[test]
+    fn test_build_cache_tuning_summary_mixed_actions() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +0.0%, 原因: 持平)",
+                0,
+                true,
+                Some("持平"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                Some("缓存有效"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(2),
+                Some("task3"),
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 2700s → 4050s (差值 +80.0%, 原因: 缓存有效)",
+                0,
+                true,
+                Some("缓存有效"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(3),
+                Some("task4"),
+                "hit=0/3 miss=3/3",
+                "缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)",
+                0,
+                true,
+                Some("缓存有害"),
+            ),
+        ];
+        let summary = build_cache_tuning_summary(&entries);
+        assert_eq!(summary.total_evaluations, 4);
+        assert_eq!(summary.keep_current_count, 1);
+        assert_eq!(summary.adjust_ttl_count, 2);
+        assert_eq!(summary.disable_count, 1);
+        assert_eq!(summary.ttl_history, vec![(1800, 2700), (2700, 4050)]);
+        assert_eq!(summary.final_ttl, Some(4050));
+        assert!(summary.cache_disabled);
+        assert_eq!(summary.initial_ttl(), Some(1800));
+        assert_eq!(summary.correlation_diffs.len(), 4);
+    }
+
+    #[test]
+    fn test_build_cache_tuning_summary_ignores_malformed() {
+        let entries = vec![
+            // 正常条目
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            // 格式错误条目 (应被跳过)
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "input",
+                "malformed output",
+                0,
+                true,
+                None,
+            ),
+            // 非 CacheTuning 条目 (应被跳过)
+            make_entry(TraceAction::TaskExecution, true),
+        ];
+        let summary = build_cache_tuning_summary(&entries);
+        assert_eq!(summary.total_evaluations, 1); // 只解析了 1 个
+        assert_eq!(summary.keep_current_count, 1);
+    }
+
+    // --- DevTraceSummary 集成测试 ---
+
+    #[test]
+    fn test_summary_cache_tuning_none_without_entries() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::FixAttempt, false),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.cache_tuning_summary.is_none());
+    }
+
+    #[test]
+    fn test_summary_cache_tuning_from_single_entry() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            Some(0),
+            Some(0),
+            Some("task"),
+            "hit=2/3 miss=3/3",
+            "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+            0,
+            true,
+            Some("缓存有效"),
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let tuning = summary.cache_tuning_summary.expect("should be Some");
+        assert_eq!(tuning.total_evaluations, 1);
+        assert_eq!(tuning.adjust_ttl_count, 1);
+        assert_eq!(tuning.final_ttl, Some(2700));
+    }
+
+    #[test]
+    fn test_summary_cache_tuning_from_multiple_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "hit=2/3 miss=3/3",
+                "缓存调优: 调整 TTL: 1800s → 900s (差值 -8.0%, 原因: 缓存略差)",
+                0,
+                true,
+                Some("缓存略差"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "hit=0/3 miss=3/3",
+                "缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)",
+                0,
+                true,
+                Some("缓存有害"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let tuning = summary.cache_tuning_summary.expect("should be Some");
+        assert_eq!(tuning.total_evaluations, 2);
+        assert_eq!(tuning.adjust_ttl_count, 1);
+        assert_eq!(tuning.disable_count, 1);
+        assert_eq!(tuning.ttl_history, vec![(1800, 900)]);
+        assert!(tuning.cache_disabled);
+    }
+
+    #[test]
+    fn test_summary_cache_tuning_serde_roundtrip() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            Some(0),
+            Some(0),
+            Some("task"),
+            "hit=2/3 miss=3/3",
+            "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+            0,
+            true,
+            Some("缓存有效"),
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: DevTraceSummary = serde_json::from_str(&json).unwrap();
+
+        let tuning = deserialized.cache_tuning_summary.expect("should be Some");
+        assert_eq!(tuning.total_evaluations, 1);
+        assert_eq!(tuning.adjust_ttl_count, 1);
+        assert_eq!(tuning.final_ttl, Some(2700));
+    }
+
+    #[test]
+    fn test_summary_cache_tuning_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        // cache_tuning_summary 为 None 时应被 skip
+        assert!(!json.contains("cache_tuning_summary"));
+    }
+
+    // --- to_report 测试 ---
+
+    #[test]
+    fn test_to_report_includes_cache_tuning() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "hit=2/3 miss=3/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                Some("缓存有效"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(1),
+                Some("task2"),
+                "hit=0/3 miss=3/3",
+                "缓存调优: 禁用缓存 (差值 -100.0%, 原因: 缓存有害)",
+                0,
+                true,
+                Some("缓存有害"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("缓存调优效果"));
+        assert!(report.contains("总评估: 2 次"));
+        assert!(report.contains("调整 TTL: 1 次"));
+        assert!(report.contains("禁用缓存: 1 次"));
+        assert!(report.contains("TTL 变化: 1800s → 2700s"));
+        assert!(report.contains("缓存状态: 已禁用"));
+    }
+
+    #[test]
+    fn test_to_report_no_cache_tuning_section_when_none() {
+        let entries = vec![make_entry(TraceAction::TaskExecution, true)];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("缓存调优效果"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_keep_only() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=1/3 miss=1/3",
+            "缓存调优: 保持当前配置 (差值 +0.0%, 原因: 数据不足)",
+            0,
+            true,
+            Some("数据不足"),
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("缓存调优效果"));
+        assert!(report.contains("总评估: 1 次"));
+        assert!(report.contains("保持当前: 1 次"));
+        assert!(!report.contains("调整 TTL"));
+        assert!(!report.contains("禁用缓存"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_final_ttl() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=3/3 miss=1/3",
+            "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+            0,
+            true,
+            Some("缓存有效"),
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("最终 TTL: 2700s"));
+        assert!(!report.contains("缓存状态: 已禁用"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_avg_diff() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +10.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=3/3 miss=1/3",
+                "缓存调优: 保持当前配置 (差值 +20.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        // 平均差值 = (10% + 20%) / 2 = 15%
+        assert!(report.contains("平均差值: +15.0%"));
+    }
+
+    #[test]
+    fn test_summary_all_sections_with_cache_tuning() {
+        // 同时有增量发送、搜索缓存、关联分析和缓存调优的条目
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                None,
+                None,
+                None,
+                "total=10, sent=3, skipped=7",
+                "response",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "query",
+                "result",
+                0,
+                true,
+                Some("缓存命中 (key=E0308, 原始耗时=300ms, 命中次数=1)"),
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "hit=2/3 miss=3/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                Some("缓存有效"),
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.incremental_summary.is_some());
+        assert!(summary.cache_summary.is_some());
+        assert!(summary.cache_fix_correlation.is_some());
+        assert!(summary.cache_tuning_summary.is_some());
+
+        let report = summary.to_report();
+        assert!(report.contains("增量发送统计"));
+        assert!(report.contains("搜索缓存统计"));
+        assert!(report.contains("缓存与修复关联分析"));
+        assert!(report.contains("缓存调优效果"));
     }
 }
