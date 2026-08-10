@@ -62,6 +62,7 @@ pub mod auto_recovery;
 pub mod ax_snapshot;
 pub mod browser;
 pub mod browser_launcher;
+pub mod cancellation_token;
 pub mod cdp;
 pub mod chat;
 pub mod clarify;
@@ -112,6 +113,7 @@ pub use browser_launcher::{
     default_user_data_dir, detect_browser_paths, find_available_port_sync, find_browser,
     is_browser_running, is_port_available_sync, BrowserLauncher,
 };
+pub use cancellation_token::{CancelError, CancellationToken, CancellationTokenSource};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
 pub use clarify::HeuristicClarificationChecker;
 pub use config::{

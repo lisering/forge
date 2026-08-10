@@ -570,10 +570,11 @@ mod tests {
 
     #[test]
     fn prop_parse_scroll_result_always_non_negative() {
-        proptest!(|(s in r"(scrolled|scroll) \w+ text=\d+")| {
+        proptest!(|(steps_in in 0u32..=100, text_in in 0u64..=999999)| {
+            let s = format!("scrolled {} text={}", steps_in, text_in);
             let (steps, text) = parse_scroll_result(&s);
-            prop_assert!(steps <= 28);
-            prop_assert!(text <= 999999);
+            prop_assert_eq!(steps, steps_in);
+            prop_assert_eq!(text, text_in);
         });
     }
 }

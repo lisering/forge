@@ -690,9 +690,9 @@ fn test_slash_command_action() {
 /// 测试 15: 所有已知指令解析
 #[test]
 fn test_all_known_commands_parsed() {
-    let response = "/compact\n/skip\n/refocus\n/retry\n/escalate";
+    let response = "/compact\n/skip\n/refocus\n/retry\n/escalate\n/search";
     let cmds = slash_command::parse_from_response(response);
-    assert_eq!(cmds.len(), 5);
+    assert_eq!(cmds.len(), 6);
     for cmd in SlashCommand::all_known() {
         assert!(cmds.contains(&cmd), "应包含指令: {:?}", cmd);
     }

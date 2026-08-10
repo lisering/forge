@@ -1183,7 +1183,7 @@ async fn test_strip_commands_preserves_code_all_features() {
 #[test]
 fn test_all_trace_actions_present() {
     let all = TraceAction::all();
-    assert_eq!(all.len(), 16, "应有 16 种 TraceAction");
+    assert_eq!(all.len(), 17, "应有 17 种 TraceAction");
 
     // 验证包含 SlashCommand
     assert!(
@@ -1220,9 +1220,9 @@ fn test_all_trace_actions_present() {
 /// 测试 22: SlashCommand 解析在全功能环境下正确
 #[test]
 fn test_slash_command_parse_full_environment() {
-    let response = "/compact\n/skip\n/refocus\n/retry\n/escalate";
+    let response = "/compact\n/skip\n/refocus\n/retry\n/escalate\n/search";
     let cmds = slash_command::parse_from_response(response);
-    assert_eq!(cmds.len(), 5, "应解析出 5 个指令");
+    assert_eq!(cmds.len(), 6, "应解析出 6 个指令");
 
     // 验证所有已知指令
     for cmd in forge::slash_command::SlashCommand::all_known() {

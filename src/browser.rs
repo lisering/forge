@@ -8,6 +8,51 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{debug, info, warn};
 
 // ============================================================================
+//  Token estimation utilities
+// ============================================================================
+
+/// 估算文本的 token 数量
+///
+/// 使用简单的启发式方法估算 token 数量:
+/// - 英文文本: 字符数 / 4 (平均每个 token 4 个字符)
+/// - 中文文本: 字符数 (每个中文字符通常对应一个 token)
+/// - 混合文本: 字符数 / 3 (折中估计)
+///
+/// 这是一个简化的估算，用于上下文压缩触发判断。
+/// 实际 LLM tokenization 更复杂，但这个估算足够用于触发阈值判断。
+pub fn estimate_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let char_count = text.chars().count();
+
+    // 检测中文字符比例
+    let chinese_chars = text
+        .chars()
+        .filter(|c| {
+            let code = *c as u32;
+            // 中文字符范围: CJK Unified Ideographs (U+4E00-U+9FFF)
+            // 和 CJK Extension A (U+3400-U+4DBF)
+            (0x4E00..=0x9FFF).contains(&code) || (0x3400..=0x4DBF).contains(&code)
+        })
+        .count();
+
+    let chinese_ratio = chinese_chars as f64 / char_count as f64;
+
+    if chinese_ratio > 0.5 {
+        // 主要是中文
+        char_count
+    } else if chinese_ratio > 0.1 {
+        // 混合文本
+        char_count / 3
+    } else {
+        // 主要是英文
+        char_count / 4
+    }
+}
+
+// ============================================================================
 //  SiteType — 多网站类型识别
 // ============================================================================
 
@@ -136,6 +181,12 @@ pub struct ChatTab {
     /// 每次 `send_message` 后 +1, `start_new_conversation` 后清零。
     /// 使用 AtomicUsize 实现线程安全的原子操作。
     pub turn_count: AtomicUsize,
+    /// 当前对话 token 数 — 用于上下文压缩
+    ///
+    /// 每次 `send_message` 后增加用户消息和 AI 回复的 token 数量,
+    /// `start_new_conversation` 后清零。
+    /// 使用 AtomicUsize 实现线程安全的原子操作。
+    pub(crate) token_count: AtomicUsize,
     /// 流式响应超时配置 (24h 可靠性) — 可配置的三阶段超时 + 卡死检测
     ///
     /// 默认使用 `TimeoutConfig::default()` (Phase1=10s, Phase2=60s, Phase3=30s, Stuck=120s)。
@@ -226,6 +277,7 @@ impl BrowserManager {
                         url: tab_info.url.clone(),
                         site_type,
                         turn_count: AtomicUsize::new(0),
+                        token_count: AtomicUsize::new(0),
                         timeout_config: TimeoutConfig::default(),
                     });
                 }

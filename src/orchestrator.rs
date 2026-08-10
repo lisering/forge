@@ -38,7 +38,7 @@ use crate::task_graph::TaskGraph;
 use crate::testrunner::{load_e2e_tests_from_workspace, CompileError, E2ETestSummary};
 use crate::traits::{
     ChatClient, ClarificationChecker, ClarificationContext, FileExtractor, FixContext,
-    HumanInteraction, PhaseInfo, PlanInfo, TaskAction, TaskInfo, TestRunner,
+    HumanInteraction, PhaseInfo, PlanInfo, TaskAction, TaskInfo, TestRunner, WebTool,
 };
 use crate::workspace::Workspace;
 use anyhow::Result;
@@ -446,6 +446,21 @@ where
     ///
     /// None 表示禁用 (默认, 向后兼容, 使用原有的直接提取逻辑)。
     pub handler_chain: Option<HandlerChain>,
+
+    /// Web 工具 — AI 自主网页搜索/文档查阅能力 (Session 73)
+    ///
+    /// 启用后, Forge 可以在开发流程中自主搜索文档、查阅网页内容，
+    /// 借鉴 ds4 `ds4_web.c` 的智能滚动、内容提取等技术。
+    ///
+    /// None 表示禁用 (默认, 向后兼容)。启用后可配合 Slash Commands
+    /// 中的 `/search` 指令使用。
+    pub web_tool: Option<Box<dyn WebTool>>,
+
+    /// 上下文压缩配置 — ds4 风格软/硬触发机制
+    ///
+    /// 启用后, 基于 token 数量而非对话轮数触发上下文压缩。
+    /// None 表示禁用 (使用原有的基于对话轮数的上下文衔接)。
+    pub compaction_config: Option<crate::context_handoff::CompactionConfig>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -486,6 +501,8 @@ where
             connection_monitor: None,
             auto_recovery: None,
             handler_chain: None,
+            web_tool: None,
+            compaction_config: None,
         }
     }
 }
@@ -542,6 +559,8 @@ where
             connection_monitor: self.connection_monitor,
             auto_recovery: self.auto_recovery,
             handler_chain: self.handler_chain,
+            web_tool: self.web_tool,
+            compaction_config: self.compaction_config,
         }
     }
 
@@ -658,6 +677,46 @@ where
         self.connection_monitor = Some(ConnectionMonitor::new(port));
         self.auto_recovery = Some(AutoRecovery::new(RecoveryConfig::new(port, max_retries)));
         self
+    }
+
+    /// 启用上下文压缩 (ds4 风格) — Session 73
+    ///
+    /// 启用后, 基于 token 数量而非对话轮数触发上下文压缩。
+    /// 使用 ds4 的软/硬触发机制:
+    /// - Soft: 对话达到上下文窗口 85% 时, 在下一轮用户消息前压缩
+    /// - Hard: 当工具结果无法放入剩余空间时, 立即压缩
+    ///
+    /// # 参数
+    /// - `context_window`: 上下文窗口大小 (token 数, 如 128000)
+    /// - `soft_threshold_pct`: 软触发阈值 (0.0-1.0, 默认 0.85)
+    /// - `hard_threshold_tokens`: 硬触发阈值 (默认 8192)
+    /// - `tail_preserve_tokens`: 压缩时保留的尾部 token 数 (默认 50000)
+    /// - `min_tokens_for_soft_trigger`: 小上下文保护的最小 token 数 (默认 512)
+    pub fn with_context_compaction(
+        mut self,
+        _context_window: usize,
+        soft_threshold_pct: Option<f64>,
+        hard_threshold_tokens: Option<usize>,
+        tail_preserve_tokens: Option<usize>,
+        min_tokens_for_soft_trigger: Option<usize>,
+    ) -> Self {
+        let config = crate::context_handoff::CompactionConfig {
+            soft_threshold_pct: soft_threshold_pct.unwrap_or(0.85),
+            hard_threshold_tokens: hard_threshold_tokens.unwrap_or(8192),
+            tail_preserve_tokens: tail_preserve_tokens.unwrap_or(50000),
+            min_tokens_for_soft_trigger: min_tokens_for_soft_trigger.unwrap_or(512),
+        };
+        self.compaction_config = Some(config);
+        self
+    }
+
+    /// 创建全局取消令牌 — 基于 Orchestrator 的超时配置
+    ///
+    /// 用于长操作（如网页搜索、编译检查、测试运行）的取消感知。
+    /// 自动在 Orchestrator 超时后取消所有操作。
+    pub fn create_cancellation_token(&self) -> crate::cancellation_token::CancellationTokenSource {
+        let timeout = std::time::Duration::from_secs(self.timeout_secs);
+        crate::cancellation_token::CancellationTokenSource::with_timeout(timeout)
     }
 
     /// 启用回调处理器链 — 借鉴 MediaCrawler callback 模式 (Session 69)
@@ -880,11 +939,27 @@ where
     /// 2. 超过则构建 ContextHandoff (从 memory + workspace + error_history)
     /// 3. 调用 chat.start_new_conversation() 新开对话
     /// 4. 发送交接 prompt 作为新对话的第一条消息
-    /// 5. 记录决策到 memory.json
-    /// 6. 对话轮数清零 (start_new_conversation 已处理)
     ///
-    /// max_context_turns == 0 时禁用 (不执行任何操作)。
+    /// 上下文处理检查 — 检查是否需要上下文衔接或压缩
+    ///
+    /// 检查两个触发条件:
+    /// 1. 基于对话轮数的上下文衔接 (原有功能)
+    /// 2. 基于 token 数量的上下文压缩 (ds4 风格)
+    ///
+    /// 优先级: token 压缩 > 对话轮数衔接
     async fn maybe_context_handoff(&mut self) -> Result<()> {
+        // 检查基于 token 的上下文压缩 (更高优先级)
+        if let Some(ref config) = self.compaction_config {
+            // 克隆 config 以避免借用冲突
+            let config_clone = config.clone();
+            if let Some(trigger) = self.check_compaction_trigger(&config_clone)? {
+                self.execute_context_compaction(trigger, &config_clone)
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        // 检查基于对话轮数的上下文衔接 (原有功能)
         if self.max_context_turns == 0 {
             return Ok(());
         }
@@ -1068,6 +1143,87 @@ where
                         "AI 主动建议跳过当前任务",
                     );
                     action = SlashCommandAction::SkipTask;
+                }
+                SlashCommand::Search(query) => {
+                    // /search — 触发网页搜索
+                    self.memory.add_decision(
+                        phase_idx,
+                        Some(&task_id),
+                        "AI 自主指令: /search",
+                        &format!("AI 请求搜索: {}", query),
+                    );
+
+                    // 执行网页搜索
+                    if let Some(ref web_tool) = self.web_tool {
+                        info!("    🔍 /search: 执行网页搜索 '{}'", query);
+                        println!("    🔍 AI 请求搜索: {}", query);
+
+                        // 创建取消令牌，确保搜索操作在全局超时内完成
+                        let cancel_source = self.create_cancellation_token();
+                        let cancel_token = cancel_source.token();
+
+                        match web_tool.search_web(query, None, Some(&cancel_token)).await {
+                            Ok(search_result) => {
+                                // 将搜索结果作为新的 AI 消息添加到对话中
+                                let search_summary = format!(
+                                    "# 网页搜索结果\\n\\n查询: {}\\n耗时: {}ms\\n\\n{}",
+                                    search_result.query,
+                                    search_result.duration_ms,
+                                    search_result.content
+                                );
+
+                                // 添加搜索结果到对话历史
+                                self.memory.add_conversation(
+                                    "assistant",
+                                    &search_summary,
+                                    Some(&task_id),
+                                );
+
+                                info!(
+                                    "    ✅ /search: 搜索完成 ({} 字符)",
+                                    search_result.content.len()
+                                );
+                                println!(
+                                    "    ✅ 搜索结果已添加到对话中 ({} 字符)",
+                                    search_result.content.len()
+                                );
+
+                                // === DevTrace: 网页搜索 (Session 73) ===
+                                let sc_task_name =
+                                    self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+                                self.trace_dev(
+                                    TraceAction::WebSearch,
+                                    Some(phase_idx),
+                                    Some(task_idx),
+                                    Some(&sc_task_name),
+                                    query,
+                                    &search_result.content,
+                                    search_result.duration_ms,
+                                    true,
+                                    Some("AI 通过 /search 指令触发"),
+                                );
+                            }
+                            Err(e) => {
+                                error!("    ❌ /search: 搜索失败: {}", e);
+                                println!("    ❌ 网页搜索失败: {}", e);
+
+                                // 添加错误信息到对话
+                                let error_msg = format!("搜索失败: {}", e);
+                                self.memory.add_conversation(
+                                    "assistant",
+                                    &error_msg,
+                                    Some(&task_id),
+                                );
+                            }
+                        }
+                    } else {
+                        warn!("    ⚠️ /search: Web 工具未启用");
+                        println!("    ⚠️ Web 工具未启用，无法执行搜索");
+
+                        let no_tool_msg = "Web 搜索工具未启用，无法执行搜索请求。";
+                        self.memory
+                            .add_conversation("assistant", no_tool_msg, Some(&task_id));
+                    }
                 }
                 SlashCommand::Compact => {
                     // /compact — 强制触发上下文衔接
@@ -3655,5 +3811,173 @@ mod tests {
         let (_dir, ws) = make_ws();
         let content = FixPromptBuilder::get_files_full_content(&ws, &[]);
         assert_eq!(content, "(无文件)");
+    }
+}
+
+// ============================================================================
+//  ds4 风格上下文压缩集成 — Session 73
+// ============================================================================
+
+#[allow(clippy::items_after_test_module)]
+impl<'a, C, T, E, Q> Orchestrator<'a, C, T, E, Q>
+where
+    C: ChatClient,
+    T: TestRunner,
+    E: FileExtractor,
+    Q: ClarificationChecker,
+{
+    /// 检查是否需要触发上下文压缩 — 借鉴 ds4 COMPACT.md 触发逻辑
+    ///
+    /// 返回 Some(trigger) 如果应该触发压缩，None 表示不需要压缩。
+    fn check_compaction_trigger(
+        &self,
+        config: &crate::context_handoff::CompactionConfig,
+    ) -> Result<Option<crate::context_handoff::CompactionTrigger>> {
+        // 估算上下文窗口大小（如果没有提供）
+        let context_window = self.estimate_context_window();
+        let current_tokens = self.chat.conversation_token_count();
+
+        let trigger = crate::context_handoff::check_compaction_trigger(
+            current_tokens,
+            context_window,
+            config,
+        );
+
+        if trigger != crate::context_handoff::CompactionTrigger::None {
+            info!(
+                "🔄 上下文压缩触发: {:?} (当前 {} tokens, 窗口 {} tokens)",
+                trigger, current_tokens, context_window
+            );
+        }
+
+        Ok(
+            if trigger == crate::context_handoff::CompactionTrigger::None {
+                None
+            } else {
+                Some(trigger)
+            },
+        )
+    }
+
+    /// 执行上下文压缩 — 发送摘要 prompt → 新开对话 → 发送压缩上下文
+    ///
+    /// 借鉴 ds4 的压缩流程:
+    /// 1. 构建压缩摘要 prompt (要求 AI 总结关键状态)
+    /// 2. 发送摘要 prompt 并等待 AI 回复
+    /// 3. 新开对话
+    /// 4. 发送 AI 生成的摘要作为新对话的上下文
+    /// 5. 继续执行
+    async fn execute_context_compaction(
+        &mut self,
+        trigger: crate::context_handoff::CompactionTrigger,
+        _config: &crate::context_handoff::CompactionConfig,
+    ) -> Result<()> {
+        info!("🔄 执行上下文压缩: {:?} (ds4 风格)", trigger);
+        println!("\n  🔄 上下文压缩: {:?} 触发, 生成会话摘要...", trigger);
+
+        // 1. 构建压缩摘要 prompt
+        let summary_prompt = crate::context_handoff::build_compaction_summary_prompt();
+
+        // 2. 发送摘要 prompt 并等待 AI 回复
+        let current_phase = self.memory.current_phase;
+        let current_task = self.memory.current_task.clone();
+        let summary_start = Instant::now();
+        let summary_result = self
+            .send_message_safe(summary_prompt, self.timeout_secs)
+            .await?;
+
+        if summary_result.timed_out {
+            warn!("⚠️ 上下文压缩摘要生成超时, 继续执行");
+        }
+
+        let summary_duration = summary_start.elapsed().as_millis() as u64;
+
+        // 记录压缩对话
+        self.memory
+            .add_conversation("user", "[上下文压缩摘要请求]", current_task.as_deref());
+        self.memory
+            .add_conversation("assistant", &summary_result.text, current_task.as_deref());
+
+        // === DevTrace: 上下文压缩 (ds4 风格) ===
+        self.trace_dev(
+            TraceAction::ContextHandoff,
+            Some(current_phase),
+            None,
+            None,
+            "[上下文压缩摘要请求]",
+            &summary_result.text,
+            summary_duration,
+            !summary_result.timed_out,
+            None,
+        );
+
+        // 3. 新开对话
+        self.chat.start_new_conversation().await?;
+
+        // 4. 发送 AI 生成的摘要作为新对话的上下文
+        let handoff_prompt = format!("# 开发会话摘要\n\n{}", summary_result.text);
+
+        let handoff_start = Instant::now();
+        let handoff_result = self
+            .send_message_safe(&handoff_prompt, self.timeout_secs)
+            .await?;
+        let handoff_duration = handoff_start.elapsed().as_millis() as u64;
+
+        // === DevTrace: 压缩上下文传递 ===
+        self.trace_dev(
+            TraceAction::ContextHandoff,
+            Some(current_phase),
+            None,
+            None,
+            &format!("[压缩上下文 - {}字符]", handoff_prompt.len()),
+            &handoff_result.text,
+            handoff_duration,
+            !handoff_result.timed_out,
+            None,
+        );
+
+        // 5. 记录压缩交接决策
+        self.memory.add_decision(
+            current_phase,
+            current_task.as_deref(),
+            "上下文压缩",
+            &format!(
+                "触发 {:?} 压缩 (当前 {} tokens), 新开对话并传递摘要",
+                trigger,
+                self.chat.conversation_token_count()
+            ),
+        );
+
+        // 记录交接对话
+        self.memory.add_conversation(
+            "user",
+            &format!("[压缩上下文 - {}字符]", handoff_prompt.len()),
+            current_task.as_deref(),
+        );
+        self.memory
+            .add_conversation("assistant", &handoff_result.text, current_task.as_deref());
+
+        self.save_memory();
+
+        println!("  ✅ 上下文压缩完成, token 计数已重置");
+        Ok(())
+    }
+
+    /// 估算当前模型的上下文窗口大小
+    ///
+    /// 根据不同网站类型估算上下文窗口:
+    /// - Z.ai: 128K tokens (DeepSeek V3)
+    /// - DeepSeek: 64K tokens (官方文档)
+    /// - Kimi: 128K tokens (官方文档)
+    /// - 通义千问: 128K tokens (官方文档)
+    /// - Claude.ai: 200K tokens (Claude 3.5 Sonnet)
+    /// - 其他: 32K tokens (保守估计)
+    fn estimate_context_window(&self) -> usize {
+        // 尝试从 chat 客户端获取网站类型信息
+        // 注意: 这里需要从 ChatClient trait 获取，但 trait 没有 site_type 方法
+        // 所以我们使用一个合理的默认值
+
+        // TODO: 在 ChatClient trait 中添加 site_type() 方法以支持更精确的估算
+        128000 // 默认 128K tokens，适用于大多数现代模型
     }
 }

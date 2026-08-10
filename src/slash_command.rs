@@ -58,6 +58,7 @@ pub fn is_code_block_boundary(line: &str) -> bool {
 /// # use forge::slash_command::is_known_keyword;
 /// assert!(is_known_keyword("compact"));
 /// assert!(is_known_keyword("SKIP"));
+/// assert!(is_known_keyword("search"));
 /// assert!(!is_known_keyword("foobar"));
 /// ```
 pub fn is_known_keyword(keyword: &str) -> bool {
@@ -233,7 +234,8 @@ pub fn classify_command_action(command: &SlashCommand) -> SlashCommandAction {
 /// 从文本中移除单个指令标记
 ///
 /// 大小写不敏感地查找并移除 `full_command` (如 `/skip`),
-/// 确保移除位置是完整匹配 (后面是边界字符)。
+/// 确保移除位置是完整匹配 (后面是边界字符)。对于 `/search` 指令，
+/// 还需要移除其后的查询参数。
 ///
 /// # 示例
 ///
@@ -250,6 +252,33 @@ pub fn strip_command_from_text(text: &str, full_command: &str) -> String {
         let end_pos = pos + full_command.len();
         if end_pos >= text.len() || !is_keyword_char(text[end_pos..].chars().next().unwrap_or(' '))
         {
+            // Special handling for search command - also strip the query
+            if full_lower == "/search"
+                && end_pos < text.len()
+                && text[end_pos..]
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+                    .is_whitespace()
+            {
+                // Find the end of the search query (next newline or end of string)
+                let query_start = end_pos + 1;
+                let mut query_end = query_start;
+                let text_chars: Vec<char> = text.chars().collect();
+                while query_end < text_chars.len()
+                    && text_chars[query_end] != '\n'
+                    && text_chars[query_end] != '\r'
+                {
+                    query_end += 1;
+                }
+                // Skip any trailing whitespace after the command
+                let strip_end = if query_end > query_start && query_end <= text_chars.len() {
+                    query_end
+                } else {
+                    end_pos
+                };
+                return format!("{}{}", &text[..pos], &text[strip_end..]);
+            }
             return format!("{}{}", &text[..pos], &text[end_pos..]);
         }
     }
@@ -268,6 +297,7 @@ pub fn strip_command_from_text(text: &str, full_command: &str) -> String {
 /// - `Refocus` → 注入转向提醒 (重新锚定 AI 注意力)
 /// - `Retry` → 重置循环终止检测器 (允许全新方法重试)
 /// - `Escalate` → 触发人工干预 (请求人类决策)
+/// - `Search(String)` → 触发网页搜索 (AI 提供查询词)
 /// - `Unknown` → 未识别的指令 (保留原始文本, 不执行任何操作)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SlashCommand {
@@ -281,6 +311,8 @@ pub enum SlashCommand {
     Retry,
     /// `/escalate` — AI 请求人工干预 → 触发人工干预接口
     Escalate,
+    /// `/search query` — AI 请求网页搜索 → 触发 Web 工具搜索
+    Search(String),
     /// 未识别的指令 (保留原始指令文本)
     Unknown(String),
 }
@@ -296,6 +328,7 @@ impl SlashCommand {
             SlashCommand::Refocus => "refocus",
             SlashCommand::Retry => "retry",
             SlashCommand::Escalate => "escalate",
+            SlashCommand::Search(_) => "search",
             SlashCommand::Unknown(s) => s,
         }
     }
@@ -315,6 +348,7 @@ impl SlashCommand {
             SlashCommand::Refocus => "重新聚焦",
             SlashCommand::Retry => "换方法重试",
             SlashCommand::Escalate => "请求人工干预",
+            SlashCommand::Search(_) => "网页搜索",
             SlashCommand::Unknown(_) => "未知指令",
         }
     }
@@ -332,12 +366,13 @@ impl SlashCommand {
             SlashCommand::Refocus,
             SlashCommand::Retry,
             SlashCommand::Escalate,
+            SlashCommand::Search(String::new()), // Placeholder for search
         ]
     }
 
     /// 从关键字字符串创建指令 (大小写不敏感)
     ///
-    /// 如 `"compact"` → `Some(Compact)`, `"foo"` → `Some(Unknown("foo"))`
+    /// 如 `"compact"` → `Some(Compact)`, `"search"` → `Some(Search(""))`, `"foo"` → `Some(Unknown("foo"))`
     pub fn from_keyword(keyword: &str) -> SlashCommand {
         let lower = keyword.to_lowercase();
         match lower.as_str() {
@@ -346,6 +381,7 @@ impl SlashCommand {
             "refocus" => SlashCommand::Refocus,
             "retry" => SlashCommand::Retry,
             "escalate" => SlashCommand::Escalate,
+            "search" => SlashCommand::Search(String::new()), // Will be populated during parsing
             _ => SlashCommand::Unknown(keyword.to_string()),
         }
     }
@@ -392,7 +428,7 @@ impl SlashCommandAction {
 // ============================================================================
 
 /// 已知指令关键字 (小写, 用于匹配)
-const KNOWN_KEYWORDS: &[&str] = &["compact", "skip", "refocus", "retry", "escalate"];
+const KNOWN_KEYWORDS: &[&str] = &["compact", "skip", "refocus", "retry", "escalate", "search"];
 
 /// 从 AI 回复中解析所有 slash commands
 ///
@@ -443,7 +479,21 @@ fn find_commands_in_line(line: &str) -> Vec<SlashCommand> {
                 let end = i + 1 + keyword.chars().count();
                 let next_is_boundary = end >= chars.len() || is_boundary_char(chars[end]);
                 if next_is_boundary && is_known_keyword(&keyword) {
-                    commands.push(SlashCommand::from_keyword(&keyword));
+                    let mut command = SlashCommand::from_keyword(&keyword);
+
+                    // Special handling for search command with query parameters
+                    if let SlashCommand::Search(_) = command {
+                        if end < chars.len() && chars[end].is_whitespace() {
+                            // Extract query after the search command
+                            let query_start = end + 1;
+                            let query = line[query_start..].trim().to_string();
+                            if !query.is_empty() {
+                                command = SlashCommand::Search(query);
+                            }
+                        }
+                    }
+
+                    commands.push(command);
                 }
             }
         }
@@ -607,12 +657,13 @@ mod tests {
     #[test]
     fn test_all_known() {
         let all = SlashCommand::all_known();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert!(all.contains(&SlashCommand::Compact));
         assert!(all.contains(&SlashCommand::Skip));
         assert!(all.contains(&SlashCommand::Refocus));
         assert!(all.contains(&SlashCommand::Retry));
         assert!(all.contains(&SlashCommand::Escalate));
+        assert!(all.contains(&SlashCommand::Search(String::new())));
     }
 
     #[test]
@@ -673,8 +724,8 @@ mod tests {
 
     #[test]
     fn test_parse_all_known_commands() {
-        let cmds = parse_from_response("/compact\n/skip\n/refocus\n/retry\n/escalate");
-        assert_eq!(cmds.len(), 5);
+        let cmds = parse_from_response("/compact\n/skip\n/refocus\n/retry\n/escalate\n/search");
+        assert_eq!(cmds.len(), 6);
         for cmd in SlashCommand::all_known() {
             assert!(cmds.contains(&cmd), "缺少指令: {:?}", cmd);
         }

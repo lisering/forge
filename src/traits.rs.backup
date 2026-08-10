@@ -458,19 +458,10 @@ pub trait WebTool: Send + Sync {
     /// # 参数
     /// - `query`: 搜索查询词
     /// - `url`: 可选的特定 URL，如为 None 则执行 Google 搜索
-    /// - `token`: 取消令牌，用于取消长时间运行的操作
     ///
     /// 默认实现返回空结果 (不支持网页搜索，向后兼容)。
-    async fn search_web(
-        &self,
-        query: &str,
-        _url: Option<&str>,
-        token: Option<&crate::cancellation_token::CancellationToken>,
-    ) -> Result<WebSearchResult> {
+    async fn search_web(&self, query: &str, url: Option<&str>) -> Result<WebSearchResult> {
         // 默认: 不支持网页搜索 (向后兼容, Mock 可不实现)
-        if let Some(token) = token {
-            token.sleep(std::time::Duration::from_millis(1)).await.ok();
-        }
         Ok(WebSearchResult {
             content: String::new(),
             query: query.to_string(),
@@ -483,20 +474,9 @@ pub trait WebTool: Send + Sync {
     /// 通过 CDP 导航到指定 URL，等待页面加载完成，
     /// 然后提取页面内容为 Markdown 格式。
     ///
-    /// # 参数
-    /// - `_url`: 要导航的 URL
-    /// - `token`: 取消令牌，用于取消长时间运行的操作
-    ///
     /// 默认实现返回空内容 (不支持导航，向后兼容)。
-    async fn navigate_and_extract(
-        &self,
-        _url: &str,
-        token: Option<&crate::cancellation_token::CancellationToken>,
-    ) -> Result<String> {
+    async fn navigate_and_extract(&self, _url: &str) -> Result<String> {
         // 默认: 不支持页面导航 (向后兼容, Mock 可不实现)
-        if let Some(token) = token {
-            token.sleep(std::time::Duration::from_millis(1)).await.ok();
-        }
         Ok(String::new())
     }
 }

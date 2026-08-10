@@ -77,6 +77,8 @@ pub enum TraceAction {
     SiteFailover,
     /// 性能统计 — 运行结束后写入各网站性能统计摘要
     PerformanceStats,
+    /// 网页搜索 — AI 通过 /search 指令主动搜索网页/查阅文档
+    WebSearch,
 }
 
 impl std::fmt::Display for TraceAction {
@@ -98,6 +100,7 @@ impl std::fmt::Display for TraceAction {
             TraceAction::HealthCheck => write!(f, "HealthCheck"),
             TraceAction::SiteFailover => write!(f, "SiteFailover"),
             TraceAction::PerformanceStats => write!(f, "PerformanceStats"),
+            TraceAction::WebSearch => write!(f, "WebSearch"),
         }
     }
 }
@@ -122,6 +125,7 @@ impl TraceAction {
             TraceAction::HealthCheck => "健康检查",
             TraceAction::SiteFailover => "网站切换",
             TraceAction::PerformanceStats => "性能统计",
+            TraceAction::WebSearch => "网页搜索",
         }
     }
 
@@ -144,6 +148,7 @@ impl TraceAction {
             TraceAction::HealthCheck,
             TraceAction::SiteFailover,
             TraceAction::PerformanceStats,
+            TraceAction::WebSearch,
         ]
     }
 }
@@ -996,7 +1001,7 @@ mod tests {
     #[test]
     fn test_trace_action_all() {
         let all = TraceAction::all();
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
         assert!(all.contains(&TraceAction::Planning));
         assert!(all.contains(&TraceAction::TaskExecution));
         assert!(all.contains(&TraceAction::FixAttempt));
@@ -1725,7 +1730,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 16); // 所有 16 种操作类型
+        assert_eq!(entries.len(), 17); // 所有 17 种操作类型
 
         let summary = writer.summary();
         for action in TraceAction::all() {
@@ -2154,7 +2159,7 @@ mod tests {
     fn test_trace_action_performance_stats_in_all() {
         let all = TraceAction::all();
         assert!(all.contains(&TraceAction::PerformanceStats));
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 17);
     }
 
     #[test]
@@ -2267,7 +2272,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 16); // 所有 16 种操作类型
+        assert_eq!(entries.len(), 17); // 所有 17 种操作类型
 
         // 确保 PerformanceStats 被包含
         let has_performance_stats = entries
@@ -2876,7 +2881,7 @@ mod tests {
             })
             .collect();
         let grouped = group_entries_by_action(&entries);
-        assert_eq!(grouped.len(), 16);
+        assert_eq!(grouped.len(), 17);
         for action in TraceAction::all() {
             assert!(grouped.contains_key(&action));
         }

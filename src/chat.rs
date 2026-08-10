@@ -845,6 +845,21 @@ impl ChatTab {
         // 10. 对话轮数 +1 (上下文衔接跟踪)
         self.turn_count.fetch_add(1, Ordering::Relaxed);
 
+        // 11. Token 计数 +N (上下文压缩跟踪)
+        let user_tokens = crate::browser::estimate_tokens(message);
+        let ai_tokens = crate::browser::estimate_tokens(&text);
+        let total_tokens = user_tokens + ai_tokens;
+        if total_tokens > 0 {
+            self.token_count.fetch_add(total_tokens, Ordering::Relaxed);
+            debug!(
+                "Token 计数更新: +{} (用户:{} + AI:{}), 总计: {}",
+                total_tokens,
+                user_tokens,
+                ai_tokens,
+                self.token_count.load(Ordering::Relaxed)
+            );
+        }
+
         Ok(ResponseResult {
             text,
             timed_out,
@@ -2018,13 +2033,24 @@ impl ChatClient for ChatTab {
         // 4. 重置对话轮数
         self.turn_count.store(0, Ordering::Relaxed);
 
-        info!("✅ 新对话页面已就绪, 对话轮数已重置 [{}]", self.site_type);
+        // 5. 重置 token 计数
+        self.token_count.store(0, Ordering::Relaxed);
+
+        info!(
+            "✅ 新对话页面已就绪, 对话轮数已重置, token 计数已清零 [{}]",
+            self.site_type
+        );
         Ok(())
     }
 
     /// 当前对话轮数 — 用于判断是否需要上下文衔接
     fn conversation_turn_count(&self) -> usize {
         self.turn_count.load(Ordering::Relaxed)
+    }
+
+    /// 当前对话 token 数 — 用于上下文压缩
+    fn conversation_token_count(&self) -> usize {
+        self.token_count.load(Ordering::Relaxed)
     }
 
     /// 上传文件到聊天页面 — 主要用于截图上传供 AI 分析
