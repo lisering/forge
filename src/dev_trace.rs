@@ -2631,11 +2631,217 @@ impl DevTraceSummary {
 
         report
     }
+
+    // ===== JSON 导出 (Session 88) =====
+
+    /// 将摘要序列化为 pretty JSON 字符串。
+    ///
+    /// 使用缩进格式, 便于人工阅读和外部工具解析。
+    /// 包含所有字段 (总条目、统计、时间线、缓存、增量、历史等)。
+    ///
+    /// # 错误
+    ///
+    /// 仅在序列化失败时返回错误 (理论上不会发生, 因为所有字段都实现了 `Serialize`)。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::dev_trace::DevTraceSummary;
+    /// let summary = DevTraceSummary::empty();
+    /// let json = summary.to_json().unwrap();
+    /// assert!(json.contains("\"total_entries\": 0"));
+    /// ```
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+
+    /// 将摘要序列化为 compact JSON 字符串 (无缩进, 节省空间)。
+    ///
+    /// 适用于存储空间敏感的场景 (如写入小文件或通过网络传输)。
+    ///
+    /// # 错误
+    ///
+    /// 仅在序列化失败时返回错误。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::dev_trace::DevTraceSummary;
+    /// let summary = DevTraceSummary::empty();
+    /// let json = summary.to_json_compact().unwrap();
+    /// assert!(json.contains("\"total_entries\":0"));
+    /// ```
+    pub fn to_json_compact(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    /// 将摘要 (含元数据) 序列化为 pretty JSON 字符串。
+    ///
+    /// 包装在 [`DevTraceJsonExport`] 中, 包含导出时间、Forge 版本和格式版本。
+    /// 适用于需要追踪导出上下文的外部工具分析。
+    ///
+    /// # 参数
+    ///
+    /// - `timestamp`: ISO 8601 格式的时间戳 (如 `2024-06-01T00:00:00+00:00`)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::dev_trace::DevTraceSummary;
+    /// let summary = DevTraceSummary::empty();
+    /// let json = summary.to_json_with_meta("2024-06-01T00:00:00+00:00").unwrap();
+    /// assert!(json.contains("\"exported_at\": \"2024-06-01T00:00:00+00:00\""));
+    /// assert!(json.contains("\"format_version\": \"1.0\""));
+    /// ```
+    pub fn to_json_with_meta(&self, timestamp: &str) -> Result<String> {
+        let export = build_dev_trace_json_export(self.clone(), timestamp.to_string());
+        Ok(serde_json::to_string_pretty(&export)?)
+    }
+
+    /// 将摘要保存为 JSON 文件 (不含元数据)。
+    ///
+    /// 使用 pretty 格式, 文件路径通常为 `.forge/devtrace_summary.json`。
+    ///
+    /// # 错误
+    ///
+    /// 文件写入失败时返回 `io::Error`。
+    pub fn save_to_json_file(&self, path: &Path) -> Result<()> {
+        let json = self.to_json()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// 将摘要 (含元数据) 保存为 JSON 文件。
+    ///
+    /// 包含导出时间、Forge 版本和格式版本, 便于外部工具识别。
+    /// 文件路径通常为 `.forge/devtrace_summary.json`。
+    ///
+    /// # 参数
+    ///
+    /// - `path`: 目标文件路径
+    /// - `timestamp`: ISO 8601 格式的时间戳
+    ///
+    /// # 错误
+    ///
+    /// 文件写入失败时返回 `io::Error`。
+    pub fn save_to_json_file_with_meta(&self, path: &Path, timestamp: &str) -> Result<()> {
+        let export = build_dev_trace_json_export(self.clone(), timestamp.to_string());
+        let json = serde_json::to_string_pretty(&export)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
+//  JSON 导出 — 元数据与包装结构 (Session 88)
+// ============================================================================
+
+/// DevTrace JSON 导出元数据。
+///
+/// 包含导出时间、Forge 版本和格式版本, 便于外部工具识别和解析。
+/// 随 [`DevTraceJsonExport`] 一起序列化。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::DevTraceExportMeta;
+/// let meta = DevTraceExportMeta {
+///     exported_at: "2024-06-01T00:00:00+00:00".to_string(),
+///     forge_version: "0.1.0".to_string(),
+///     format_version: "1.0".to_string(),
+/// };
+/// assert_eq!(meta.format_version, "1.0");
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevTraceExportMeta {
+    /// 导出时间 (ISO 8601 格式, 如 `2024-06-01T00:00:00+00:00`)
+    pub exported_at: String,
+    /// Forge 版本号 (从 `Cargo.toml` 编译时确定)
+    pub forge_version: String,
+    /// JSON 格式版本 (当前为 `"1.0"`)
+    pub format_version: String,
+}
+
+/// DevTrace JSON 导出包装。
+///
+/// 将元数据与追踪摘要组合在一起, 便于外部工具解析和分析。
+/// 通过 [`DevTraceSummary::to_json_with_meta`] 或 [`build_dev_trace_json_export`] 生成。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceSummary, build_dev_trace_json_export};
+/// let summary = DevTraceSummary::empty();
+/// let export = build_dev_trace_json_export(summary, "2024-06-01T00:00:00+00:00".to_string());
+/// assert_eq!(export.meta.format_version, "1.0");
+/// assert_eq!(export.summary.total_entries, 0);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevTraceJsonExport {
+    /// 导出元数据
+    pub meta: DevTraceExportMeta,
+    /// 追踪摘要
+    pub summary: DevTraceSummary,
 }
 
 // ============================================================================
 //  纯逻辑函数 — 时间线/统计/格式化
 // ============================================================================
+
+/// 构建当前时间的 ISO 8601 时间戳 (纯函数)。
+///
+/// 返回 RFC 3339 格式的时间戳, 如 `2024-06-01T00:00:00+00:00`。
+/// 用于 [`DevTraceJsonExport`] 的 `exported_at` 字段。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::build_export_timestamp;
+/// let ts = build_export_timestamp();
+/// assert!(ts.contains('T')); // ISO 8601 格式
+/// ```
+pub fn build_export_timestamp() -> String {
+    Utc::now().to_rfc3339()
+}
+
+/// 构建 DevTrace JSON 导出包装 (纯函数, 遵循 DIP)。
+///
+/// 将 [`DevTraceSummary`] 和时间戳组合为 [`DevTraceJsonExport`],
+/// 自动填充 Forge 版本 (`env!("CARGO_PKG_VERSION")`) 和格式版本 (`"1.0"`)。
+///
+/// # 参数
+///
+/// - `summary`: 追踪摘要
+/// - `timestamp`: ISO 8601 格式的时间戳
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceSummary, build_dev_trace_json_export};
+/// let summary = DevTraceSummary::empty();
+/// let export = build_dev_trace_json_export(summary, "2024-06-01T00:00:00+00:00".to_string());
+/// assert_eq!(export.meta.exported_at, "2024-06-01T00:00:00+00:00");
+/// assert_eq!(export.meta.format_version, "1.0");
+/// ```
+pub fn build_dev_trace_json_export(
+    summary: DevTraceSummary,
+    timestamp: String,
+) -> DevTraceJsonExport {
+    DevTraceJsonExport {
+        meta: DevTraceExportMeta {
+            exported_at: timestamp,
+            forge_version: env!("CARGO_PKG_VERSION").to_string(),
+            format_version: "1.0".to_string(),
+        },
+        summary,
+    }
+}
 
 /// 从 trace 条目列表构建时间线, 限制为最近 `max_entries` 条。
 ///
@@ -9204,5 +9410,433 @@ mod tests {
         // from_entries 不应从 trace 条目解析历史摘要
         assert!(summary.search_quality_history_summary.is_none());
         assert!(summary.cache_tuning_history_summary.is_none());
+    }
+
+    // ===== JSON 导出测试 (Session 88) =====
+
+    // --- to_json ---
+
+    #[test]
+    fn test_to_json_empty_summary() {
+        let summary = DevTraceSummary::empty();
+        let json = summary.to_json().unwrap();
+        assert!(json.contains("\"total_entries\": 0"));
+        assert!(json.contains("\"total_duration_ms\": 0"));
+        assert!(json.contains("\"success_rate\": 0.0"));
+    }
+
+    #[test]
+    fn test_to_json_with_entries() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, false),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let json = summary.to_json().unwrap();
+        assert!(json.contains("\"total_entries\": 2"));
+        // 确保时间线被序列化
+        assert!(json.contains("\"timeline\""));
+        assert!(json.contains("\"by_action\""));
+    }
+
+    #[test]
+    fn test_to_json_includes_optional_fields() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, false, 5, 1, None))
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 1, 0, 1, None,
+            ));
+        let json = summary.to_json().unwrap();
+        assert!(json.contains("search_quality_history_summary"));
+        assert!(json.contains("cache_tuning_history_summary"));
+        assert!(json.contains("\"evaluation_count\": 5"));
+        assert!(json.contains("\"initial_ttl\": 1800"));
+    }
+
+    #[test]
+    fn test_to_json_skip_none_fields() {
+        let summary = DevTraceSummary::empty();
+        let json = summary.to_json().unwrap();
+        // None 字段应被跳过
+        assert!(!json.contains("incremental_summary"));
+        assert!(!json.contains("cache_summary"));
+        assert!(!json.contains("cache_fix_correlation"));
+        assert!(!json.contains("cache_tuning_summary"));
+        assert!(!json.contains("search_quality_summary"));
+        assert!(!json.contains("search_quality_history_summary"));
+        assert!(!json.contains("cache_tuning_history_summary"));
+    }
+
+    // --- to_json_compact ---
+
+    #[test]
+    fn test_to_json_compact_empty() {
+        let summary = DevTraceSummary::empty();
+        let json = summary.to_json_compact().unwrap();
+        assert!(json.contains("\"total_entries\":0"));
+        // compact 格式不应有缩进
+        assert!(!json.contains("\n"));
+    }
+
+    #[test]
+    fn test_to_json_compact_vs_pretty() {
+        let summary = DevTraceSummary::empty();
+        let compact = summary.to_json_compact().unwrap();
+        let pretty = summary.to_json().unwrap();
+        // pretty 有换行, compact 没有
+        assert!(pretty.contains('\n'));
+        assert!(!compact.contains('\n'));
+        // 两者反序列化后应相等
+        let from_compact: DevTraceSummary = serde_json::from_str(&compact).unwrap();
+        let from_pretty: DevTraceSummary = serde_json::from_str(&pretty).unwrap();
+        assert_eq!(from_compact.total_entries, from_pretty.total_entries);
+    }
+
+    // --- to_json_with_meta ---
+
+    #[test]
+    fn test_to_json_with_meta_basic() {
+        let summary = DevTraceSummary::empty();
+        let json = summary
+            .to_json_with_meta("2024-06-01T00:00:00+00:00")
+            .unwrap();
+        assert!(json.contains("\"meta\""));
+        assert!(json.contains("\"summary\""));
+        assert!(json.contains("\"exported_at\": \"2024-06-01T00:00:00+00:00\""));
+        assert!(json.contains("\"format_version\": \"1.0\""));
+        assert!(json.contains("\"forge_version\""));
+    }
+
+    #[test]
+    fn test_to_json_with_meta_roundtrip() {
+        let summary =
+            DevTraceSummary::empty().with_search_quality_history(SearchQualityHistorySummary::new(
+                true,
+                false,
+                10,
+                2,
+                Some("2024-06-01T00:00:00+00:00".to_string()),
+            ));
+        let json = summary
+            .to_json_with_meta("2024-06-02T00:00:00+00:00")
+            .unwrap();
+        let export: DevTraceJsonExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(export.meta.exported_at, "2024-06-02T00:00:00+00:00");
+        assert_eq!(export.meta.format_version, "1.0");
+        assert_eq!(export.summary.total_entries, 0);
+        let sqh = export
+            .summary
+            .search_quality_history_summary
+            .expect("should be Some");
+        assert_eq!(sqh.evaluation_count, 10);
+        assert_eq!(sqh.disable_count, 2);
+    }
+
+    // --- save_to_json_file ---
+
+    #[test]
+    fn test_save_to_json_file_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        let summary = DevTraceSummary::empty();
+        summary.save_to_json_file(&path).unwrap();
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"total_entries\": 0"));
+    }
+
+    #[test]
+    fn test_save_to_json_file_with_entries() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trace_summary.json");
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        summary.save_to_json_file(&path).unwrap();
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"total_entries\": 2"));
+        // 反序列化验证
+        let loaded: DevTraceSummary = serde_json::from_str(&content).unwrap();
+        assert_eq!(loaded.total_entries, 2);
+    }
+
+    #[test]
+    fn test_save_to_json_file_overwrite() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        // 第一次写入
+        let summary1 = DevTraceSummary::empty();
+        summary1.save_to_json_file(&path).unwrap();
+        // 第二次写入 (覆盖)
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+            make_entry(TraceAction::TestRun, false),
+        ];
+        let summary2 = DevTraceSummary::from_entries(&entries);
+        summary2.save_to_json_file(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"total_entries\": 3"));
+    }
+
+    // --- save_to_json_file_with_meta ---
+
+    #[test]
+    fn test_save_to_json_file_with_meta_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("summary.json");
+        let summary = DevTraceSummary::empty();
+        summary
+            .save_to_json_file_with_meta(&path, "2024-06-01T00:00:00+00:00")
+            .unwrap();
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"meta\""));
+        assert!(content.contains("\"exported_at\": \"2024-06-01T00:00:00+00:00\""));
+        assert!(content.contains("\"format_version\": \"1.0\""));
+    }
+
+    #[test]
+    fn test_save_to_json_file_with_meta_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(600, 1800, true, 2, 0, 2, None),
+        );
+        summary
+            .save_to_json_file_with_meta(&path, "2024-06-01T12:00:00+00:00")
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let export: DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+        assert_eq!(export.meta.exported_at, "2024-06-01T12:00:00+00:00");
+        assert_eq!(export.meta.format_version, "1.0");
+        let cth = export
+            .summary
+            .cache_tuning_history_summary
+            .expect("should be Some");
+        assert_eq!(cth.initial_ttl, 600);
+        assert_eq!(cth.current_ttl, 1800);
+    }
+
+    // --- DevTraceExportMeta ---
+
+    #[test]
+    fn test_export_meta_creation() {
+        let meta = DevTraceExportMeta {
+            exported_at: "2024-06-01T00:00:00+00:00".to_string(),
+            forge_version: "0.1.0".to_string(),
+            format_version: "1.0".to_string(),
+        };
+        assert_eq!(meta.exported_at, "2024-06-01T00:00:00+00:00");
+        assert_eq!(meta.forge_version, "0.1.0");
+        assert_eq!(meta.format_version, "1.0");
+    }
+
+    #[test]
+    fn test_export_meta_serde_roundtrip() {
+        let meta = DevTraceExportMeta {
+            exported_at: "2024-06-01T00:00:00+00:00".to_string(),
+            forge_version: "0.1.0".to_string(),
+            format_version: "1.0".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let loaded: DevTraceExportMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.exported_at, meta.exported_at);
+        assert_eq!(loaded.forge_version, meta.forge_version);
+        assert_eq!(loaded.format_version, meta.format_version);
+    }
+
+    // --- DevTraceJsonExport ---
+
+    #[test]
+    fn test_json_export_creation() {
+        let summary = DevTraceSummary::empty();
+        let export = DevTraceJsonExport {
+            meta: DevTraceExportMeta {
+                exported_at: "2024-06-01T00:00:00+00:00".to_string(),
+                forge_version: "0.1.0".to_string(),
+                format_version: "1.0".to_string(),
+            },
+            summary,
+        };
+        assert_eq!(export.meta.format_version, "1.0");
+        assert_eq!(export.summary.total_entries, 0);
+    }
+
+    #[test]
+    fn test_json_export_serde_roundtrip() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 3, 0, None));
+        let export = DevTraceJsonExport {
+            meta: DevTraceExportMeta {
+                exported_at: "2024-06-01T00:00:00+00:00".to_string(),
+                forge_version: "0.1.0".to_string(),
+                format_version: "1.0".to_string(),
+            },
+            summary,
+        };
+        let json = serde_json::to_string_pretty(&export).unwrap();
+        let loaded: DevTraceJsonExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.meta.exported_at, "2024-06-01T00:00:00+00:00");
+        assert_eq!(loaded.summary.total_entries, 0);
+        let sqh = loaded
+            .summary
+            .search_quality_history_summary
+            .expect("should be Some");
+        assert_eq!(sqh.evaluation_count, 3);
+    }
+
+    // --- build_export_timestamp ---
+
+    #[test]
+    fn test_build_export_timestamp_format() {
+        let ts = build_export_timestamp();
+        // RFC 3339 格式应包含 'T' 和时区偏移
+        assert!(ts.contains('T'));
+        // 应包含 +00:00 或 Z (UTC)
+        assert!(ts.contains("+00:00") || ts.contains('Z'));
+    }
+
+    #[test]
+    fn test_build_export_timestamp_unique() {
+        let ts1 = build_export_timestamp();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ts2 = build_export_timestamp();
+        // 两次调用应返回不同的时间戳 (极小概率相同)
+        assert_ne!(ts1, ts2);
+    }
+
+    // --- build_dev_trace_json_export ---
+
+    #[test]
+    fn test_build_dev_trace_json_export_basic() {
+        let summary = DevTraceSummary::empty();
+        let export = build_dev_trace_json_export(summary, "2024-06-01T00:00:00+00:00".to_string());
+        assert_eq!(export.meta.exported_at, "2024-06-01T00:00:00+00:00");
+        assert_eq!(export.meta.format_version, "1.0");
+        assert!(!export.meta.forge_version.is_empty());
+        assert_eq!(export.summary.total_entries, 0);
+    }
+
+    #[test]
+    fn test_build_dev_trace_json_export_with_data() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, false),
+            make_entry(TraceAction::TestRun, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries).with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 900, false, 1, 1, 2, None),
+        );
+        let export = build_dev_trace_json_export(summary, "2024-06-01T12:00:00+00:00".to_string());
+        assert_eq!(export.summary.total_entries, 3);
+        let cth = export
+            .summary
+            .cache_tuning_history_summary
+            .expect("should be Some");
+        assert!(!cth.enabled);
+        assert_eq!(cth.ttl_delta, -900);
+    }
+
+    #[test]
+    fn test_build_dev_trace_json_export_serde() {
+        let summary = DevTraceSummary::empty();
+        let export = build_dev_trace_json_export(summary, "2024-06-01T00:00:00+00:00".to_string());
+        let json = serde_json::to_string(&export).unwrap();
+        let loaded: DevTraceJsonExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.meta.exported_at, "2024-06-01T00:00:00+00:00");
+        assert_eq!(loaded.meta.format_version, "1.0");
+        assert_eq!(loaded.summary.total_entries, 0);
+    }
+
+    // --- JSON 完整性验证 ---
+
+    #[test]
+    fn test_json_full_roundtrip_all_fields() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, false),
+            DevTraceEntry::new(
+                TraceAction::IncrementalSend,
+                Some(0),
+                Some(0),
+                Some("增量发送"),
+                "total=10 sent=3 skipped=7",
+                "发送成功",
+                500,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_history(SearchQualityHistorySummary::new(
+                true,
+                false,
+                5,
+                1,
+                Some("2024-06-01T00:00:00+00:00".to_string()),
+            ))
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800,
+                2700,
+                true,
+                2,
+                0,
+                2,
+                Some("2024-06-01T00:00:00+00:00".to_string()),
+            ));
+
+        // 序列化 → 反序列化 → 验证
+        let json = summary.to_json().unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.total_entries, 3);
+        assert!(loaded.incremental_summary.is_some());
+        assert!(loaded.search_quality_history_summary.is_some());
+        assert!(loaded.cache_tuning_history_summary.is_some());
+
+        // 验证增量发送统计
+        let inc = loaded.incremental_summary.expect("should be Some");
+        assert_eq!(inc.send_count, 1);
+        assert_eq!(inc.total_messages, 10);
+        assert_eq!(inc.sent_messages, 3);
+
+        let sqh = loaded
+            .search_quality_history_summary
+            .expect("should be Some");
+        assert_eq!(sqh.evaluation_count, 5);
+        assert!(sqh.enabled_changed);
+
+        let cth = loaded.cache_tuning_history_summary.expect("should be Some");
+        assert_eq!(cth.ttl_delta, 900);
+        assert_eq!(cth.decision_count, 2);
+    }
+
+    #[test]
+    fn test_json_meta_export_preserves_timeline() {
+        let entries: Vec<DevTraceEntry> = (0..10)
+            .map(|i| {
+                DevTraceEntry::new(
+                    TraceAction::TaskExecution,
+                    Some(0),
+                    Some(i),
+                    Some("task"),
+                    "input",
+                    "output",
+                    500,
+                    true,
+                    None,
+                )
+            })
+            .collect();
+        let summary = DevTraceSummary::from_entries(&entries);
+        let export = build_dev_trace_json_export(summary, "2024-06-01T00:00:00+00:00".to_string());
+        let json = serde_json::to_string_pretty(&export).unwrap();
+        let loaded: DevTraceJsonExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.summary.timeline.len(), 10);
+        assert_eq!(loaded.summary.total_entries, 10);
     }
 }

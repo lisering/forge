@@ -27,7 +27,7 @@ use crate::clarify::HeuristicClarificationChecker;
 use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
 use crate::dev_trace::{
-    build_cache_fix_correlation, build_cache_tuning_history_summary,
+    build_cache_fix_correlation, build_cache_tuning_history_summary, build_export_timestamp,
     build_search_quality_history_summary, build_search_quality_stats, DevTraceWriter, TraceAction,
 };
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
@@ -2658,6 +2658,18 @@ where
             }
 
             println!("\n{}", summary.to_report());
+
+            // === 保存 DevTraceSummary JSON 导出 (Session 88) ===
+            let json_path = self.workspace.root.join(".forge/devtrace_summary.json");
+            let timestamp = build_export_timestamp();
+            match summary.save_to_json_file_with_meta(&json_path, &timestamp) {
+                Ok(()) => {
+                    println!("📊 DevTrace JSON 已保存: {}", json_path.display());
+                }
+                Err(e) => {
+                    warn!("保存 DevTrace JSON 失败: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -7336,6 +7348,233 @@ mod tests {
             .join("search_quality_history.json");
         assert!(!ct_path.exists());
         assert!(!sq_path.exists());
+    }
+
+    // ===== Session 88: DevTraceSummary JSON 导出集成测试 =====
+
+    #[test]
+    fn test_final_report_creates_json_export() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 写入一些 trace 条目
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                Some(0),
+                Some(0),
+                Some("task"),
+                "input",
+                "output",
+                1000,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("check"),
+                "in",
+                "out",
+                500,
+                false,
+                Some("编译错误"),
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.final_report().unwrap();
+
+        // JSON 文件应存在
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists(), "DevTrace JSON 文件应存在");
+
+        // 验证内容可反序列化为 DevTraceJsonExport
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport =
+            serde_json::from_str(&content).expect("应能反序列化为 DevTraceJsonExport");
+
+        // 验证元数据
+        assert!(!export.meta.exported_at.is_empty());
+        assert_eq!(export.meta.format_version, "1.0");
+        assert!(!export.meta.forge_version.is_empty());
+
+        // 验证摘要内容
+        assert_eq!(export.summary.total_entries, 2);
+    }
+
+    #[test]
+    fn test_final_report_json_includes_history_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 调整 TTL
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&decision);
+        }
+
+        // 评估搜索质量
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let mut stats = crate::dev_trace::SearchQualityStats::new();
+            for _ in 0..3 {
+                stats.record_with_search(false);
+                stats.record_without_search(true);
+            }
+            evaluator.evaluate_and_apply(&stats);
+        }
+
+        orch.final_report().unwrap();
+
+        // JSON 文件应存在且包含历史数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // 缓存调优历史应存在
+        let cth = export
+            .summary
+            .cache_tuning_history_summary
+            .expect("JSON 应包含缓存调优历史");
+        assert_eq!(cth.initial_ttl, 1800);
+        assert_eq!(cth.current_ttl, 2700);
+        assert_eq!(cth.ttl_delta, 900);
+
+        // 搜索质量历史应存在
+        let sqh = export
+            .summary
+            .search_quality_history_summary
+            .expect("JSON 应包含搜索质量历史");
+        assert!(sqh.initial_enabled);
+        assert!(!sqh.current_enabled);
+        assert!(sqh.enabled_changed);
+    }
+
+    #[test]
+    fn test_final_report_json_without_evaluators() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 写入 trace 条目
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::TaskExecution,
+            Some(0),
+            Some(0),
+            Some("task"),
+            "in",
+            "out",
+            500,
+            true,
+            None,
+        )];
+        write_trace_entries(&orch, &entries);
+
+        orch.final_report().unwrap();
+
+        // JSON 文件应存在 (即使没有 evaluators)
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // 摘要应存在
+        assert_eq!(export.summary.total_entries, 1);
+        // 历史摘要应为 None (没有 evaluators)
+        assert!(export.summary.cache_tuning_history_summary.is_none());
+        assert!(export.summary.search_quality_history_summary.is_none());
+    }
+
+    #[test]
+    fn test_final_report_json_overwrites_previous() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 第一次 final_report (空 trace)
+        orch.final_report().unwrap();
+
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let content1 = std::fs::read_to_string(&json_path).unwrap();
+        let export1: crate::dev_trace::DevTraceJsonExport =
+            serde_json::from_str(&content1).unwrap();
+        assert_eq!(export1.summary.total_entries, 0);
+
+        // 写入 trace 条目后再次 final_report
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::TaskExecution,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "in",
+                "out",
+                500,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t2"),
+                "in",
+                "out",
+                300,
+                true,
+                None,
+            ),
+        ];
+        write_trace_entries(&orch, &entries);
+
+        orch.final_report().unwrap();
+
+        // 文件应被覆盖
+        let content2 = std::fs::read_to_string(&json_path).unwrap();
+        let export2: crate::dev_trace::DevTraceJsonExport =
+            serde_json::from_str(&content2).unwrap();
+        assert_eq!(export2.summary.total_entries, 2);
+    }
+
+    #[test]
+    fn test_final_report_json_meta_valid() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // exported_at 应为有效的 ISO 8601 时间戳
+        assert!(export.meta.exported_at.contains('T'));
+        // forge_version 应与 env!("CARGO_PKG_VERSION") 一致
+        assert_eq!(export.meta.forge_version, env!("CARGO_PKG_VERSION"));
+        // format_version 应为 "1.0"
+        assert_eq!(export.meta.format_version, "1.0");
     }
 }
 
