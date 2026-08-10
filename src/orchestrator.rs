@@ -1922,6 +1922,129 @@ where
         );
     }
 
+    /// 构建三评估器协同分析摘要 (Session 91)
+    ///
+    /// 从 CacheTuner, SearchQualityEvaluator, MemoryContextEvaluator
+    /// 的状态和 DevTrace 条目构建协同分析摘要。
+    /// 只有至少一个评估器启用时才返回 Some。
+    fn build_evaluator_synergy(&self) -> Option<crate::evaluator_synergy::EvaluatorSynergySummary> {
+        use crate::evaluator_synergy::{
+            build_evaluator_synergy_summary, EvaluatorState, EvaluatorType,
+        };
+
+        let mut states = vec![];
+        let mut has_any = false;
+
+        // CacheTuner 状态
+        if let Some(ref tuner) = self.cache_tuner {
+            has_any = true;
+            let entries = self
+                .dev_trace
+                .as_ref()
+                .and_then(|w| w.read_all().ok())
+                .unwrap_or_default();
+            let corr = build_cache_fix_correlation(&entries);
+            let with_rate = corr.hit_fix_rate();
+            let without_rate = corr.miss_fix_rate();
+            let diff = corr.hit_vs_miss_diff();
+            let is_beneficial = corr.is_cache_effective();
+            let total_checks = corr.checks_after_hit + corr.checks_after_miss;
+            states.push(EvaluatorState::new(
+                EvaluatorType::CacheTuner,
+                tuner.is_enabled(),
+                with_rate,
+                without_rate,
+                diff,
+                is_beneficial,
+                total_checks,
+                tuner.decisions().len(),
+                tuner.to_history().disable_count as usize,
+            ));
+        }
+
+        // SearchQualityEvaluator 状态
+        if let Some(ref evaluator) = self.search_quality_evaluator {
+            has_any = true;
+            let entries = self
+                .dev_trace
+                .as_ref()
+                .and_then(|w| w.read_all().ok())
+                .unwrap_or_default();
+            let stats = build_search_quality_stats(&entries);
+            let with_rate = stats.with_search_fix_rate();
+            let without_rate = stats.without_search_fix_rate();
+            let diff = stats.search_vs_no_search_diff();
+            let is_beneficial = stats.is_search_beneficial();
+            let total_checks = stats.checks_with_search + stats.checks_without_search;
+            states.push(EvaluatorState::new(
+                EvaluatorType::SearchQuality,
+                evaluator.is_enabled(),
+                with_rate,
+                without_rate,
+                diff,
+                is_beneficial,
+                total_checks,
+                evaluator.evaluation_count() as usize,
+                evaluator.to_history().disable_count as usize,
+            ));
+        }
+
+        // MemoryContextEvaluator 状态
+        if let Some(ref evaluator) = self.memory_evaluator {
+            has_any = true;
+            let entries = self
+                .dev_trace
+                .as_ref()
+                .and_then(|w| w.read_all().ok())
+                .unwrap_or_default();
+            let stats = build_memory_evaluation_stats(&entries);
+            let with_rate = stats.with_memory_fix_rate();
+            let without_rate = stats.without_memory_fix_rate();
+            let diff = stats.memory_vs_no_memory_diff();
+            let is_beneficial = stats.is_memory_beneficial();
+            let total_checks = stats.total_checks();
+            states.push(EvaluatorState::new(
+                EvaluatorType::MemoryContext,
+                evaluator.is_enabled(),
+                with_rate,
+                without_rate,
+                diff,
+                is_beneficial,
+                total_checks,
+                evaluator.evaluation_count() as usize,
+                evaluator.to_history().disable_count as usize,
+            ));
+        }
+
+        if !has_any {
+            return None;
+        }
+
+        // 读取 DevTrace 条目用于时间线构建
+        let entries = self
+            .dev_trace
+            .as_ref()
+            .and_then(|w| w.read_all().ok())
+            .unwrap_or_default();
+
+        // 计算总编译检查次数和成功次数
+        let total_compile_checks = entries
+            .iter()
+            .filter(|e| e.action == TraceAction::CompileCheck)
+            .count();
+        let total_compile_successes = entries
+            .iter()
+            .filter(|e| e.action == TraceAction::CompileCheck && e.success)
+            .count();
+
+        Some(build_evaluator_synergy_summary(
+            &states,
+            total_compile_checks,
+            total_compile_successes,
+            &entries,
+        ))
+    }
+
     /// memory.json 路径
     fn memory_path(&self) -> std::path::PathBuf {
         self.workspace.root.join(".forge").join("memory.json")
@@ -3080,6 +3203,12 @@ where
                     h.saved_at.clone(),
                 );
                 summary = summary.with_memory_evaluation_history(me_summary);
+            }
+
+            // 附加三评估器协同分析摘要 (Session 91)
+            let synergy = self.build_evaluator_synergy();
+            if let Some(s) = synergy {
+                summary = summary.with_evaluator_synergy(s);
             }
 
             println!("\n{}", summary.to_report());

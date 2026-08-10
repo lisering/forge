@@ -36,6 +36,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use crate::evaluator_synergy::EvaluatorSynergySummary;
 use crate::trace_store::{StorageBackend, StorageConfig as TraceStorageConfig};
 
 // ============================================================================
@@ -2599,6 +2600,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有历史数据。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_evaluation_history_summary: Option<MemoryEvaluationHistorySummary>,
+
+    /// 三评估器协同分析摘要 (Session 91)
+    ///
+    /// 从 CacheTuner + SearchQualityEvaluator + MemoryContextEvaluator
+    /// 的状态和 DevTrace 条目构建的综合分析。
+    /// `None` 表示没有协同分析数据 (未启用评估器或无 DevTrace)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluator_synergy_summary: Option<EvaluatorSynergySummary>,
 }
 
 impl DevTraceSummary {
@@ -2619,6 +2628,7 @@ impl DevTraceSummary {
             cache_tuning_history_summary: None,
             memory_evaluation_summary: None,
             memory_evaluation_history_summary: None,
+            evaluator_synergy_summary: None,
         }
     }
 
@@ -2711,6 +2721,7 @@ impl DevTraceSummary {
             cache_tuning_history_summary: None,
             memory_evaluation_summary,
             memory_evaluation_history_summary: None,
+            evaluator_synergy_summary: None,
         }
     }
 
@@ -2754,6 +2765,19 @@ impl DevTraceSummary {
         summary: MemoryEvaluationHistorySummary,
     ) -> Self {
         self.memory_evaluation_history_summary = Some(summary);
+        self
+    }
+
+    /// 附加三评估器协同分析摘要 (builder 模式)
+    ///
+    /// 从 CacheTuner + SearchQualityEvaluator + MemoryContextEvaluator
+    /// 的状态构建的综合分析, 由 Orchestrator 在 `final_report` 时调用。
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 三评估器协同分析摘要
+    pub fn with_evaluator_synergy(mut self, summary: EvaluatorSynergySummary) -> Self {
+        self.evaluator_synergy_summary = Some(summary);
         self
     }
 
@@ -3072,6 +3096,78 @@ impl DevTraceSummary {
             }
             if let Some(ref saved_at) = meh.saved_at {
                 report.push_str(&format!("  保存时间: {}\n", saved_at));
+            }
+        }
+
+        // === 三评估器协同分析 (Session 91) ===
+        if let Some(ref synergy) = self.evaluator_synergy_summary {
+            report.push_str("\n  ── 三评估器协同分析 ──\n");
+            report.push_str(&format!(
+                "  活跃评估器: {} / 3\n",
+                synergy.active_evaluators
+            ));
+            report.push_str(&format!(
+                "  协同评分: {:.0}%\n",
+                synergy.synergy_score * 100.0
+            ));
+            report.push_str(&format!(
+                "  总体修复率: {:.1}%\n",
+                synergy.overall_fix_rate * 100.0
+            ));
+            report.push_str(&format!("  总决策数: {}\n", synergy.total_decisions));
+            if synergy.total_disables > 0 {
+                report.push_str(&format!("  总禁用数: {}\n", synergy.total_disables));
+            }
+            if synergy.any_disabled {
+                report.push_str("  状态: ⚠️ 有功能被禁用\n");
+            } else if synergy.all_beneficial {
+                report.push_str("  状态: ✅ 全部有效\n");
+            } else {
+                report.push_str("  状态: ─ 正常\n");
+            }
+
+            // 各评估器快照
+            for snap in &synergy.snapshots {
+                report.push_str(&format!("  • {}\n", snap.to_summary()));
+            }
+
+            // 决策时间线 (最多显示最近 20 条)
+            if !synergy.timeline.is_empty() {
+                report.push_str(&format!(
+                    "\n  决策时间线 ({} 条, 最近 {} 条):\n",
+                    synergy.timeline.len(),
+                    synergy.timeline.len().min(20)
+                ));
+                for entry in synergy.timeline.iter().rev().take(20) {
+                    let disable_mark = if entry.action.is_disable() {
+                        "⚠️"
+                    } else {
+                        "•"
+                    };
+                    report.push_str(&format!(
+                        "  {} {} [{}] 差值 {:+.1}% {}\n",
+                        entry.timestamp.format("%H:%M:%S"),
+                        disable_mark,
+                        entry.evaluator_type.label(),
+                        entry.diff * 100.0,
+                        entry.action.label(),
+                    ));
+                }
+            }
+
+            // 交互影响分析
+            let interactions =
+                crate::evaluator_synergy::build_evaluator_interactions(&synergy.snapshots);
+            if !interactions.is_empty() {
+                report.push_str("\n  交互影响:\n");
+                for inter in &interactions {
+                    report.push_str(&format!(
+                        "  {} → {}: {}\n",
+                        inter.source_evaluator.label(),
+                        inter.affected_evaluator.label(),
+                        inter.description,
+                    ));
+                }
             }
         }
 

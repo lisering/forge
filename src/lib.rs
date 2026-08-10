@@ -74,6 +74,7 @@ pub mod deadline;
 pub mod dev_trace;
 pub mod error_diagnosis;
 pub mod error_search;
+pub mod evaluator_synergy;
 pub mod extract;
 pub mod failover_chat;
 pub mod interaction;
@@ -169,6 +170,14 @@ pub use error_diagnosis::{
 pub use error_search::{
     build_error_search_query, extract_error_keywords, format_search_results_section,
     should_search_errors, truncate_search_results,
+};
+pub use evaluator_synergy::{
+    build_evaluator_interactions, build_evaluator_synergy_summary, build_evaluator_timeline,
+    compute_evaluator_action_stats, compute_evaluator_avg_diffs, compute_synergy_score,
+    parse_diff_value, parse_evaluator_timeline_action, save_synergy_summary_to_json,
+    synergy_summary_to_json, synergy_summary_to_json_compact, EvaluatorInteraction,
+    EvaluatorSnapshot, EvaluatorState, EvaluatorSynergySummary, EvaluatorTimelineAction,
+    EvaluatorTimelineEntry, EvaluatorType,
 };
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
