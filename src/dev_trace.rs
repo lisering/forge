@@ -2616,6 +2616,20 @@ pub struct DevTraceSummary {
     /// `None` 表示没有历史数据 (首次运行或未启用评估器)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluator_synergy_history_summary: Option<EvaluatorSynergyHistorySummary>,
+
+    /// 协同评分历史列表 (Session 93) — 用于 sparkline 可视化
+    ///
+    /// 存储每个 session 的协同评分 (0.0~1.0), 用于在报告中渲染 ASCII sparkline。
+    /// `None` 表示没有历史数据或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synergy_score_history: Option<Vec<f64>>,
+
+    /// 修复率历史列表 (Session 93) — 用于 sparkline 可视化
+    ///
+    /// 存储每个 session 的修复率 (0.0~1.0), 用于在报告中渲染 ASCII sparkline。
+    /// `None` 表示没有历史数据或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_rate_history: Option<Vec<f64>>,
 }
 
 impl DevTraceSummary {
@@ -2638,6 +2652,8 @@ impl DevTraceSummary {
             memory_evaluation_history_summary: None,
             evaluator_synergy_summary: None,
             evaluator_synergy_history_summary: None,
+            synergy_score_history: None,
+            fix_rate_history: None,
         }
     }
 
@@ -2732,6 +2748,8 @@ impl DevTraceSummary {
             memory_evaluation_history_summary: None,
             evaluator_synergy_summary: None,
             evaluator_synergy_history_summary: None,
+            synergy_score_history: None,
+            fix_rate_history: None,
         }
     }
 
@@ -2802,6 +2820,55 @@ impl DevTraceSummary {
     ) -> Self {
         self.evaluator_synergy_history_summary = Some(summary);
         self
+    }
+
+    /// 附加协同评分和修复率历史列表 (Session 93)
+    ///
+    /// 用于在 `to_report()` 中渲染 ASCII sparkline 趋势图。
+    ///
+    /// # 参数
+    ///
+    /// - `scores`: 各 session 的协同评分列表 (0.0~1.0)
+    /// - `fix_rates`: 各 session 的修复率列表 (0.0~1.0)
+    pub fn with_synergy_sparkline(mut self, scores: Vec<f64>, fix_rates: Vec<f64>) -> Self {
+        self.synergy_score_history = Some(scores);
+        self.fix_rate_history = Some(fix_rates);
+        self
+    }
+
+    /// 生成 HTML 报告 (Session 93)
+    ///
+    /// 将摘要渲染为包含 Chart.js 图表的自包含 HTML 页面。
+    ///
+    /// # 返回
+    ///
+    /// 完整的 HTML 字符串
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::dev_trace::DevTraceSummary;
+    /// let summary = DevTraceSummary::empty();
+    /// let html = summary.to_html_report();
+    /// assert!(html.contains("<!DOCTYPE html>"));
+    /// ```
+    pub fn to_html_report(&self) -> String {
+        crate::html_report::generate_html_report(self)
+    }
+
+    /// 保存 HTML 报告到文件 (Session 93)
+    ///
+    /// 生成 HTML 报告并写入指定路径, 自动创建父目录。
+    ///
+    /// # 参数
+    ///
+    /// - `path`: 输出文件路径
+    ///
+    /// # 返回
+    ///
+    /// 成功返回 Ok(()), 失败返回错误。
+    pub fn save_to_html_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        crate::html_report::generate_html_report_file(self, path)
     }
 
     /// 生成可读的报告文本
@@ -3194,7 +3261,7 @@ impl DevTraceSummary {
             }
         }
 
-        // === 协同分析历史趋势 (Session 92) ===
+        // === 协同分析历史趋势 (Session 92) + Sparkline (Session 93) ===
         if let Some(ref syh) = self.evaluator_synergy_history_summary {
             if !syh.is_empty() {
                 report.push_str("\n  ── 协同分析历史趋势 (跨 Session) ──\n");
@@ -3219,6 +3286,31 @@ impl DevTraceSummary {
                 if syh.total_disables > 0 {
                     report.push_str(&format!("  累计禁用: {} 次\n", syh.total_disables,));
                 }
+
+                // === Sparkline 可视化 (Session 93) ===
+                if let Some(ref scores) = self.synergy_score_history {
+                    if scores.len() >= 2 {
+                        let config = crate::sparkline::SparklineConfig::new(40);
+                        report.push_str(&crate::sparkline::format_trend_sparkline(
+                            "  评分趋势图",
+                            scores,
+                            &config,
+                        ));
+                        report.push('\n');
+                    }
+                }
+                if let Some(ref fix_rates) = self.fix_rate_history {
+                    if fix_rates.len() >= 2 {
+                        let config = crate::sparkline::SparklineConfig::new(40);
+                        report.push_str(&crate::sparkline::format_trend_sparkline(
+                            "  修复率趋势图",
+                            fix_rates,
+                            &config,
+                        ));
+                        report.push('\n');
+                    }
+                }
+
                 if let Some(ref saved_at) = syh.saved_at {
                     report.push_str(&format!("  保存时间: {}\n", saved_at));
                 }

@@ -3225,6 +3225,13 @@ where
                     summary = summary.with_evaluator_synergy_history(history_summary);
                 }
 
+                // 附加 sparkline 数据 (Session 93)
+                let scores = history.synergy_scores();
+                let fix_rates = history.fix_rates();
+                if scores.len() >= 2 {
+                    summary = summary.with_synergy_sparkline(scores, fix_rates);
+                }
+
                 // 保存历史到工作区
                 match history.save_to_workspace(&self.workspace.root) {
                     Ok(()) => {
@@ -3251,6 +3258,17 @@ where
                 }
                 Err(e) => {
                     warn!("保存 DevTrace JSON 失败: {}", e);
+                }
+            }
+
+            // === 保存 DevTraceSummary HTML 报告 (Session 93) ===
+            let html_path = self.workspace.root.join(".forge/devtrace_report.html");
+            match summary.save_to_html_file(&html_path) {
+                Ok(()) => {
+                    println!("📊 DevTrace HTML 已保存: {}", html_path.display());
+                }
+                Err(e) => {
+                    warn!("保存 DevTrace HTML 失败: {}", e);
                 }
             }
         }
@@ -8838,6 +8856,189 @@ mod tests {
         assert!((history.sessions[1].synergy_score - 0.65).abs() < 0.001);
         // 第三个 session 的评分由 final_report 构建 (取决于 mock 数据)
         // 趋势无法预测 (第三 session 评分取决于 mock 环境), 只验证累积正确
+    }
+
+    // ===== Session 93: Sparkline + HTML 报告集成测试 =====
+
+    #[test]
+    fn test_devtrace_html_report_generated() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // HTML 报告应存在
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists(), "HTML 报告文件应存在");
+
+        let content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(content.contains("<!DOCTYPE html>"));
+        assert!(content.contains("Forge DevTrace"));
+        assert!(content.contains("Chart.js"));
+    }
+
+    #[test]
+    fn test_sparkline_data_in_devtrace_json() {
+        let dir = tempdir().unwrap();
+
+        // 手动创建 2 个 session 的历史
+        use crate::evaluator_synergy::{EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry};
+        use chrono::Utc;
+
+        {
+            let mut history = EvaluatorSynergyHistory::new();
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                1,
+                Utc::now(),
+                1,
+                0.45,
+                0.60,
+                3,
+                0,
+                false,
+                true,
+            ));
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                2,
+                Utc::now(),
+                1,
+                0.70,
+                0.75,
+                4,
+                0,
+                false,
+                true,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // JSON 应包含 sparkline 数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // sparkline 数据应存在 (至少 3 个 session: 2 个预存 + 1 个当前)
+        assert!(
+            export.summary.synergy_score_history.is_some(),
+            "JSON 应包含协同评分历史列表"
+        );
+        let scores = export.summary.synergy_score_history.unwrap();
+        assert!(scores.len() >= 2, "至少应有 2 个评分数据点");
+
+        assert!(
+            export.summary.fix_rate_history.is_some(),
+            "JSON 应包含修复率历史列表"
+        );
+    }
+
+    #[test]
+    fn test_sparkline_rendered_in_report() {
+        use crate::dev_trace::DevTraceSummary;
+        use crate::evaluator_synergy::EvaluatorSynergyHistorySummary;
+
+        // 构建带 sparkline 数据的摘要
+        let summary = DevTraceSummary::empty()
+            .with_evaluator_synergy_history(EvaluatorSynergyHistorySummary {
+                session_count: 3,
+                latest_score: 0.75,
+                avg_score: 0.60,
+                score_trend: crate::evaluator_synergy::ScoreTrend::Improving,
+                score_delta: 0.15,
+                latest_fix_rate: 0.80,
+                avg_fix_rate: 0.70,
+                fix_rate_trend: crate::evaluator_synergy::ScoreTrend::Improving,
+                total_decisions: 9,
+                total_disables: 0,
+                saved_at: None,
+            })
+            .with_synergy_sparkline(vec![0.45, 0.60, 0.75], vec![0.65, 0.70, 0.80]);
+
+        let report = summary.to_report();
+
+        // 报告应包含 sparkline 图表
+        assert!(report.contains("评分趋势图"));
+        assert!(report.contains("修复率趋势图"));
+        // 应包含 sparkline 字符
+        assert!(report.contains('▁') || report.contains('▃') || report.contains('▅'));
+        assert!(report.contains('▇') || report.contains('█'));
+    }
+
+    #[test]
+    fn test_html_report_with_sparkline_data() {
+        let dir = tempdir().unwrap();
+
+        // 手动创建 3 个 session 的历史
+        use crate::evaluator_synergy::{EvaluatorSynergyHistory, EvaluatorSynergyHistoryEntry};
+        use chrono::Utc;
+
+        {
+            let mut history = EvaluatorSynergyHistory::new();
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                1,
+                Utc::now(),
+                3,
+                0.40,
+                0.55,
+                5,
+                0,
+                false,
+                true,
+            ));
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                2,
+                Utc::now(),
+                3,
+                0.55,
+                0.65,
+                6,
+                0,
+                false,
+                true,
+            ));
+            history.add_entry(EvaluatorSynergyHistoryEntry::new(
+                3,
+                Utc::now(),
+                3,
+                0.70,
+                0.75,
+                7,
+                0,
+                false,
+                true,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // HTML 报告应包含协同分析趋势图表
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(content.contains("协同评分趋势"));
+        assert!(content.contains("修复率趋势"));
+        assert!(content.contains("synergyScoreChart"));
+        assert!(content.contains("fixRateChart"));
     }
 }
 

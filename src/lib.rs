@@ -77,6 +77,7 @@ pub mod error_search;
 pub mod evaluator_synergy;
 pub mod extract;
 pub mod failover_chat;
+pub mod html_report;
 pub mod interaction;
 pub mod language;
 pub mod live_continuation;
@@ -94,6 +95,7 @@ pub mod search_cache;
 pub mod search_quality;
 pub mod site_health;
 pub mod slash_command;
+pub mod sparkline;
 pub mod stealth_patches;
 pub mod steer_reminder;
 pub mod task_graph;
@@ -183,6 +185,10 @@ pub use evaluator_synergy::{
 };
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
+pub use html_report::{
+    generate_chart_js_bar, generate_chart_js_line, generate_css_styles, generate_html_report,
+    generate_html_report_file, generate_stat_card, HTML_REPORT_FORMAT_VERSION,
+};
 pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteraction};
 pub use language::{
     detect_language, GoAdapter, MultiLanguageTestRunner, NodeAdapter, PythonAdapter, RustAdapter,
@@ -248,6 +254,13 @@ pub use slash_command::{
     format_summary_report, is_boundary_char, is_code_block_boundary, is_known_keyword,
     is_prefix_boundary, strip_command_from_text, SlashCommand, SlashCommandAction,
     SlashCommandSummary,
+};
+pub use sparkline::{
+    compute_sparkline_stats, escape_html, format_multi_sparkline, format_trend_sparkline,
+    map_value_to_char, normalize_value, render_percentage_sparkline, render_sparkline,
+    render_sparkline_with_range, SparklineConfig, SparklineStats, TrendDirection,
+    DEFAULT_FILL_CHAR, DEFAULT_SPARKLINE_MAX_WIDTH, SPARKLINE_CHARS,
+    SPARKLINE_CHARS as SPARKLINE_BLOCK_CHARS, TREND_THRESHOLD,
 };
 pub use stealth_patches::{
     build_bootstrap_script, needs_stealth_patches, patch_names, validate_bootstrap_script,
