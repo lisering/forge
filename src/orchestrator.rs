@@ -2428,6 +2428,27 @@ where
             }
         }
 
+        // === 加载搜索质量历史 (Session 86) ===
+        // 如果启用了 search_quality_evaluator, 尝试从 .forge/search_quality_history.json 恢复
+        if let Some(ref evaluator) = self.search_quality_evaluator {
+            let config = evaluator.config().clone();
+            if let Some(loaded_evaluator) =
+                SearchQualityEvaluator::load_from_workspace(&self.workspace.root, config)
+            {
+                let enabled = loaded_evaluator.is_enabled();
+                let eval_count = loaded_evaluator.evaluation_count();
+                self.search_quality_evaluator = Some(loaded_evaluator);
+                if !enabled {
+                    println!(
+                        "  🔍 搜索质量: 从历史恢复 (搜索已禁用, 评估 {} 次)",
+                        eval_count
+                    );
+                } else {
+                    println!("  🔍 搜索质量: 从历史恢复 (评估 {} 次)", eval_count);
+                }
+            }
+        }
+
         let memory_path = self.memory_path();
 
         // ========== 断点恢复检查 ==========
@@ -2584,6 +2605,21 @@ where
                 }
                 Err(e) => {
                     warn!("保存缓存调优历史失败: {}", e);
+                }
+            }
+        }
+
+        // === 保存搜索质量历史 (Session 86) ===
+        if let Some(ref evaluator) = self.search_quality_evaluator {
+            match evaluator.save_to_workspace(&self.workspace.root) {
+                Ok(()) => {
+                    let h = evaluator.to_history();
+                    if !h.is_empty() {
+                        println!("\n  🔍 搜索质量历史已保存: {}", h.to_summary());
+                    }
+                }
+                Err(e) => {
+                    warn!("保存搜索质量历史失败: {}", e);
                 }
             }
         }
@@ -6963,6 +6999,175 @@ mod tests {
 
         // 中性 → 保持启用
         assert!(orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+    }
+
+    // ===== Session 86: SearchQualityEvaluator 持久化集成测试 =====
+
+    #[test]
+    fn test_final_report_saves_search_quality_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 调用 final_report
+        orch.final_report().unwrap();
+
+        // 验证历史文件已创建
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        assert!(history_path.exists(), "搜索质量历史文件应存在");
+
+        // 验证可以加载
+        let loaded = crate::search_quality::SearchQualityHistory::load(&history_path).unwrap();
+        assert!(loaded.initial_enabled); // 初始启用
+        assert!(loaded.current_enabled); // 当前仍启用
+        assert!(loaded.saved_at.is_some()); // final_report 保存时添加时间戳
+    }
+
+    #[test]
+    fn test_final_report_no_history_without_evaluator() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+        // 不启用 search_quality_evaluator
+
+        orch.final_report().unwrap();
+
+        // 验证历史文件未创建
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        assert!(!history_path.exists(), "无 evaluator 时不应创建历史文件");
+    }
+
+    #[test]
+    fn test_search_quality_history_preserves_disabled_state() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动禁用搜索
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let mut stats = crate::dev_trace::SearchQualityStats::new();
+            for _ in 0..3 {
+                stats.record_with_search(false);
+                stats.record_without_search(true);
+            }
+            evaluator.evaluate_and_apply(&stats);
+        }
+        assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+
+        // 保存
+        orch.final_report().unwrap();
+
+        // 加载并验证
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        let loaded = crate::search_quality::SearchQualityHistory::load(&history_path).unwrap();
+        assert!(loaded.initial_enabled); // session 开始时启用
+        assert!(!loaded.current_enabled); // 最终禁用
+        assert!(loaded.enabled_changed());
+        assert_eq!(loaded.disable_count, 1);
+        assert_eq!(loaded.evaluation_count, 1);
+    }
+
+    #[test]
+    fn test_search_quality_history_preserves_evaluation_count() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 多次评估
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let stats = crate::dev_trace::SearchQualityStats::new();
+            evaluator.evaluate_and_apply(&stats);
+            evaluator.evaluate_and_apply(&stats);
+            evaluator.evaluate_and_apply(&stats);
+        }
+        assert_eq!(
+            orch.search_quality_evaluator
+                .as_ref()
+                .unwrap()
+                .evaluation_count(),
+            3
+        );
+
+        // 保存
+        orch.final_report().unwrap();
+
+        // 加载并验证
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        let loaded = crate::search_quality::SearchQualityHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.evaluation_count, 3);
+    }
+
+    #[test]
+    fn test_search_quality_history_cross_session_persistence() {
+        let dir = tempdir().unwrap();
+
+        // === Session 1: 评估并禁用 ===
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+            setup_test_phase(&mut orch);
+
+            if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+                let mut stats = crate::dev_trace::SearchQualityStats::new();
+                for _ in 0..3 {
+                    stats.record_with_search(false);
+                    stats.record_without_search(true);
+                }
+                evaluator.evaluate_and_apply(&stats);
+            }
+            assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+
+            orch.final_report().unwrap();
+        }
+
+        // === Session 2: 从历史恢复 ===
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+            setup_test_phase(&mut orch);
+
+            // 模拟 run() 中的加载逻辑
+            if let Some(ref evaluator) = orch.search_quality_evaluator {
+                let config = evaluator.config().clone();
+                if let Some(loaded) =
+                    crate::search_quality::SearchQualityEvaluator::load_from_workspace(
+                        &orch.workspace.root,
+                        config,
+                    )
+                {
+                    let enabled = loaded.is_enabled();
+                    let eval_count = loaded.evaluation_count();
+                    orch.search_quality_evaluator = Some(loaded);
+                    assert!(!enabled, "搜索应从历史恢复为禁用");
+                    assert_eq!(eval_count, 1, "评估次数应保留");
+                }
+            }
+
+            assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+            assert_eq!(
+                orch.search_quality_evaluator
+                    .as_ref()
+                    .unwrap()
+                    .evaluation_count(),
+                1
+            );
+        }
     }
 }
 

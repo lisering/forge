@@ -45,7 +45,10 @@
 //! ```
 
 use crate::dev_trace::SearchQualityStats;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use tracing::{debug, info, warn};
 
 // ============================================================================
 //  常量
@@ -63,6 +66,9 @@ pub const DEFAULT_DISABLE_THRESHOLD: f64 = -0.10;
 ///
 /// 搜索后修复率比不搜索高 5% 以上 → 搜索有效, 保持
 pub const DEFAULT_BENEFICIAL_THRESHOLD: f64 = 0.05;
+
+/// 持久化文件名 — 存储在 `.forge/search_quality_history.json`
+pub const SEARCH_QUALITY_HISTORY_FILENAME: &str = "search_quality_history.json";
 
 // ============================================================================
 //  SearchQualityConfig — 质量评估配置
@@ -418,6 +424,7 @@ pub fn compute_search_quality_decision(
 /// `SearchQualityEvaluator` 封装了搜索质量评估的状态和逻辑:
 /// - `config`: 评估配置 (阈值和参数)
 /// - `enabled`: 搜索是否启用 (禁用后不再执行自动搜索)
+/// - `initial_enabled`: session 开始时的启用状态 (用于持久化对比)
 /// - `evaluation_count`: 累计评估次数
 /// - `disable_count`: 累计禁用次数
 /// - `last_decision`: 最近一次质量决策
@@ -448,6 +455,8 @@ pub struct SearchQualityEvaluator {
     config: SearchQualityConfig,
     /// 搜索是否启用
     enabled: bool,
+    /// session 开始时的启用状态 (用于持久化对比)
+    initial_enabled: bool,
     /// 累计评估次数
     evaluation_count: u32,
     /// 累计禁用次数
@@ -466,6 +475,7 @@ impl SearchQualityEvaluator {
         Self {
             config,
             enabled: true,
+            initial_enabled: true,
             evaluation_count: 0,
             disable_count: 0,
             last_decision: None,
@@ -515,9 +525,12 @@ impl SearchQualityEvaluator {
     /// 一步评估并应用 — 等价于 `evaluate` + `apply_decision`
     ///
     /// 返回生成的质量决策。
+    ///
+    /// 同时递增 `evaluation_count`。
     pub fn evaluate_and_apply(&mut self, stats: &SearchQualityStats) -> SearchQualityDecision {
         let decision = self.evaluate(stats);
         self.apply_decision(&decision);
+        self.evaluation_count += 1;
         decision
     }
 
@@ -534,6 +547,11 @@ impl SearchQualityEvaluator {
     /// 搜索是否启用
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// session 开始时的启用状态
+    pub fn initial_enabled(&self) -> bool {
+        self.initial_enabled
     }
 
     /// 累计评估次数
@@ -563,6 +581,305 @@ impl SearchQualityEvaluator {
                 .map(|d| d.to_trace_summary())
                 .unwrap_or_else(|| "无".to_string())
         )
+    }
+
+    // ===== 持久化方法 (Session 86) =====
+
+    /// 导出为搜索质量历史 (用于持久化)
+    ///
+    /// 将当前 `SearchQualityEvaluator` 状态导出为 `SearchQualityHistory`,
+    /// 可通过 `save_to_workspace()` 持久化到 `.forge/` 目录。
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::search_quality::SearchQualityEvaluator;
+    ///
+    /// let evaluator = SearchQualityEvaluator::with_default_config();
+    /// let history = evaluator.to_history();
+    /// assert!(history.initial_enabled);
+    /// assert!(history.current_enabled);
+    /// assert!(history.is_empty());
+    /// ```
+    pub fn to_history(&self) -> SearchQualityHistory {
+        SearchQualityHistory {
+            initial_enabled: self.initial_enabled,
+            current_enabled: self.enabled,
+            evaluation_count: self.evaluation_count,
+            disable_count: self.disable_count,
+            last_decision: self.last_decision.clone(),
+            saved_at: None,
+        }
+    }
+
+    /// 从搜索质量历史恢复 `SearchQualityEvaluator` 状态
+    ///
+    /// 使用历史记录中的 `current_enabled` 作为新的启用状态,
+    /// 保留累计计数和最近决策。
+    ///
+    /// # 参数
+    ///
+    /// - `history`: 搜索质量历史
+    /// - `config`: 评估配置 (历史不保存配置, 由调用方提供)
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use forge::search_quality::{
+    ///     SearchQualityConfig, SearchQualityEvaluator, SearchQualityHistory,
+    /// };
+    ///
+    /// let mut history = SearchQualityHistory::new();
+    /// history.current_enabled = false;
+    /// history.evaluation_count = 3;
+    /// history.disable_count = 1;
+    ///
+    /// let evaluator =
+    ///     SearchQualityEvaluator::from_history(history, SearchQualityConfig::default());
+    /// assert!(!evaluator.is_enabled()); // 从历史恢复 (已禁用)
+    /// assert!(!evaluator.initial_enabled()); // 初始 = 历史 current
+    /// assert_eq!(evaluator.evaluation_count(), 3); // 累计计数保留
+    /// ```
+    pub fn from_history(history: SearchQualityHistory, config: SearchQualityConfig) -> Self {
+        Self {
+            config,
+            enabled: history.current_enabled,
+            initial_enabled: history.current_enabled,
+            evaluation_count: history.evaluation_count,
+            disable_count: history.disable_count,
+            last_decision: history.last_decision,
+        }
+    }
+
+    /// 保存搜索质量历史到工作区 (`.forge/search_quality_history.json`)
+    ///
+    /// 将当前状态导出为 `SearchQualityHistory` 并保存到工作区,
+    /// 包含自动时间戳。
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let history = self.to_history().with_timestamp();
+        history.save_to_workspace(workspace_root)
+    }
+
+    /// 从工作区加载搜索质量历史并恢复 `SearchQualityEvaluator`
+    ///
+    /// 查找 `.forge/search_quality_history.json`, 如果存在则恢复状态。
+    /// 文件不存在时返回 `None` (调用方使用默认配置)。
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    /// - `config`: 评估配置
+    ///
+    /// # 返回
+    ///
+    /// - `Some(evaluator)`: 成功从历史恢复
+    /// - `None`: 无历史文件或加载失败
+    pub fn load_from_workspace(workspace_root: &Path, config: SearchQualityConfig) -> Option<Self> {
+        match SearchQualityHistory::load_from_workspace(workspace_root) {
+            Some(history) => {
+                info!(
+                    "📥 加载搜索质量历史: 启用={}, 评估 {} 次, 禁用 {} 次",
+                    history.current_enabled, history.evaluation_count, history.disable_count
+                );
+                Some(Self::from_history(history, config))
+            }
+            None => {
+                debug!("无搜索质量历史文件, 使用默认配置");
+                None
+            }
+        }
+    }
+}
+
+// ============================================================================
+//  SearchQualityHistory — 搜索质量历史持久化 (Session 86)
+// ============================================================================
+
+/// 搜索质量历史 — 跨 session 持久化搜索质量评估状态
+///
+/// 存储在 `.forge/search_quality_history.json`, 在 Orchestrator 启动时加载,
+/// 在 `final_report` 时保存。这使得新 session 可以复用上一 session 的
+/// 搜索质量评估经验 (启用状态、累计统计)。
+///
+/// # 字段
+///
+/// | 字段 | 说明 |
+/// |------|------|
+/// | `initial_enabled` | session 开始时的搜索启用状态 |
+/// | `current_enabled` | 最终搜索启用状态 (下次 session 的起始值) |
+/// | `evaluation_count` | 累计评估次数 |
+/// | `disable_count` | 累计禁用次数 |
+/// | `last_decision` | 最近一次质量决策 |
+/// | `saved_at` | 保存时间 (ISO 8601) |
+///
+/// # 示例
+///
+/// ```
+/// use forge::search_quality::{SearchQualityEvaluator, SearchQualityHistory};
+///
+/// let mut evaluator = SearchQualityEvaluator::with_default_config();
+/// let history = evaluator.to_history();
+/// assert!(history.initial_enabled);
+/// assert!(history.current_enabled);
+/// assert!(history.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchQualityHistory {
+    /// session 开始时的搜索启用状态
+    pub initial_enabled: bool,
+    /// 最终搜索启用状态 — 下次 session 的起始值
+    pub current_enabled: bool,
+    /// 累计评估次数
+    pub evaluation_count: u32,
+    /// 累计禁用次数
+    pub disable_count: u32,
+    /// 最近一次质量决策 (可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_decision: Option<SearchQualityDecision>,
+    /// 保存时间 (ISO 8601 格式, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl SearchQualityHistory {
+    /// 创建空的搜索质量历史
+    ///
+    /// 默认值: enabled=true, 无评估记录
+    pub fn new() -> Self {
+        Self {
+            initial_enabled: true,
+            current_enabled: true,
+            evaluation_count: 0,
+            disable_count: 0,
+            last_decision: None,
+            saved_at: None,
+        }
+    }
+
+    /// 是否为空 (无评估记录)
+    pub fn is_empty(&self) -> bool {
+        self.evaluation_count == 0
+    }
+
+    /// 启用状态是否发生变化 (initial != current)
+    pub fn enabled_changed(&self) -> bool {
+        self.initial_enabled != self.current_enabled
+    }
+
+    /// 格式化为可读摘要字符串
+    pub fn to_summary(&self) -> String {
+        let status = if self.current_enabled {
+            "启用"
+        } else {
+            "禁用"
+        };
+        let changed = if self.enabled_changed() {
+            if self.current_enabled {
+                " (本 session 重新启用)"
+            } else {
+                " (本 session 已禁用)"
+            }
+        } else {
+            ""
+        };
+        format!(
+            "搜索质量历史: 状态={}{}, 评估 {} 次, 禁用 {} 次, 最近决策: {}",
+            status,
+            changed,
+            self.evaluation_count,
+            self.disable_count,
+            self.last_decision
+                .as_ref()
+                .map(|d| d.to_trace_summary())
+                .unwrap_or_else(|| "无".to_string())
+        )
+    }
+
+    /// 从文件加载搜索质量历史
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    ///
+    /// # 返回
+    ///
+    /// - `Ok(history)`: 成功加载
+    /// - `Err`: 文件不存在或解析失败
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(anyhow!("搜索质量历史文件不存在: {}", path.display()));
+        }
+        let content =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("读取搜索质量历史失败: {}", e))?;
+        let history: SearchQualityHistory = serde_json::from_str(&content)
+            .map_err(|e| anyhow!("解析搜索质量历史 JSON 失败: {}", e))?;
+        Ok(history)
+    }
+
+    /// 保存搜索质量历史到文件
+    ///
+    /// # 参数
+    ///
+    /// - `path`: JSON 文件路径
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow!("序列化搜索质量历史失败: {}", e))?;
+        std::fs::write(path, content).map_err(|e| anyhow!("写入搜索质量历史失败: {}", e))?;
+        Ok(())
+    }
+
+    /// 从工作区加载 (查找 `.forge/search_quality_history.json`)
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    ///
+    /// # 返回
+    ///
+    /// - `Some(history)`: 文件存在且加载成功
+    /// - `None`: 文件不存在或加载失败 (静默降级, 不报错)
+    pub fn load_from_workspace(workspace_root: &Path) -> Option<Self> {
+        let path = workspace_root
+            .join(".forge")
+            .join(SEARCH_QUALITY_HISTORY_FILENAME);
+        match Self::load(&path) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!("加载搜索质量历史失败, 使用默认配置: {}", e);
+                None
+            }
+        }
+    }
+
+    /// 保存到工作区 (`.forge/search_quality_history.json`)
+    ///
+    /// # 参数
+    ///
+    /// - `workspace_root`: 工作区根目录
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let path = workspace_root
+            .join(".forge")
+            .join(SEARCH_QUALITY_HISTORY_FILENAME);
+        self.save(&path)
+    }
+
+    /// 创建带时间戳的副本 (用于保存时自动添加保存时间)
+    pub fn with_timestamp(mut self) -> Self {
+        self.saved_at = Some(chrono::Utc::now().to_rfc3339());
+        self
+    }
+}
+
+impl Default for SearchQualityHistory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1676,5 +1993,411 @@ mod tests {
         assert!(report.contains("缓存与修复关联分析"));
         assert!(report.contains("缓存调优效果"));
         assert!(report.contains("搜索质量评估"));
+    }
+
+    // ===== SearchQualityEvaluator: evaluation_count 递增 (Session 86 修复) =====
+
+    #[test]
+    fn test_evaluator_evaluate_and_apply_increments_count() {
+        let mut evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        let stats = SearchQualityStats::new();
+        assert_eq!(evaluator.evaluation_count(), 0);
+
+        evaluator.evaluate_and_apply(&stats);
+        assert_eq!(evaluator.evaluation_count(), 1);
+
+        evaluator.evaluate_and_apply(&stats);
+        assert_eq!(evaluator.evaluation_count(), 2);
+    }
+
+    #[test]
+    fn test_evaluator_initial_enabled() {
+        let evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        assert!(evaluator.initial_enabled()); // 默认启用
+
+        // 禁用后 initial_enabled 不变
+        let mut e2 = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        e2.apply_decision(&SearchQualityDecision::disable_search(-0.2, "有害"));
+        assert!(!e2.is_enabled());
+        assert!(e2.initial_enabled()); // 仍然记录初始状态为启用
+    }
+
+    // ===== SearchQualityHistory 测试 (Session 86) =====
+
+    #[test]
+    fn test_history_new() {
+        let h = SearchQualityHistory::new();
+        assert!(h.initial_enabled);
+        assert!(h.current_enabled);
+        assert_eq!(h.evaluation_count, 0);
+        assert_eq!(h.disable_count, 0);
+        assert!(h.last_decision.is_none());
+        assert!(h.saved_at.is_none());
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn test_history_default() {
+        let h = SearchQualityHistory::default();
+        assert_eq!(h.evaluation_count, 0);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn test_history_is_empty() {
+        let h = SearchQualityHistory::new();
+        assert!(h.is_empty());
+
+        let h2 = SearchQualityHistory {
+            evaluation_count: 1,
+            ..SearchQualityHistory::new()
+        };
+        assert!(!h2.is_empty());
+    }
+
+    #[test]
+    fn test_history_enabled_changed() {
+        let h = SearchQualityHistory::new();
+        assert!(!h.enabled_changed()); // initial == current
+
+        let h2 = SearchQualityHistory {
+            initial_enabled: true,
+            current_enabled: false,
+            ..SearchQualityHistory::new()
+        };
+        assert!(h2.enabled_changed());
+    }
+
+    #[test]
+    fn test_history_to_summary_enabled() {
+        let h = SearchQualityHistory::new();
+        let summary = h.to_summary();
+        assert!(summary.contains("状态=启用"));
+        assert!(summary.contains("评估 0 次"));
+        assert!(!summary.contains("本 session"));
+    }
+
+    #[test]
+    fn test_history_to_summary_disabled() {
+        let h = SearchQualityHistory {
+            initial_enabled: true,
+            current_enabled: false,
+            evaluation_count: 5,
+            disable_count: 1,
+            ..SearchQualityHistory::new()
+        };
+        let summary = h.to_summary();
+        assert!(summary.contains("状态=禁用"));
+        assert!(summary.contains("本 session 已禁用"));
+        assert!(summary.contains("评估 5 次"));
+        assert!(summary.contains("禁用 1 次"));
+    }
+
+    #[test]
+    fn test_history_to_summary_re_enabled() {
+        let h = SearchQualityHistory {
+            initial_enabled: false,
+            current_enabled: true,
+            evaluation_count: 3,
+            ..SearchQualityHistory::new()
+        };
+        let summary = h.to_summary();
+        assert!(summary.contains("状态=启用"));
+        assert!(summary.contains("本 session 重新启用"));
+    }
+
+    #[test]
+    fn test_history_serde_roundtrip() {
+        let h = SearchQualityHistory {
+            initial_enabled: true,
+            current_enabled: false,
+            evaluation_count: 5,
+            disable_count: 2,
+            last_decision: Some(SearchQualityDecision::disable_search(-0.15, "有害")),
+            saved_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        let loaded: SearchQualityHistory = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.initial_enabled, h.initial_enabled);
+        assert_eq!(loaded.current_enabled, h.current_enabled);
+        assert_eq!(loaded.evaluation_count, h.evaluation_count);
+        assert_eq!(loaded.disable_count, h.disable_count);
+        assert_eq!(loaded.last_decision, h.last_decision);
+        assert_eq!(loaded.saved_at, h.saved_at);
+    }
+
+    #[test]
+    fn test_history_serde_skip_none() {
+        let h = SearchQualityHistory::new();
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(!json.contains("last_decision"));
+        assert!(!json.contains("saved_at"));
+    }
+
+    #[test]
+    fn test_history_serde_with_decision() {
+        let h = SearchQualityHistory {
+            last_decision: Some(SearchQualityDecision::keep_searching(0.1, "有效")),
+            ..SearchQualityHistory::new()
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains("last_decision"));
+        assert!(json.contains("KeepSearching"));
+    }
+
+    #[test]
+    fn test_history_with_timestamp() {
+        let h = SearchQualityHistory::new().with_timestamp();
+        assert!(h.saved_at.is_some());
+        // 验证是有效的 ISO 8601
+        assert!(h.saved_at.as_ref().unwrap().contains('T'));
+    }
+
+    #[test]
+    fn test_history_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+
+        let h = SearchQualityHistory {
+            initial_enabled: true,
+            current_enabled: false,
+            evaluation_count: 3,
+            disable_count: 1,
+            last_decision: Some(SearchQualityDecision::disable_search(-0.2, "有害")),
+            saved_at: None,
+        };
+        h.save(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = SearchQualityHistory::load(&path).unwrap();
+        assert!(loaded.initial_enabled);
+        assert!(!loaded.current_enabled);
+        assert_eq!(loaded.evaluation_count, 3);
+        assert_eq!(loaded.disable_count, 1);
+        assert!(loaded.last_decision.is_some());
+    }
+
+    #[test]
+    fn test_history_load_nonexistent() {
+        let path = std::path::Path::new("/nonexistent/search_quality_history.json");
+        let result = SearchQualityHistory::load(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_history_save_creates_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subdir").join("history.json");
+
+        let h = SearchQualityHistory::new();
+        h.save(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_history_load_from_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let forge_dir = dir.path().join(".forge");
+        std::fs::create_dir_all(&forge_dir).unwrap();
+        let path = forge_dir.join(SEARCH_QUALITY_HISTORY_FILENAME);
+
+        let h = SearchQualityHistory {
+            current_enabled: false,
+            evaluation_count: 7,
+            disable_count: 2,
+            ..SearchQualityHistory::new()
+        };
+        h.save(&path).unwrap();
+
+        let loaded = SearchQualityHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert!(!loaded.current_enabled);
+        assert_eq!(loaded.evaluation_count, 7);
+        assert_eq!(loaded.disable_count, 2);
+    }
+
+    #[test]
+    fn test_history_load_from_workspace_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = SearchQualityHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_history_save_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = SearchQualityHistory {
+            current_enabled: false,
+            evaluation_count: 2,
+            ..SearchQualityHistory::new()
+        };
+        h.save_to_workspace(dir.path()).unwrap();
+
+        let path = dir
+            .path()
+            .join(".forge")
+            .join(SEARCH_QUALITY_HISTORY_FILENAME);
+        assert!(path.exists());
+
+        let loaded = SearchQualityHistory::load_from_workspace(dir.path()).unwrap();
+        assert!(!loaded.current_enabled);
+        assert_eq!(loaded.evaluation_count, 2);
+    }
+
+    // ===== SearchQualityEvaluator: to_history / from_history =====
+
+    #[test]
+    fn test_evaluator_to_history_default() {
+        let evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        let history = evaluator.to_history();
+        assert!(history.initial_enabled);
+        assert!(history.current_enabled);
+        assert_eq!(history.evaluation_count, 0);
+        assert_eq!(history.disable_count, 0);
+        assert!(history.last_decision.is_none());
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_evaluator_to_history_after_disable() {
+        let mut evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        let mut stats = SearchQualityStats::new();
+        for _ in 0..3 {
+            stats.record_with_search(false);
+            stats.record_without_search(true);
+        }
+        evaluator.evaluate_and_apply(&stats);
+
+        let history = evaluator.to_history();
+        assert!(history.initial_enabled); // session 开始时是启用的
+        assert!(!history.current_enabled); // 现在已禁用
+        assert_eq!(history.evaluation_count, 1);
+        assert_eq!(history.disable_count, 1);
+        assert!(history.last_decision.is_some());
+        assert!(history.enabled_changed());
+    }
+
+    #[test]
+    fn test_evaluator_from_history_enabled() {
+        let history = SearchQualityHistory {
+            current_enabled: true,
+            evaluation_count: 5,
+            disable_count: 0,
+            ..SearchQualityHistory::new()
+        };
+        let evaluator =
+            SearchQualityEvaluator::from_history(history, SearchQualityConfig::default());
+        assert!(evaluator.is_enabled());
+        assert!(evaluator.initial_enabled());
+        assert_eq!(evaluator.evaluation_count(), 5);
+        assert_eq!(evaluator.disable_count(), 0);
+    }
+
+    #[test]
+    fn test_evaluator_from_history_disabled() {
+        let history = SearchQualityHistory {
+            initial_enabled: true,
+            current_enabled: false,
+            evaluation_count: 3,
+            disable_count: 1,
+            last_decision: Some(SearchQualityDecision::disable_search(-0.2, "有害")),
+            saved_at: None,
+        };
+        let evaluator =
+            SearchQualityEvaluator::from_history(history, SearchQualityConfig::default());
+        assert!(!evaluator.is_enabled()); // 从历史恢复 (已禁用)
+        assert!(!evaluator.initial_enabled()); // 初始 = 历史 current
+        assert_eq!(evaluator.evaluation_count(), 3);
+        assert_eq!(evaluator.disable_count(), 1);
+        assert!(evaluator.last_decision().is_some());
+    }
+
+    #[test]
+    fn test_evaluator_from_history_preserves_last_decision() {
+        let decision = SearchQualityDecision::keep_searching(0.15, "搜索有效");
+        let history = SearchQualityHistory {
+            last_decision: Some(decision.clone()),
+            ..SearchQualityHistory::new()
+        };
+        let evaluator =
+            SearchQualityEvaluator::from_history(history, SearchQualityConfig::default());
+        assert!(evaluator.last_decision().is_some());
+        assert!(evaluator.last_decision().unwrap().is_keep());
+    }
+
+    #[test]
+    fn test_evaluator_save_and_load_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 创建评估器并做一次评估
+        let mut evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        let mut stats = SearchQualityStats::new();
+        for _ in 0..3 {
+            stats.record_with_search(false);
+            stats.record_without_search(true);
+        }
+        evaluator.evaluate_and_apply(&stats);
+        assert!(!evaluator.is_enabled());
+        assert_eq!(evaluator.evaluation_count(), 1);
+
+        // 保存
+        evaluator.save_to_workspace(dir.path()).unwrap();
+
+        // 加载
+        let loaded =
+            SearchQualityEvaluator::load_from_workspace(dir.path(), SearchQualityConfig::default());
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert!(!loaded.is_enabled()); // 恢复禁用状态
+        assert_eq!(loaded.evaluation_count(), 1); // 保留评估次数
+        assert_eq!(loaded.disable_count(), 1); // 保留禁用次数
+    }
+
+    #[test]
+    fn test_evaluator_load_workspace_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded =
+            SearchQualityEvaluator::load_from_workspace(dir.path(), SearchQualityConfig::default());
+        assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_evaluator_history_roundtrip_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Session 1: 评估并禁用
+        let mut evaluator = SearchQualityEvaluator::new(SearchQualityConfig::default());
+        let mut stats = SearchQualityStats::new();
+        for _ in 0..3 {
+            stats.record_with_search(false);
+            stats.record_without_search(true);
+        }
+        evaluator.evaluate_and_apply(&stats);
+        evaluator.save_to_workspace(dir.path()).unwrap();
+
+        // Session 2: 从历史恢复
+        let mut evaluator2 =
+            SearchQualityEvaluator::load_from_workspace(dir.path(), SearchQualityConfig::default())
+                .unwrap();
+        assert!(!evaluator2.is_enabled()); // 搜索仍禁用
+        assert_eq!(evaluator2.evaluation_count(), 1); // 保留计数
+        assert!(!evaluator2.initial_enabled()); // 初始 = 禁用
+
+        // Session 2: 再次评估 (已禁用 → keep)
+        let stats2 = SearchQualityStats::new();
+        let decision = evaluator2.evaluate_and_apply(&stats2);
+        assert!(decision.is_keep()); // 已禁用, 不再禁用
+        assert_eq!(evaluator2.evaluation_count(), 2); // 递增
+
+        // 保存 Session 2
+        evaluator2.save_to_workspace(dir.path()).unwrap();
+
+        // Session 3: 从历史恢复
+        let evaluator3 =
+            SearchQualityEvaluator::load_from_workspace(dir.path(), SearchQualityConfig::default())
+                .unwrap();
+        assert!(!evaluator3.is_enabled()); // 仍禁用
+        assert_eq!(evaluator3.evaluation_count(), 2); // 跨 session 保留
     }
 }

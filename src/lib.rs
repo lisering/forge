@@ -209,7 +209,7 @@ pub use search_cache::{
 pub use search_quality::{
     compute_search_quality_decision, has_sufficient_search_data, should_disable_search,
     SearchQualityAction, SearchQualityConfig, SearchQualityDecision, SearchQualityEvaluator,
-    DEFAULT_BENEFICIAL_THRESHOLD,
+    SearchQualityHistory, DEFAULT_BENEFICIAL_THRESHOLD, SEARCH_QUALITY_HISTORY_FILENAME,
 };
 pub use site_health::{
     build_detailed_check_js, calculate_health_rate, check_all_tabs, check_and_log,
