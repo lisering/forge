@@ -82,6 +82,7 @@ pub mod live_continuation;
 pub mod llm_clarify;
 pub mod loop_detector;
 pub mod memory;
+pub mod memory_evaluation;
 pub mod orchestrator;
 pub mod package;
 pub mod prompt_builder;
@@ -150,15 +151,16 @@ pub use context_handoff::{
 pub use deadline::{no_deadline, Deadline};
 pub use dev_trace::{
     build_cache_fix_correlation, build_cache_summary, build_cache_tuning_history_summary,
-    build_dev_trace_json_export, build_export_timestamp, build_search_quality_history_summary,
+    build_dev_trace_json_export, build_export_timestamp, build_memory_evaluation_history_summary,
+    build_memory_evaluation_stats, build_search_quality_history_summary,
     build_search_quality_stats, build_timeline, calculate_success_rate, find_next_compile_check,
     format_action_stats_line, format_duration_human, format_success_rate_percent,
     format_timeline_line, group_entries_by_action, is_cache_miss, is_search_failure,
     parse_cache_entry, parse_cache_hit_duration, parse_incremental_entry, parse_jsonl_line,
     ActionStats, CacheEntryInfo, CacheFixCorrelation, CacheStatsSummary, CacheTuningHistorySummary,
     CacheTuningSummary, DevTraceEntry, DevTraceExportMeta, DevTraceJsonExport, DevTraceSummary,
-    DevTraceWriter, IncrementalStats, SearchQualityHistorySummary, SearchQualityStats,
-    TimelineEntry, TraceAction,
+    DevTraceWriter, IncrementalStats, MemoryEvaluationHistorySummary, MemoryEvaluationStats,
+    SearchQualityHistorySummary, SearchQualityStats, TimelineEntry, TraceAction,
 };
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,
@@ -190,6 +192,14 @@ pub use loop_detector::{
     should_skip_task, ErrorRound, LoopDetector,
 };
 pub use memory::{Memory, RequirementChange};
+pub use memory_evaluation::{
+    compute_memory_evaluation_decision, has_sufficient_evaluation_data, should_disable_injection,
+    MemoryContextEvaluator, MemoryEvaluationAction, MemoryEvaluationConfig,
+    MemoryEvaluationDecision, MemoryEvaluationHistory,
+    DEFAULT_BENEFICIAL_THRESHOLD as DEFAULT_ME_BENEFICIAL_THRESHOLD,
+    DEFAULT_DISABLE_THRESHOLD as DEFAULT_ME_DISABLE_THRESHOLD,
+    DEFAULT_MIN_SAMPLES as DEFAULT_ME_MIN_SAMPLES, MEMORY_EVALUATION_HISTORY_FILENAME,
+};
 pub use orchestrator::{build_fix_messages_with_memory, MemoryContextStats, Orchestrator};
 pub use prompt_builder::SystemPrompt;
 pub use proxy_pool::{

@@ -1205,6 +1205,14 @@ where
         );
     }
 
+    // Session 90: 启用 Memory 评估器 (需要 DevTrace 数据)
+    // 当 DevTrace 启用时自动启用 MemoryContextEvaluator, 评估 Memory 注入效果并自动禁用有害注入
+    if dev_trace {
+        orch = orch.with_memory_evaluator(
+            forge::memory_evaluation::MemoryContextEvaluator::with_default_config(),
+        );
+    }
+
     // Session 69: 集成 HandlerChain 回调处理器链
     if let Some(chain) = handler_chain {
         orch = orch.with_response_handlers(chain);

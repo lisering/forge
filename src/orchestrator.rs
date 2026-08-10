@@ -28,6 +28,7 @@ use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
 use crate::dev_trace::{
     build_cache_fix_correlation, build_cache_tuning_history_summary, build_export_timestamp,
+    build_memory_evaluation_history_summary, build_memory_evaluation_stats,
     build_search_quality_history_summary, build_search_quality_stats, DevTraceWriter, TraceAction,
 };
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
@@ -35,6 +36,7 @@ use crate::error_search;
 use crate::interaction::AutoApprove;
 use crate::loop_detector::LoopDetector;
 use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
+use crate::memory_evaluation::MemoryContextEvaluator;
 use crate::prompt_builder::SystemPrompt;
 use crate::response_handler::{HandlerChain, TaskContext};
 use crate::search_cache::{self, CachedSearchEntry, SearchCache};
@@ -694,6 +696,13 @@ where
     /// 记录 memory context 被注入的次数和总消息数,
     /// 用于 DevTrace 报告中展示注入效果。
     pub memory_context_stats: MemoryContextStats,
+
+    /// Memory 评估器 — 评估 Memory 上下文注入效果并自动禁用 (Session 90)
+    ///
+    /// 启用后, 在每次编译检查后评估 Memory 注入对修复成功率的影响,
+    /// 当注入有害时自动禁用 Memory 上下文注入。
+    /// None 表示禁用 (默认, 向后兼容)。
+    pub memory_evaluator: Option<MemoryContextEvaluator>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -744,6 +753,7 @@ where
             search_quality_evaluator: None,
             memory_context_count: 0,
             memory_context_stats: MemoryContextStats::new(),
+            memory_evaluator: None,
         }
     }
 }
@@ -810,6 +820,7 @@ where
             search_quality_evaluator: self.search_quality_evaluator,
             memory_context_count: self.memory_context_count,
             memory_context_stats: self.memory_context_stats,
+            memory_evaluator: self.memory_evaluator,
         }
     }
 
@@ -1070,6 +1081,15 @@ where
     /// ```
     pub fn with_memory_context(mut self, count: usize) -> Self {
         self.memory_context_count = count;
+        self
+    }
+
+    /// 启用 Memory 评估器 — 评估 Memory 上下文注入效果 (Session 90)
+    ///
+    /// 启用后, 在每次编译检查后评估 Memory 注入对修复成功率的影响,
+    /// 当注入有害时自动禁用 Memory 上下文注入。
+    pub fn with_memory_evaluator(mut self, evaluator: MemoryContextEvaluator) -> Self {
+        self.memory_evaluator = Some(evaluator);
         self
     }
 
@@ -1379,6 +1399,19 @@ where
                 let skipped_delta = skipped_after.saturating_sub(skipped_before);
                 self.memory_context_stats
                     .record_injection(memory_injected, skipped_delta);
+
+                // DevTrace: 记录 Memory 注入 (Session 90)
+                self.trace_dev(
+                    TraceAction::MemoryInjection,
+                    None,
+                    None,
+                    None,
+                    &format!("注入 {} 条消息", memory_injected),
+                    &format!("跳过 {} 条", skipped_delta),
+                    0,
+                    true,
+                    None,
+                );
             }
 
             Ok(result)
@@ -1787,6 +1820,100 @@ where
                 stats.checks_with_search,
                 stats.successes_without_search,
                 stats.checks_without_search,
+            ),
+            &decision.to_trace_summary(),
+            0,
+            true,
+            Some(&decision.reason),
+        );
+    }
+
+    /// Memory 上下文注入效果评估 — 评估并应用决策 (Session 90)
+    ///
+    /// 在每次编译检查后调用, 基于 DevTrace 中的 MemoryInjection + CompileCheck 条目
+    /// 构建 `MemoryEvaluationStats`, 评估有注入 vs 无注入的修复成功率差值,
+    /// 当注入有害时自动禁用 Memory 上下文注入。
+    ///
+    /// ## 条件
+    ///
+    /// - `memory_evaluator` 必须已启用 (否则跳过)
+    /// - `dev_trace` 必须已启用 (否则跳过)
+    ///
+    /// ## 决策应用
+    ///
+    /// - `DisableInjection` → 后续 `send_attempt_prompt` 不注入 Memory 上下文
+    /// - `KeepInjecting` / `InsufficientData` → 无操作
+    ///
+    /// # 参数
+    ///
+    /// - `phase_idx`: 阶段索引 (DevTrace)
+    /// - `task_idx`: 任务索引 (DevTrace)
+    fn evaluate_memory_context(&mut self, phase_idx: usize, task_idx: usize) {
+        let (evaluator, trace_writer) = match (&mut self.memory_evaluator, &self.dev_trace) {
+            (Some(e), Some(w)) => (e, w),
+            _ => return, // 未启用, 跳过
+        };
+
+        // 读取 DevTrace 条目, 构建 Memory 评估统计
+        let entries = match trace_writer.read_all() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("    📝 Memory 评估: 读取 DevTrace 失败: {}", e);
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            debug!("    📝 Memory 评估: 无 DevTrace 条目, 跳过");
+            return;
+        }
+
+        let stats = build_memory_evaluation_stats(&entries);
+
+        // 评估并应用决策
+        let decision = evaluator.evaluate_and_apply(
+            stats.checks_with_memory,
+            stats.successes_with_memory,
+            stats.checks_without_memory,
+            stats.successes_without_memory,
+        );
+
+        // 应用决策
+        match &decision.action {
+            crate::memory_evaluation::MemoryEvaluationAction::KeepInjecting => {
+                debug!("    📝 Memory 评估: {}", decision.reason);
+            }
+            crate::memory_evaluation::MemoryEvaluationAction::InsufficientData => {
+                debug!("    📝 Memory 评估: {}", decision.reason);
+            }
+            crate::memory_evaluation::MemoryEvaluationAction::DisableInjection => {
+                info!(
+                    "    📝 Memory 评估: 禁用注入 (差值 {:+.1}%)",
+                    decision.diff * 100.0
+                );
+                println!(
+                    "    📝 Memory 评估: 禁用 Memory 上下文注入 ({:+.1}% 差值, 注入有害)",
+                    decision.diff * 100.0
+                );
+                // 禁用 Memory 上下文注入
+                self.memory_context_count = 0;
+            }
+        }
+
+        // DevTrace: 记录 Memory 评估决策
+        let me_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+        self.trace_dev(
+            TraceAction::MemoryEvaluation,
+            Some(phase_idx),
+            Some(task_idx),
+            Some(&me_task_name),
+            &format!(
+                "with={}/{} without={}/{} injections={}",
+                stats.successes_with_memory,
+                stats.checks_with_memory,
+                stats.successes_without_memory,
+                stats.checks_without_memory,
+                stats.total_injections,
             ),
             &decision.to_trace_summary(),
             0,
@@ -2689,6 +2816,29 @@ where
             }
         }
 
+        // === 加载 Memory 评估历史 (Session 90) ===
+        // 如果启用了 memory_evaluator, 尝试从 .forge/memory_evaluation_history.json 恢复
+        if let Some(ref evaluator) = self.memory_evaluator {
+            let config = evaluator.config().clone();
+            if let Some(loaded_evaluator) =
+                MemoryContextEvaluator::load_from_workspace(&self.workspace.root, config)
+            {
+                let enabled = loaded_evaluator.is_enabled();
+                let eval_count = loaded_evaluator.evaluation_count();
+                self.memory_evaluator = Some(loaded_evaluator);
+                if !enabled {
+                    println!(
+                        "  📝 Memory 评估: 从历史恢复 (注入已禁用, 评估 {} 次)",
+                        eval_count
+                    );
+                    // 历史显示注入已禁用, 禁用 memory_context_count
+                    self.memory_context_count = 0;
+                } else {
+                    println!("  📝 Memory 评估: 从历史恢复 (评估 {} 次)", eval_count);
+                }
+            }
+        }
+
         let memory_path = self.memory_path();
 
         // ========== 断点恢复检查 ==========
@@ -2872,6 +3022,21 @@ where
             );
         }
 
+        // === 保存 Memory 评估历史 (Session 90) ===
+        if let Some(ref evaluator) = self.memory_evaluator {
+            match evaluator.save_to_workspace(&self.workspace.root) {
+                Ok(()) => {
+                    let h = evaluator.to_history();
+                    if !h.is_empty() {
+                        println!("\n  📝 Memory 评估历史已保存: {}", h.to_summary());
+                    }
+                }
+                Err(e) => {
+                    warn!("保存 Memory 评估历史失败: {}", e);
+                }
+            }
+        }
+
         // === DevTrace: 打印追踪摘要 (借鉴方向 4) ===
         if let Some(ref trace) = self.dev_trace {
             let mut summary = trace.summary();
@@ -2902,6 +3067,19 @@ where
                     h.saved_at.clone(),
                 );
                 summary = summary.with_search_quality_history(sq_summary);
+            }
+
+            // 附加 Memory 评估历史摘要 (Session 90)
+            if let Some(ref evaluator) = self.memory_evaluator {
+                let h = evaluator.to_history();
+                let me_summary = build_memory_evaluation_history_summary(
+                    h.initial_enabled,
+                    h.current_enabled,
+                    h.evaluation_count,
+                    h.disable_count,
+                    h.saved_at.clone(),
+                );
+                summary = summary.with_memory_evaluation_history(me_summary);
             }
 
             println!("\n{}", summary.to_report());
@@ -3822,6 +4000,10 @@ where
             // === 搜索质量评估 (Session 85) ===
             // 在每次编译检查后评估搜索质量, 当搜索有害时自动禁用
             self.evaluate_search_quality(phase_idx, task_idx);
+
+            // === Memory 评估 (Session 90) ===
+            // 在每次编译检查后评估 Memory 注入效果, 当注入有害时自动禁用
+            self.evaluate_memory_context(phase_idx, task_idx);
 
             if check_result.success {
                 println!("    ✅ 编译成功");

@@ -85,6 +85,10 @@ pub enum TraceAction {
     CacheTuning,
     /// 搜索质量评估 — SearchQualityEvaluator 评估搜索效果并自动禁用 (Session 85)
     SearchQuality,
+    /// Memory 上下文注入 — 修复轮次中注入 Memory 对话历史 (Session 90)
+    MemoryInjection,
+    /// Memory 评估 — MemoryContextEvaluator 评估注入效果并自动禁用 (Session 90)
+    MemoryEvaluation,
 }
 
 impl std::fmt::Display for TraceAction {
@@ -110,6 +114,8 @@ impl std::fmt::Display for TraceAction {
             TraceAction::IncrementalSend => write!(f, "IncrementalSend"),
             TraceAction::CacheTuning => write!(f, "CacheTuning"),
             TraceAction::SearchQuality => write!(f, "SearchQuality"),
+            TraceAction::MemoryInjection => write!(f, "MemoryInjection"),
+            TraceAction::MemoryEvaluation => write!(f, "MemoryEvaluation"),
         }
     }
 }
@@ -138,6 +144,8 @@ impl TraceAction {
             TraceAction::IncrementalSend => "增量发送",
             TraceAction::CacheTuning => "缓存调优",
             TraceAction::SearchQuality => "搜索质量评估",
+            TraceAction::MemoryInjection => "Memory 注入",
+            TraceAction::MemoryEvaluation => "Memory 评估",
         }
     }
 
@@ -164,6 +172,8 @@ impl TraceAction {
             TraceAction::IncrementalSend,
             TraceAction::CacheTuning,
             TraceAction::SearchQuality,
+            TraceAction::MemoryInjection,
+            TraceAction::MemoryEvaluation,
         ]
     }
 }
@@ -958,6 +968,234 @@ pub fn build_search_quality_stats(entries: &[DevTraceEntry]) -> SearchQualitySta
                         acc.record_with_search(entry.success);
                     } else {
                         acc.record_without_search(entry.success);
+                    }
+                }
+                _ => {}
+            }
+            acc
+        })
+}
+
+// ============================================================================
+//  MemoryEvaluationStats — Memory 上下文注入效果统计 (Session 90)
+// ============================================================================
+
+/// Memory 上下文注入效果统计 — 评估 Memory 注入对修复成功率的影响
+///
+/// 比较使用了 Memory 上下文注入的修复 (with memory) 和未使用注入的修复
+/// (without memory) 的成功率, 回答核心问题:
+/// **Memory 上下文注入是否真正提高了修复成功率?**
+///
+/// # 设计
+///
+/// 在 Orchestrator 的修复流程中:
+/// 1. 修复轮次 → `send_attempt_prompt` 注入 Memory → 记录 `MemoryInjection` trace
+/// 2. AI 修复 → 编译检查 → 记录 `CompileCheck` trace (success=true/false)
+///
+/// 统计逻辑:
+/// - 遍历所有 `CompileCheck` 条目
+/// - 检查同一任务在此之前是否有 `MemoryInjection`
+/// - 有 → 记录为 "with memory"; 无 → 记录为 "without memory"
+///
+/// # 核心指标
+///
+/// - `with_memory_fix_rate()`: 有注入后的编译通过率
+/// - `without_memory_fix_rate()`: 无注入时的编译通过率
+/// - `memory_vs_no_memory_diff()`: 两者差值 (正=有效, 负=有害)
+/// - `is_memory_beneficial()`: 注入是否有助于提高修复成功率
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::MemoryEvaluationStats;
+/// let mut stats = MemoryEvaluationStats::new();
+///
+/// stats.record_with_memory(true);
+/// stats.record_with_memory(true);
+/// stats.record_without_memory(false);
+///
+/// assert!((stats.with_memory_fix_rate() - 1.0).abs() < 0.001);
+/// assert!((stats.without_memory_fix_rate() - 0.0).abs() < 0.001);
+/// assert!(stats.is_memory_beneficial());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryEvaluationStats {
+    /// 有 Memory 注入后的编译检查次数
+    pub checks_with_memory: usize,
+    /// 有 Memory 注入后编译通过次数
+    pub successes_with_memory: usize,
+    /// 无 Memory 注入时的编译检查次数
+    pub checks_without_memory: usize,
+    /// 无 Memory 注入时编译通过次数
+    pub successes_without_memory: usize,
+    /// 总注入次数 (MemoryInjection 条目数)
+    pub total_injections: usize,
+}
+
+impl MemoryEvaluationStats {
+    /// 创建空的统计
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次有 Memory 注入后的编译检查结果
+    pub fn record_with_memory(&mut self, success: bool) {
+        self.checks_with_memory += 1;
+        if success {
+            self.successes_with_memory += 1;
+        }
+    }
+
+    /// 记录一次无 Memory 注入时的编译检查结果
+    pub fn record_without_memory(&mut self, success: bool) {
+        self.checks_without_memory += 1;
+        if success {
+            self.successes_without_memory += 1;
+        }
+    }
+
+    /// 记录一次 Memory 注入
+    pub fn record_injection(&mut self) {
+        self.total_injections += 1;
+    }
+
+    /// 有注入后的修复成功率 (0.0 ~ 1.0)
+    pub fn with_memory_fix_rate(&self) -> f64 {
+        if self.checks_with_memory == 0 {
+            return 0.0;
+        }
+        self.successes_with_memory as f64 / self.checks_with_memory as f64
+    }
+
+    /// 无注入时的修复成功率 (0.0 ~ 1.0)
+    pub fn without_memory_fix_rate(&self) -> f64 {
+        if self.checks_without_memory == 0 {
+            return 0.0;
+        }
+        self.successes_without_memory as f64 / self.checks_without_memory as f64
+    }
+
+    /// 注入与不注入的修复成功率差值
+    ///
+    /// 正值=注入有效, 负值=注入有害, 零=效果相同。
+    pub fn memory_vs_no_memory_diff(&self) -> f64 {
+        if self.checks_with_memory == 0 || self.checks_without_memory == 0 {
+            return 0.0;
+        }
+        self.with_memory_fix_rate() - self.without_memory_fix_rate()
+    }
+
+    /// 注入是否有助于提高修复成功率
+    pub fn is_memory_beneficial(&self) -> bool {
+        if self.checks_with_memory == 0 || self.checks_without_memory == 0 {
+            return false;
+        }
+        self.with_memory_fix_rate() >= self.without_memory_fix_rate()
+    }
+
+    /// 总编译检查次数
+    pub fn total_checks(&self) -> usize {
+        self.checks_with_memory + self.checks_without_memory
+    }
+
+    /// 是否为空
+    pub fn is_empty(&self) -> bool {
+        self.total_checks() == 0 && self.total_injections == 0
+    }
+
+    /// 格式化为可读字符串
+    pub fn to_summary(&self) -> String {
+        format!(
+            "Memory 评估: 有注入 {} 次检查 (通过 {}), 无注入 {} 次检查 (通过 {}), \
+             注入修复率 {:.1}%, 无注入修复率 {:.1}%, 差值 {:+.1}%, \
+             总注入 {} 次",
+            self.checks_with_memory,
+            self.successes_with_memory,
+            self.checks_without_memory,
+            self.successes_without_memory,
+            self.with_memory_fix_rate() * 100.0,
+            self.without_memory_fix_rate() * 100.0,
+            self.memory_vs_no_memory_diff() * 100.0,
+            self.total_injections,
+        )
+    }
+}
+
+/// 检查 CompileCheck 条目之前是否有同一任务的 MemoryInjection
+///
+/// 从 `idx` 位置向前搜索, 直到找到同一任务的 MemoryInjection (返回 true)
+/// 或遇到同一任务的另一个 CompileCheck (返回 false)
+/// 或到达列表起始 (返回 false)。
+fn has_preceding_memory_injection(entries: &[DevTraceEntry], idx: usize) -> bool {
+    if idx == 0 || idx >= entries.len() {
+        return false;
+    }
+
+    let ref_entry = &entries[idx];
+    let ref_phase = ref_entry.phase_idx;
+    let ref_task = ref_entry.task_idx;
+
+    for j in (0..idx).rev() {
+        let e = &entries[j];
+        if e.phase_idx != ref_phase || e.task_idx != ref_task {
+            continue;
+        }
+        if e.action == TraceAction::MemoryInjection {
+            return true;
+        }
+        if e.action == TraceAction::CompileCheck {
+            return false;
+        }
+    }
+
+    false
+}
+
+/// 从 DevTrace 条目列表构建 Memory 评估统计
+///
+/// 遍历所有条目:
+/// 1. `MemoryInjection` 条目 → 记录注入次数
+/// 2. `CompileCheck` 条目 → 检查是否有前置 `MemoryInjection` (同一任务)
+///    - 有 → 记录为 "with memory"
+///    - 无 → 记录为 "without memory"
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{build_memory_evaluation_stats, DevTraceEntry, TraceAction};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(0), Some("t1"),
+///         "check", "failed", 50, false, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::MemoryInjection, Some(0), Some(1), Some("t2"),
+///         "inject", "msgs=3", 0, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::CompileCheck, Some(0), Some(1), Some("t2"),
+///         "check", "passed", 50, true, None,
+///     ),
+/// ];
+/// let stats = build_memory_evaluation_stats(&entries);
+/// assert_eq!(stats.checks_without_memory, 1);
+/// assert_eq!(stats.checks_with_memory, 1);
+/// assert_eq!(stats.total_injections, 1);
+/// ```
+pub fn build_memory_evaluation_stats(entries: &[DevTraceEntry]) -> MemoryEvaluationStats {
+    entries
+        .iter()
+        .enumerate()
+        .fold(MemoryEvaluationStats::new(), |mut acc, (idx, entry)| {
+            match entry.action {
+                TraceAction::MemoryInjection => {
+                    acc.record_injection();
+                }
+                TraceAction::CompileCheck => {
+                    if has_preceding_memory_injection(entries, idx) {
+                        acc.record_with_memory(entry.success);
+                    } else {
+                        acc.record_without_memory(entry.success);
                     }
                 }
                 _ => {}
@@ -1940,6 +2178,115 @@ pub fn build_cache_tuning_history_summary(
 }
 
 // ============================================================================
+//  MemoryEvaluationHistorySummary — 跨 Session 历史摘要 (Session 90)
+// ============================================================================
+
+/// Memory 评估历史摘要 — 跨 session 的 Memory 注入评估概览
+///
+/// 从 `MemoryEvaluationHistory` (`.forge/memory_evaluation_history.json`) 提取,
+/// 展示 Memory 注入在多个 session 中的启用/禁用状态变化和累计评估统计。
+///
+/// # 字段
+///
+/// | 字段 | 说明 |
+/// |------|------|
+/// | `initial_enabled` | session 开始时的注入启用状态 |
+/// | `current_enabled` | 最终注入启用状态 |
+/// | `evaluation_count` | 累计评估次数 |
+/// | `disable_count` | 累计禁用次数 |
+/// | `enabled_changed` | 启用状态是否发生变化 |
+/// | `saved_at` | 历史保存时间 (ISO 8601) |
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::MemoryEvaluationHistorySummary;
+/// let s = MemoryEvaluationHistorySummary::new(true, false, 5, 1, None);
+/// assert!(s.enabled_changed);
+/// assert!(!s.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryEvaluationHistorySummary {
+    /// session 开始时的注入启用状态
+    pub initial_enabled: bool,
+    /// 最终注入启用状态
+    pub current_enabled: bool,
+    /// 累计评估次数
+    pub evaluation_count: u32,
+    /// 累计禁用次数
+    pub disable_count: u32,
+    /// 启用状态是否发生变化
+    pub enabled_changed: bool,
+    /// 历史保存时间 (ISO 8601, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl MemoryEvaluationHistorySummary {
+    /// 创建 Memory 评估历史摘要
+    pub fn new(
+        initial_enabled: bool,
+        current_enabled: bool,
+        evaluation_count: u32,
+        disable_count: u32,
+        saved_at: Option<String>,
+    ) -> Self {
+        Self {
+            initial_enabled,
+            current_enabled,
+            evaluation_count,
+            disable_count,
+            enabled_changed: initial_enabled != current_enabled,
+            saved_at,
+        }
+    }
+
+    /// 是否为空 (无评估记录)
+    pub fn is_empty(&self) -> bool {
+        self.evaluation_count == 0
+    }
+
+    /// 禁用率
+    pub fn disable_rate(&self) -> f64 {
+        if self.evaluation_count == 0 {
+            return 0.0;
+        }
+        self.disable_count as f64 / self.evaluation_count as f64
+    }
+}
+
+impl Default for MemoryEvaluationHistorySummary {
+    fn default() -> Self {
+        Self::new(true, true, 0, 0, None)
+    }
+}
+
+/// 从原始数据构建 Memory 评估历史摘要 (纯函数)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::build_memory_evaluation_history_summary;
+/// let s = build_memory_evaluation_history_summary(true, false, 5, 1, None);
+/// assert!(s.enabled_changed);
+/// ```
+pub fn build_memory_evaluation_history_summary(
+    initial_enabled: bool,
+    current_enabled: bool,
+    evaluation_count: u32,
+    disable_count: u32,
+    saved_at: Option<String>,
+) -> MemoryEvaluationHistorySummary {
+    MemoryEvaluationHistorySummary::new(
+        initial_enabled,
+        current_enabled,
+        evaluation_count,
+        disable_count,
+        saved_at,
+    )
+}
+
+// ============================================================================
 //  纯逻辑函数 — 统计计算
 // ============================================================================
 
@@ -2237,6 +2584,21 @@ pub struct DevTraceSummary {
     /// `None` 表示没有历史数据 (首次运行或未启用 CacheTuner)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_tuning_history_summary: Option<CacheTuningHistorySummary>,
+
+    /// Memory 评估统计摘要 (Session 90)
+    ///
+    /// 从 `MemoryInjection` + `CompileCheck` trace 条目中解析的注入效果统计,
+    /// 比较有注入 vs 无注入的修复成功率。
+    /// `None` 表示没有 Memory 评估数据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_evaluation_summary: Option<MemoryEvaluationStats>,
+
+    /// Memory 评估历史摘要 (Session 90)
+    ///
+    /// 从 `MemoryEvaluationHistory` 提取的跨 session 数据。
+    /// `None` 表示没有历史数据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_evaluation_history_summary: Option<MemoryEvaluationHistorySummary>,
 }
 
 impl DevTraceSummary {
@@ -2255,6 +2617,8 @@ impl DevTraceSummary {
             search_quality_summary: None,
             search_quality_history_summary: None,
             cache_tuning_history_summary: None,
+            memory_evaluation_summary: None,
+            memory_evaluation_history_summary: None,
         }
     }
 
@@ -2323,6 +2687,14 @@ impl DevTraceSummary {
             Some(sq_stats)
         };
 
+        // 从 MemoryInjection + CompileCheck 条目中解析 Memory 评估统计 (Session 90)
+        let me_stats = build_memory_evaluation_stats(entries);
+        let memory_evaluation_summary = if me_stats.is_empty() {
+            None
+        } else {
+            Some(me_stats)
+        };
+
         Self {
             total_entries,
             total_duration_ms,
@@ -2337,6 +2709,8 @@ impl DevTraceSummary {
             // 跨 session 历史摘要来自外部持久化文件, 不从 trace 条目解析
             search_quality_history_summary: None,
             cache_tuning_history_summary: None,
+            memory_evaluation_summary,
+            memory_evaluation_history_summary: None,
         }
     }
 
@@ -2368,6 +2742,18 @@ impl DevTraceSummary {
     /// - `summary`: 缓存调优历史摘要
     pub fn with_cache_tuning_history(mut self, summary: CacheTuningHistorySummary) -> Self {
         self.cache_tuning_history_summary = Some(summary);
+        self
+    }
+
+    /// 附加 Memory 评估历史摘要 (builder 模式)
+    ///
+    /// 从 `MemoryEvaluationHistory` 提取的跨 session 数据,
+    /// 由 Orchestrator 在 `final_report` 时调用。
+    pub fn with_memory_evaluation_history(
+        mut self,
+        summary: MemoryEvaluationHistorySummary,
+    ) -> Self {
+        self.memory_evaluation_history_summary = Some(summary);
         self
     }
 
@@ -2618,6 +3004,73 @@ impl DevTraceSummary {
             }
             report.push_str(&format!("  决策记录: {} 条\n", cth.decision_count));
             if let Some(ref saved_at) = cth.saved_at {
+                report.push_str(&format!("  保存时间: {}\n", saved_at));
+            }
+        }
+
+        // === Memory 评估 (Session 90) ===
+        if let Some(ref me) = self.memory_evaluation_summary {
+            report.push_str("\n  ── Memory 注入评估 ──\n");
+            report.push_str(&format!(
+                "  有注入修复: {} 次检查 (通过 {})\n",
+                me.checks_with_memory, me.successes_with_memory
+            ));
+            report.push_str(&format!(
+                "  无注入修复: {} 次检查 (通过 {})\n",
+                me.checks_without_memory, me.successes_without_memory
+            ));
+            report.push_str(&format!("  总注入: {} 次\n", me.total_injections));
+            if me.checks_with_memory > 0 {
+                report.push_str(&format!(
+                    "  有注入修复率: {:.1}%\n",
+                    me.with_memory_fix_rate() * 100.0
+                ));
+            }
+            if me.checks_without_memory > 0 {
+                report.push_str(&format!(
+                    "  无注入修复率: {:.1}%\n",
+                    me.without_memory_fix_rate() * 100.0
+                ));
+            }
+            if me.checks_with_memory > 0 && me.checks_without_memory > 0 {
+                report.push_str(&format!(
+                    "  差值: {:+.1}% ({})\n",
+                    me.memory_vs_no_memory_diff() * 100.0,
+                    if me.is_memory_beneficial() {
+                        "注入有效"
+                    } else {
+                        "注入效果不足"
+                    }
+                ));
+            }
+        }
+
+        // === Memory 评估历史 (Session 90) ===
+        if let Some(ref meh) = self.memory_evaluation_history_summary {
+            report.push_str("\n  ── Memory 评估历史 (跨 Session) ──\n");
+            let initial_str = if meh.initial_enabled {
+                "启用"
+            } else {
+                "禁用"
+            };
+            let current_str = if meh.current_enabled {
+                "启用"
+            } else {
+                "禁用"
+            };
+            report.push_str(&format!("  初始状态: {}\n", initial_str));
+            report.push_str(&format!("  最终状态: {}\n", current_str));
+            if meh.enabled_changed {
+                report.push_str("  状态变化: ✅ 已变更\n");
+            } else {
+                report.push_str("  状态变化: ─ 未变\n");
+            }
+            report.push_str(&format!("  累计评估: {} 次\n", meh.evaluation_count));
+            if meh.disable_count > 0 {
+                report.push_str(&format!("  累计禁用: {} 次\n", meh.disable_count));
+                report.push_str(&format!("  禁用率: {:.1}%\n", meh.disable_rate() * 100.0));
+            }
+            if let Some(ref saved_at) = meh.saved_at {
                 report.push_str(&format!("  保存时间: {}\n", saved_at));
             }
         }
@@ -3343,7 +3796,7 @@ mod tests {
     #[test]
     fn test_trace_action_all() {
         let all = TraceAction::all();
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 22);
         assert!(all.contains(&TraceAction::Planning));
         assert!(all.contains(&TraceAction::TaskExecution));
         assert!(all.contains(&TraceAction::FixAttempt));
@@ -4072,7 +4525,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 20); // 所有 20 种操作类型
+        assert_eq!(entries.len(), 22); // 所有 22 种操作类型
 
         let summary = writer.summary();
         for action in TraceAction::all() {
@@ -4501,7 +4954,7 @@ mod tests {
     fn test_trace_action_performance_stats_in_all() {
         let all = TraceAction::all();
         assert!(all.contains(&TraceAction::PerformanceStats));
-        assert_eq!(all.len(), 20);
+        assert_eq!(all.len(), 22);
     }
 
     #[test]
@@ -4614,7 +5067,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 20); // 所有 20 种操作类型
+        assert_eq!(entries.len(), 22); // 所有 22 种操作类型
 
         // 确保 PerformanceStats 被包含
         let has_performance_stats = entries
@@ -5223,7 +5676,7 @@ mod tests {
             })
             .collect();
         let grouped = group_entries_by_action(&entries);
-        assert_eq!(grouped.len(), 20);
+        assert_eq!(grouped.len(), 22);
         for action in TraceAction::all() {
             assert!(grouped.contains_key(&action));
         }

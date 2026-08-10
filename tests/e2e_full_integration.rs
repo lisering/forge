@@ -1183,7 +1183,7 @@ async fn test_strip_commands_preserves_code_all_features() {
 #[test]
 fn test_all_trace_actions_present() {
     let all = TraceAction::all();
-    assert_eq!(all.len(), 20, "应有 20 种 TraceAction");
+    assert_eq!(all.len(), 22, "应有 22 种 TraceAction");
 
     // 验证包含 SlashCommand
     assert!(
