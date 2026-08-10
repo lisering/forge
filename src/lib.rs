@@ -62,6 +62,7 @@ pub mod auto_recovery;
 pub mod ax_snapshot;
 pub mod browser;
 pub mod browser_launcher;
+pub mod cache_tuning;
 pub mod cancellation_token;
 pub mod cdp;
 pub mod chat;
@@ -116,6 +117,13 @@ pub use browser_launcher::{
     browser_exists, browser_from_env, browser_name, build_launch_args, connect_existing_browser,
     default_user_data_dir, detect_browser_paths, find_available_port_sync, find_browser,
     is_browser_running, is_port_available_sync, BrowserLauncher,
+};
+pub use cache_tuning::{
+    compute_new_ttl, has_sufficient_data, make_tuning_decision, should_adjust_ttl,
+    should_disable_cache, CacheTuner, CacheTuningConfig, CacheTuningDecision, TuningAction,
+    DEFAULT_DISABLE_THRESHOLD, DEFAULT_INCREASE_TTL_THRESHOLD, DEFAULT_MAX_TTL_SECS,
+    DEFAULT_MIN_SAMPLES, DEFAULT_MIN_TTL_SECS, DEFAULT_REDUCE_TTL_THRESHOLD,
+    DEFAULT_TTL_INCREASE_FACTOR, DEFAULT_TTL_REDUCE_FACTOR,
 };
 pub use cancellation_token::{CancelError, CancellationToken, CancellationTokenSource};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
