@@ -27,7 +27,8 @@ use crate::clarify::HeuristicClarificationChecker;
 use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
 use crate::dev_trace::{
-    build_cache_fix_correlation, build_search_quality_stats, DevTraceWriter, TraceAction,
+    build_cache_fix_correlation, build_cache_tuning_history_summary,
+    build_search_quality_history_summary, build_search_quality_stats, DevTraceWriter, TraceAction,
 };
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
 use crate::error_search;
@@ -2626,7 +2627,36 @@ where
 
         // === DevTrace: 打印追踪摘要 (借鉴方向 4) ===
         if let Some(ref trace) = self.dev_trace {
-            let summary = trace.summary();
+            let mut summary = trace.summary();
+
+            // 附加缓存调优历史摘要 (Session 87)
+            if let Some(ref tuner) = self.cache_tuner {
+                let h = tuner.to_history();
+                let ct_summary = build_cache_tuning_history_summary(
+                    h.initial_ttl,
+                    h.current_ttl,
+                    h.enabled,
+                    h.adjustment_count,
+                    h.disable_count,
+                    h.decisions.len(),
+                    h.saved_at.clone(),
+                );
+                summary = summary.with_cache_tuning_history(ct_summary);
+            }
+
+            // 附加搜索质量历史摘要 (Session 87)
+            if let Some(ref evaluator) = self.search_quality_evaluator {
+                let h = evaluator.to_history();
+                let sq_summary = build_search_quality_history_summary(
+                    h.initial_enabled,
+                    h.current_enabled,
+                    h.evaluation_count,
+                    h.disable_count,
+                    h.saved_at.clone(),
+                );
+                summary = summary.with_search_quality_history(sq_summary);
+            }
+
             println!("\n{}", summary.to_report());
         }
 
@@ -7168,6 +7198,144 @@ mod tests {
                 1
             );
         }
+    }
+
+    // ===== Session 87: DevTrace 历史摘要面板集成测试 =====
+
+    #[test]
+    fn test_final_report_devtrace_includes_cache_tuning_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 手动调整 TTL
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&decision);
+        }
+
+        // 捕获 stdout 验证报告中包含缓存调优历史面板
+        // final_report 内部会构建 DevTraceSummary 并附加历史摘要
+        orch.final_report().unwrap();
+
+        // 验证历史文件已创建 (含调优数据)
+        let history_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        assert!(history_path.exists());
+        let loaded = crate::cache_tuning::CacheTuningHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert_eq!(loaded.adjustment_count, 1);
+        assert_eq!(loaded.decisions.len(), 1);
+    }
+
+    #[test]
+    fn test_final_report_devtrace_includes_search_quality_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 执行评估
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let mut stats = crate::dev_trace::SearchQualityStats::new();
+            for _ in 0..3 {
+                stats.record_with_search(false);
+                stats.record_without_search(true);
+            }
+            evaluator.evaluate_and_apply(&stats);
+        }
+        assert!(!orch.search_quality_evaluator.as_ref().unwrap().is_enabled());
+
+        orch.final_report().unwrap();
+
+        // 验证历史文件已创建 (含搜索质量数据)
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        assert!(history_path.exists());
+        let loaded = crate::search_quality::SearchQualityHistory::load(&history_path).unwrap();
+        assert!(!loaded.current_enabled); // 最终禁用
+        assert!(loaded.initial_enabled); // 初始启用
+        assert!(loaded.enabled_changed());
+        assert_eq!(loaded.evaluation_count, 1);
+        assert_eq!(loaded.disable_count, 1);
+    }
+
+    #[test]
+    fn test_final_report_devtrace_includes_both_histories() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        // 同时启用 cache_tuner 和 search_quality_evaluator
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 调整 TTL
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let decision =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&decision);
+        }
+
+        // 评估搜索质量
+        if let Some(ref mut evaluator) = orch.search_quality_evaluator {
+            let mut stats = crate::dev_trace::SearchQualityStats::new();
+            for _ in 0..3 {
+                stats.record_with_search(false);
+                stats.record_without_search(true);
+            }
+            evaluator.evaluate_and_apply(&stats);
+        }
+
+        orch.final_report().unwrap();
+
+        // 两个历史文件都应存在
+        let ct_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        let sq_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        assert!(ct_path.exists(), "缓存调优历史文件应存在");
+        assert!(sq_path.exists(), "搜索质量历史文件应存在");
+
+        // 验证缓存调优历史
+        let ct = crate::cache_tuning::CacheTuningHistory::load(&ct_path).unwrap();
+        assert_eq!(ct.current_ttl, 2700);
+        assert_eq!(ct.adjustment_count, 1);
+
+        // 验证搜索质量历史
+        let sq = crate::search_quality::SearchQualityHistory::load(&sq_path).unwrap();
+        assert!(!sq.current_enabled);
+        assert_eq!(sq.evaluation_count, 1);
+    }
+
+    #[test]
+    fn test_final_report_no_history_panels_without_evaluators() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 不启用 cache_tuner 和 search_quality_evaluator
+        assert!(orch.cache_tuner.is_none());
+        assert!(orch.search_quality_evaluator.is_none());
+
+        // final_report 应正常执行, 不生成历史文件
+        orch.final_report().unwrap();
+
+        let ct_path = dir.path().join(".forge").join("cache_tuning_history.json");
+        let sq_path = dir
+            .path()
+            .join(".forge")
+            .join("search_quality_history.json");
+        assert!(!ct_path.exists());
+        assert!(!sq_path.exists());
     }
 }
 

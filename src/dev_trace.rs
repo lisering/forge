@@ -1664,6 +1664,282 @@ pub fn build_cache_tuning_summary(entries: &[DevTraceEntry]) -> CacheTuningSumma
 }
 
 // ============================================================================
+//  跨 Session 历史摘要 (Session 87)
+// ============================================================================
+
+/// 搜索质量历史摘要 — 跨 session 的搜索质量评估概览
+///
+/// 从 `SearchQualityHistory` (`.forge/search_quality_history.json`) 提取,
+/// 展示搜索功能在多个 session 中的启用/禁用状态变化和累计评估统计。
+///
+/// 与 `SearchQualityStats` (单 session) 不同, 本摘要反映的是跨 session 的
+/// 持久化历史数据, 用于判断搜索质量评估的长期趋势。
+///
+/// # 字段
+///
+/// | 字段 | 说明 |
+/// |------|------|
+/// | `initial_enabled` | session 开始时的搜索启用状态 |
+/// | `current_enabled` | 最终搜索启用状态 |
+/// | `evaluation_count` | 累计评估次数 |
+/// | `disable_count` | 累计禁用次数 |
+/// | `enabled_changed` | 启用状态是否发生变化 |
+/// | `saved_at` | 历史保存时间 (ISO 8601) |
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::SearchQualityHistorySummary;
+/// let s = SearchQualityHistorySummary::new(true, false, 5, 1, Some("2024-01-01T00:00:00Z".to_string()));
+/// assert!(s.enabled_changed); // true → false
+/// assert!(!s.is_empty()); // 5 evaluations
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchQualityHistorySummary {
+    /// session 开始时的搜索启用状态
+    pub initial_enabled: bool,
+    /// 最终搜索启用状态
+    pub current_enabled: bool,
+    /// 累计评估次数
+    pub evaluation_count: u32,
+    /// 累计禁用次数
+    pub disable_count: u32,
+    /// 启用状态是否发生变化 (initial != current)
+    pub enabled_changed: bool,
+    /// 历史保存时间 (ISO 8601 格式, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl SearchQualityHistorySummary {
+    /// 创建搜索质量历史摘要
+    ///
+    /// # 参数
+    ///
+    /// - `initial_enabled`: session 开始时的搜索启用状态
+    /// - `current_enabled`: 最终搜索启用状态
+    /// - `evaluation_count`: 累计评估次数
+    /// - `disable_count`: 累计禁用次数
+    /// - `saved_at`: 历史保存时间 (ISO 8601, 可选)
+    pub fn new(
+        initial_enabled: bool,
+        current_enabled: bool,
+        evaluation_count: u32,
+        disable_count: u32,
+        saved_at: Option<String>,
+    ) -> Self {
+        Self {
+            initial_enabled,
+            current_enabled,
+            evaluation_count,
+            disable_count,
+            enabled_changed: initial_enabled != current_enabled,
+            saved_at,
+        }
+    }
+
+    /// 是否为空 (无评估记录)
+    pub fn is_empty(&self) -> bool {
+        self.evaluation_count == 0
+    }
+
+    /// 禁用率 (disable_count / evaluation_count)
+    ///
+    /// 无评估时返回 0.0。
+    pub fn disable_rate(&self) -> f64 {
+        if self.evaluation_count == 0 {
+            return 0.0;
+        }
+        self.disable_count as f64 / self.evaluation_count as f64
+    }
+}
+
+impl Default for SearchQualityHistorySummary {
+    fn default() -> Self {
+        Self::new(true, true, 0, 0, None)
+    }
+}
+
+/// 缓存调优历史摘要 — 跨 session 的缓存调优概览
+///
+/// 从 `CacheTuningHistory` (`.forge/cache_tuning_history.json`) 提取,
+/// 展示缓存调优在多个 session 中的 TTL 变化趋势和累计统计。
+///
+/// 与 `CacheTuningSummary` (单 session, 从 trace 条目解析) 不同,
+/// 本摘要反映的是跨 session 的持久化历史数据, 用于判断缓存策略的长期效果。
+///
+/// # 字段
+///
+/// | 字段 | 说明 |
+/// |------|------|
+/// | `initial_ttl` | session 开始时的 TTL (秒) |
+/// | `current_ttl` | 最终 TTL (秒) |
+/// | `enabled` | 缓存是否启用 |
+/// | `adjustment_count` | 累计 TTL 调整次数 |
+/// | `disable_count` | 累计禁用次数 |
+/// | `decision_count` | 决策记录总数 |
+/// | `ttl_delta` | TTL 变化量 (current - initial) |
+/// | `saved_at` | 历史保存时间 (ISO 8601) |
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::CacheTuningHistorySummary;
+/// let s = CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None);
+/// assert_eq!(s.ttl_delta, 900);
+/// assert!(!s.is_empty()); // 1 decision
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheTuningHistorySummary {
+    /// session 开始时的 TTL (秒)
+    pub initial_ttl: u64,
+    /// 最终 TTL (秒)
+    pub current_ttl: u64,
+    /// 缓存是否启用
+    pub enabled: bool,
+    /// 累计 TTL 调整次数
+    pub adjustment_count: u32,
+    /// 累计禁用次数
+    pub disable_count: u32,
+    /// 决策记录总数
+    pub decision_count: usize,
+    /// TTL 变化量 (current - initial, 正=延长 负=缩短)
+    pub ttl_delta: i64,
+    /// 历史保存时间 (ISO 8601 格式, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl CacheTuningHistorySummary {
+    /// 创建缓存调优历史摘要
+    ///
+    /// # 参数
+    ///
+    /// - `initial_ttl`: session 开始时的 TTL (秒)
+    /// - `current_ttl`: 最终 TTL (秒)
+    /// - `enabled`: 缓存是否启用
+    /// - `adjustment_count`: 累计 TTL 调整次数
+    /// - `disable_count`: 累计禁用次数
+    /// - `decision_count`: 决策记录总数
+    /// - `saved_at`: 历史保存时间 (ISO 8601, 可选)
+    pub fn new(
+        initial_ttl: u64,
+        current_ttl: u64,
+        enabled: bool,
+        adjustment_count: u32,
+        disable_count: u32,
+        decision_count: usize,
+        saved_at: Option<String>,
+    ) -> Self {
+        Self {
+            initial_ttl,
+            current_ttl,
+            enabled,
+            adjustment_count,
+            disable_count,
+            decision_count,
+            ttl_delta: current_ttl as i64 - initial_ttl as i64,
+            saved_at,
+        }
+    }
+
+    /// 是否为空 (无决策记录)
+    pub fn is_empty(&self) -> bool {
+        self.decision_count == 0
+    }
+
+    /// TTL 变化百分比 (relative to initial)
+    ///
+    /// 无初始 TTL 时返回 0.0。
+    pub fn ttl_delta_percent(&self) -> f64 {
+        if self.initial_ttl == 0 {
+            return 0.0;
+        }
+        self.ttl_delta as f64 / self.initial_ttl as f64 * 100.0
+    }
+}
+
+impl Default for CacheTuningHistorySummary {
+    fn default() -> Self {
+        Self::new(0, 0, true, 0, 0, 0, None)
+    }
+}
+
+/// 从原始数据构建搜索质量历史摘要 (纯函数)
+///
+/// # 参数
+///
+/// - `initial_enabled`: session 开始时的搜索启用状态
+/// - `current_enabled`: 最终搜索启用状态
+/// - `evaluation_count`: 累计评估次数
+/// - `disable_count`: 累计禁用次数
+/// - `saved_at`: 历史保存时间 (ISO 8601, 可选)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::build_search_quality_history_summary;
+/// let s = build_search_quality_history_summary(true, false, 3, 1, None);
+/// assert!(s.enabled_changed);
+/// assert!((s.disable_rate() - (1.0 / 3.0)).abs() < 0.001);
+/// ```
+pub fn build_search_quality_history_summary(
+    initial_enabled: bool,
+    current_enabled: bool,
+    evaluation_count: u32,
+    disable_count: u32,
+    saved_at: Option<String>,
+) -> SearchQualityHistorySummary {
+    SearchQualityHistorySummary::new(
+        initial_enabled,
+        current_enabled,
+        evaluation_count,
+        disable_count,
+        saved_at,
+    )
+}
+
+/// 从原始数据构建缓存调优历史摘要 (纯函数)
+///
+/// # 参数
+///
+/// - `initial_ttl`: session 开始时的 TTL (秒)
+/// - `current_ttl`: 最终 TTL (秒)
+/// - `enabled`: 缓存是否启用
+/// - `adjustment_count`: 累计 TTL 调整次数
+/// - `disable_count`: 累计禁用次数
+/// - `decision_count`: 决策记录总数
+/// - `saved_at`: 历史保存时间 (ISO 8601, 可选)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::build_cache_tuning_history_summary;
+/// let s = build_cache_tuning_history_summary(1800, 2700, true, 1, 0, 1, None);
+/// assert_eq!(s.ttl_delta, 900);
+/// assert!((s.ttl_delta_percent() - 50.0).abs() < 0.001);
+/// ```
+pub fn build_cache_tuning_history_summary(
+    initial_ttl: u64,
+    current_ttl: u64,
+    enabled: bool,
+    adjustment_count: u32,
+    disable_count: u32,
+    decision_count: usize,
+    saved_at: Option<String>,
+) -> CacheTuningHistorySummary {
+    CacheTuningHistorySummary::new(
+        initial_ttl,
+        current_ttl,
+        enabled,
+        adjustment_count,
+        disable_count,
+        decision_count,
+        saved_at,
+    )
+}
+
+// ============================================================================
 //  纯逻辑函数 — 统计计算
 // ============================================================================
 
@@ -1945,6 +2221,22 @@ pub struct DevTraceSummary {
     /// `None` 表示没有搜索质量数据 (无 WebSearch 或无 CompileCheck)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_quality_summary: Option<SearchQualityStats>,
+
+    /// 搜索质量历史摘要 (Session 87)
+    ///
+    /// 从 `SearchQualityHistory` (`.forge/search_quality_history.json`) 提取的
+    /// 跨 session 持久化数据, 展示搜索功能的长期启用/禁用趋势。
+    /// `None` 表示没有历史数据 (首次运行或未启用 SearchQualityEvaluator)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_quality_history_summary: Option<SearchQualityHistorySummary>,
+
+    /// 缓存调优历史摘要 (Session 87)
+    ///
+    /// 从 `CacheTuningHistory` (`.forge/cache_tuning_history.json`) 提取的
+    /// 跨 session 持久化数据, 展示缓存策略的长期 TTL 变化趋势。
+    /// `None` 表示没有历史数据 (首次运行或未启用 CacheTuner)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_tuning_history_summary: Option<CacheTuningHistorySummary>,
 }
 
 impl DevTraceSummary {
@@ -1961,6 +2253,8 @@ impl DevTraceSummary {
             cache_fix_correlation: None,
             cache_tuning_summary: None,
             search_quality_summary: None,
+            search_quality_history_summary: None,
+            cache_tuning_history_summary: None,
         }
     }
 
@@ -2040,12 +2334,41 @@ impl DevTraceSummary {
             cache_fix_correlation,
             cache_tuning_summary,
             search_quality_summary,
+            // 跨 session 历史摘要来自外部持久化文件, 不从 trace 条目解析
+            search_quality_history_summary: None,
+            cache_tuning_history_summary: None,
         }
     }
 
     /// 获取某个操作类型的统计 (如有)
     pub fn get_action_stats(&self, action: TraceAction) -> Option<&ActionStats> {
         self.by_action.get(&action)
+    }
+
+    /// 附加搜索质量历史摘要 (builder 模式)
+    ///
+    /// 从 `SearchQualityHistory` 提取的跨 session 数据,
+    /// 由 Orchestrator 在 `final_report` 时调用。
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 搜索质量历史摘要
+    pub fn with_search_quality_history(mut self, summary: SearchQualityHistorySummary) -> Self {
+        self.search_quality_history_summary = Some(summary);
+        self
+    }
+
+    /// 附加缓存调优历史摘要 (builder 模式)
+    ///
+    /// 从 `CacheTuningHistory` 提取的跨 session 数据,
+    /// 由 Orchestrator 在 `final_report` 时调用。
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 缓存调优历史摘要
+    pub fn with_cache_tuning_history(mut self, summary: CacheTuningHistorySummary) -> Self {
+        self.cache_tuning_history_summary = Some(summary);
+        self
     }
 
     /// 生成可读的报告文本
@@ -2238,6 +2561,64 @@ impl DevTraceSummary {
                         "搜索效果不足"
                     }
                 ));
+            }
+        }
+
+        // === 搜索质量历史 (Session 87) ===
+        if let Some(ref sqh) = self.search_quality_history_summary {
+            report.push_str("\n  ── 搜索质量历史 (跨 Session) ──\n");
+            let initial_str = if sqh.initial_enabled {
+                "启用"
+            } else {
+                "禁用"
+            };
+            let current_str = if sqh.current_enabled {
+                "启用"
+            } else {
+                "禁用"
+            };
+            report.push_str(&format!("  初始状态: {}\n", initial_str));
+            report.push_str(&format!("  最终状态: {}\n", current_str));
+            if sqh.enabled_changed {
+                report.push_str("  状态变化: ✅ 已变更\n");
+            } else {
+                report.push_str("  状态变化: ─ 未变\n");
+            }
+            report.push_str(&format!("  累计评估: {} 次\n", sqh.evaluation_count));
+            if sqh.disable_count > 0 {
+                report.push_str(&format!("  累计禁用: {} 次\n", sqh.disable_count));
+                report.push_str(&format!("  禁用率: {:.1}%\n", sqh.disable_rate() * 100.0));
+            }
+            if let Some(ref saved_at) = sqh.saved_at {
+                report.push_str(&format!("  保存时间: {}\n", saved_at));
+            }
+        }
+
+        // === 缓存调优历史 (Session 87) ===
+        if let Some(ref cth) = self.cache_tuning_history_summary {
+            report.push_str("\n  ── 缓存调优历史 (跨 Session) ──\n");
+            report.push_str(&format!("  初始 TTL: {}s\n", cth.initial_ttl));
+            report.push_str(&format!("  最终 TTL: {}s\n", cth.current_ttl));
+            if cth.ttl_delta != 0 {
+                let delta_sign = if cth.ttl_delta > 0 { "+" } else { "" };
+                report.push_str(&format!(
+                    "  TTL 变化: {}{}s ({:.1}%)\n",
+                    delta_sign,
+                    cth.ttl_delta,
+                    cth.ttl_delta_percent()
+                ));
+            }
+            let status = if cth.enabled { "启用" } else { "已禁用" };
+            report.push_str(&format!("  缓存状态: {}\n", status));
+            if cth.adjustment_count > 0 {
+                report.push_str(&format!("  累计调整: {} 次\n", cth.adjustment_count));
+            }
+            if cth.disable_count > 0 {
+                report.push_str(&format!("  累计禁用: {} 次\n", cth.disable_count));
+            }
+            report.push_str(&format!("  决策记录: {} 条\n", cth.decision_count));
+            if let Some(ref saved_at) = cth.saved_at {
+                report.push_str(&format!("  保存时间: {}\n", saved_at));
             }
         }
 
@@ -8354,5 +8735,474 @@ mod tests {
         assert!(report.contains("搜索缓存统计"));
         assert!(report.contains("缓存与修复关联分析"));
         assert!(report.contains("缓存调优效果"));
+    }
+
+    // ======================================================================
+    //  Session 87: 跨 Session 历史摘要测试
+    // ======================================================================
+
+    // --- SearchQualityHistorySummary 测试 ---
+
+    #[test]
+    fn test_sq_history_summary_new() {
+        let s = SearchQualityHistorySummary::new(true, false, 5, 1, None);
+        assert!(s.initial_enabled);
+        assert!(!s.current_enabled);
+        assert_eq!(s.evaluation_count, 5);
+        assert_eq!(s.disable_count, 1);
+        assert!(s.enabled_changed);
+        assert!(s.saved_at.is_none());
+    }
+
+    #[test]
+    fn test_sq_history_summary_default() {
+        let s = SearchQualityHistorySummary::default();
+        assert!(s.initial_enabled);
+        assert!(s.current_enabled);
+        assert_eq!(s.evaluation_count, 0);
+        assert!(s.is_empty());
+        assert!(!s.enabled_changed);
+    }
+
+    #[test]
+    fn test_sq_history_summary_is_empty() {
+        let s = SearchQualityHistorySummary::new(true, true, 0, 0, None);
+        assert!(s.is_empty());
+
+        let s2 = SearchQualityHistorySummary::new(true, true, 1, 0, None);
+        assert!(!s2.is_empty());
+    }
+
+    #[test]
+    fn test_sq_history_summary_enabled_changed() {
+        // true → false: changed
+        let s = SearchQualityHistorySummary::new(true, false, 1, 1, None);
+        assert!(s.enabled_changed);
+
+        // true → true: not changed
+        let s2 = SearchQualityHistorySummary::new(true, true, 1, 0, None);
+        assert!(!s2.enabled_changed);
+
+        // false → true: changed
+        let s3 = SearchQualityHistorySummary::new(false, true, 1, 0, None);
+        assert!(s3.enabled_changed);
+
+        // false → false: not changed
+        let s4 = SearchQualityHistorySummary::new(false, false, 0, 0, None);
+        assert!(!s4.enabled_changed);
+    }
+
+    #[test]
+    fn test_sq_history_summary_disable_rate() {
+        // 1/5 = 20%
+        let s = SearchQualityHistorySummary::new(true, false, 5, 1, None);
+        assert!((s.disable_rate() - 0.2).abs() < 0.001);
+
+        // 0 evaluations → 0.0
+        let s2 = SearchQualityHistorySummary::new(true, true, 0, 0, None);
+        assert!((s2.disable_rate() - 0.0).abs() < 0.001);
+
+        // 3/3 = 100%
+        let s3 = SearchQualityHistorySummary::new(true, false, 3, 3, None);
+        assert!((s3.disable_rate() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_sq_history_summary_serde_roundtrip() {
+        let s = SearchQualityHistorySummary::new(
+            true,
+            false,
+            5,
+            1,
+            Some("2024-01-01T00:00:00Z".to_string()),
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: SearchQualityHistorySummary = serde_json::from_str(&json).unwrap();
+        assert!(loaded.initial_enabled);
+        assert!(!loaded.current_enabled);
+        assert_eq!(loaded.evaluation_count, 5);
+        assert_eq!(loaded.disable_count, 1);
+        assert!(loaded.enabled_changed);
+        assert_eq!(loaded.saved_at, Some("2024-01-01T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_sq_history_summary_serde_skip_none() {
+        let s = SearchQualityHistorySummary::new(true, true, 0, 0, None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("saved_at"));
+    }
+
+    // --- CacheTuningHistorySummary 测试 ---
+
+    #[test]
+    fn test_ct_history_summary_new() {
+        let s = CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None);
+        assert_eq!(s.initial_ttl, 1800);
+        assert_eq!(s.current_ttl, 2700);
+        assert!(s.enabled);
+        assert_eq!(s.adjustment_count, 1);
+        assert_eq!(s.disable_count, 0);
+        assert_eq!(s.decision_count, 1);
+        assert_eq!(s.ttl_delta, 900);
+        assert!(s.saved_at.is_none());
+    }
+
+    #[test]
+    fn test_ct_history_summary_default() {
+        let s = CacheTuningHistorySummary::default();
+        assert_eq!(s.initial_ttl, 0);
+        assert_eq!(s.current_ttl, 0);
+        assert!(s.enabled);
+        assert_eq!(s.ttl_delta, 0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_ct_history_summary_is_empty() {
+        let s = CacheTuningHistorySummary::new(1800, 1800, true, 0, 0, 0, None);
+        assert!(s.is_empty());
+
+        let s2 = CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None);
+        assert!(!s2.is_empty());
+    }
+
+    #[test]
+    fn test_ct_history_summary_ttl_delta_positive() {
+        let s = CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None);
+        assert_eq!(s.ttl_delta, 900);
+        assert!((s.ttl_delta_percent() - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ct_history_summary_ttl_delta_negative() {
+        let s = CacheTuningHistorySummary::new(1800, 900, true, 1, 0, 1, None);
+        assert_eq!(s.ttl_delta, -900);
+        assert!((s.ttl_delta_percent() - (-50.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ct_history_summary_ttl_delta_zero() {
+        let s = CacheTuningHistorySummary::new(1800, 1800, true, 0, 0, 0, None);
+        assert_eq!(s.ttl_delta, 0);
+        assert!((s.ttl_delta_percent() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ct_history_summary_disabled() {
+        let s = CacheTuningHistorySummary::new(1800, 1800, false, 0, 1, 1, None);
+        assert!(!s.enabled);
+        assert_eq!(s.disable_count, 1);
+    }
+
+    #[test]
+    fn test_ct_history_summary_serde_roundtrip() {
+        let s = CacheTuningHistorySummary::new(
+            1800,
+            2700,
+            true,
+            2,
+            0,
+            2,
+            Some("2024-01-01T00:00:00Z".to_string()),
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: CacheTuningHistorySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.initial_ttl, 1800);
+        assert_eq!(loaded.current_ttl, 2700);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.adjustment_count, 2);
+        assert_eq!(loaded.ttl_delta, 900);
+        assert_eq!(loaded.saved_at, Some("2024-01-01T00:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn test_ct_history_summary_serde_skip_none() {
+        let s = CacheTuningHistorySummary::new(1800, 1800, true, 0, 0, 0, None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("saved_at"));
+    }
+
+    // --- 纯函数测试 ---
+
+    #[test]
+    fn test_build_search_quality_history_summary() {
+        let s = build_search_quality_history_summary(true, false, 3, 1, None);
+        assert!(s.initial_enabled);
+        assert!(!s.current_enabled);
+        assert_eq!(s.evaluation_count, 3);
+        assert_eq!(s.disable_count, 1);
+        assert!(s.enabled_changed);
+    }
+
+    #[test]
+    fn test_build_search_quality_history_summary_with_timestamp() {
+        let s = build_search_quality_history_summary(
+            true,
+            true,
+            10,
+            0,
+            Some("2024-06-01T12:00:00Z".to_string()),
+        );
+        assert_eq!(s.saved_at, Some("2024-06-01T12:00:00Z".to_string()));
+        assert!(!s.enabled_changed);
+        assert!((s.disable_rate() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_cache_tuning_history_summary() {
+        let s = build_cache_tuning_history_summary(1800, 2700, true, 1, 0, 1, None);
+        assert_eq!(s.initial_ttl, 1800);
+        assert_eq!(s.current_ttl, 2700);
+        assert_eq!(s.ttl_delta, 900);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_build_cache_tuning_history_summary_disabled() {
+        let s = build_cache_tuning_history_summary(1800, 1800, false, 0, 1, 1, None);
+        assert!(!s.enabled);
+        assert_eq!(s.disable_count, 1);
+        assert_eq!(s.ttl_delta, 0);
+    }
+
+    #[test]
+    fn test_build_cache_tuning_history_summary_with_timestamp() {
+        let s = build_cache_tuning_history_summary(
+            600,
+            1800,
+            true,
+            3,
+            0,
+            3,
+            Some("2024-06-01T12:00:00Z".to_string()),
+        );
+        assert_eq!(s.ttl_delta, 1200);
+        assert!((s.ttl_delta_percent() - 200.0).abs() < 0.001);
+        assert_eq!(s.saved_at, Some("2024-06-01T12:00:00Z".to_string()));
+    }
+
+    // --- to_report: 搜索质量历史面板测试 ---
+
+    #[test]
+    fn test_to_report_includes_search_quality_history() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, false, 5, 1, None));
+        let report = summary.to_report();
+
+        assert!(report.contains("搜索质量历史 (跨 Session)"));
+        assert!(report.contains("初始状态: 启用"));
+        assert!(report.contains("最终状态: 禁用"));
+        assert!(report.contains("状态变化: ✅ 已变更"));
+        assert!(report.contains("累计评估: 5 次"));
+        assert!(report.contains("累计禁用: 1 次"));
+        assert!(report.contains("禁用率: 20.0%"));
+    }
+
+    #[test]
+    fn test_to_report_no_search_quality_history_when_none() {
+        let summary = DevTraceSummary::empty();
+        let report = summary.to_report();
+        assert!(!report.contains("搜索质量历史 (跨 Session)"));
+    }
+
+    #[test]
+    fn test_to_report_search_quality_history_no_change() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 10, 0, None));
+        let report = summary.to_report();
+
+        assert!(report.contains("初始状态: 启用"));
+        assert!(report.contains("最终状态: 启用"));
+        assert!(report.contains("状态变化: ─ 未变"));
+        assert!(report.contains("累计评估: 10 次"));
+        // disable_count == 0 → 不显示禁用相关行
+        assert!(!report.contains("累计禁用"));
+        assert!(!report.contains("禁用率"));
+    }
+
+    #[test]
+    fn test_to_report_search_quality_history_with_saved_at() {
+        let summary =
+            DevTraceSummary::empty().with_search_quality_history(SearchQualityHistorySummary::new(
+                false,
+                true,
+                3,
+                0,
+                Some("2024-06-01T00:00:00Z".to_string()),
+            ));
+        let report = summary.to_report();
+
+        assert!(report.contains("初始状态: 禁用"));
+        assert!(report.contains("最终状态: 启用"));
+        assert!(report.contains("状态变化: ✅ 已变更"));
+        assert!(report.contains("保存时间: 2024-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn test_to_report_search_quality_history_empty() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 0, 0, None));
+        let report = summary.to_report();
+
+        assert!(report.contains("搜索质量历史 (跨 Session)"));
+        assert!(report.contains("累计评估: 0 次"));
+        assert!(!report.contains("累计禁用"));
+        assert!(!report.contains("禁用率"));
+    }
+
+    // --- to_report: 缓存调优历史面板测试 ---
+
+    #[test]
+    fn test_to_report_includes_cache_tuning_history() {
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None),
+        );
+        let report = summary.to_report();
+
+        assert!(report.contains("缓存调优历史 (跨 Session)"));
+        assert!(report.contains("初始 TTL: 1800s"));
+        assert!(report.contains("最终 TTL: 2700s"));
+        assert!(report.contains("TTL 变化: +900s (50.0%)"));
+        assert!(report.contains("缓存状态: 启用"));
+        assert!(report.contains("累计调整: 1 次"));
+        assert!(report.contains("决策记录: 1 条"));
+    }
+
+    #[test]
+    fn test_to_report_no_cache_tuning_history_when_none() {
+        let summary = DevTraceSummary::empty();
+        let report = summary.to_report();
+        assert!(!report.contains("缓存调优历史 (跨 Session)"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_disabled() {
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 1800, false, 0, 1, 1, None),
+        );
+        let report = summary.to_report();
+
+        assert!(report.contains("缓存状态: 已禁用"));
+        assert!(report.contains("累计禁用: 1 次"));
+        // ttl_delta == 0 → 不显示 TTL 变化行
+        assert!(!report.contains("TTL 变化:"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_negative_delta() {
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 900, true, 1, 0, 1, None),
+        );
+        let report = summary.to_report();
+
+        assert!(report.contains("TTL 变化: -900s (-50.0%)"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_zero_delta() {
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 1800, true, 0, 0, 0, None),
+        );
+        let report = summary.to_report();
+
+        assert!(report.contains("初始 TTL: 1800s"));
+        assert!(report.contains("最终 TTL: 1800s"));
+        // ttl_delta == 0 → 不显示 TTL 变化行
+        assert!(!report.contains("TTL 变化:"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_with_saved_at() {
+        let summary =
+            DevTraceSummary::empty().with_cache_tuning_history(CacheTuningHistorySummary::new(
+                600,
+                1800,
+                true,
+                3,
+                0,
+                3,
+                Some("2024-06-01T00:00:00Z".to_string()),
+            ));
+        let report = summary.to_report();
+
+        assert!(report.contains("TTL 变化: +1200s (200.0%)"));
+        assert!(report.contains("保存时间: 2024-06-01T00:00:00Z"));
+    }
+
+    // --- to_report: 两个面板同时存在的测试 ---
+
+    #[test]
+    fn test_to_report_both_history_panels() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, false, 5, 1, None))
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 1, 0, 1, None,
+            ));
+        let report = summary.to_report();
+
+        assert!(report.contains("搜索质量历史 (跨 Session)"));
+        assert!(report.contains("缓存调优历史 (跨 Session)"));
+        assert!(report.contains("初始状态: 启用"));
+        assert!(report.contains("最终状态: 禁用"));
+        assert!(report.contains("初始 TTL: 1800s"));
+        assert!(report.contains("最终 TTL: 2700s"));
+    }
+
+    // --- serde 测试: DevTraceSummary 中的新字段 ---
+
+    #[test]
+    fn test_summary_sq_history_serde_roundtrip() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, false, 5, 1, None));
+        let json = serde_json::to_string(&summary).unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+        let sqh = loaded
+            .search_quality_history_summary
+            .expect("should be Some");
+        assert_eq!(sqh.evaluation_count, 5);
+        assert_eq!(sqh.disable_count, 1);
+        assert!(sqh.enabled_changed);
+    }
+
+    #[test]
+    fn test_summary_sq_history_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("search_quality_history_summary"));
+    }
+
+    #[test]
+    fn test_summary_ct_history_serde_roundtrip() {
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None),
+        );
+        let json = serde_json::to_string(&summary).unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+        let cth = loaded.cache_tuning_history_summary.expect("should be Some");
+        assert_eq!(cth.initial_ttl, 1800);
+        assert_eq!(cth.current_ttl, 2700);
+        assert_eq!(cth.ttl_delta, 900);
+    }
+
+    #[test]
+    fn test_summary_ct_history_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("cache_tuning_history_summary"));
+    }
+
+    // --- from_entries 不解析历史 (来自外部文件) ---
+
+    #[test]
+    fn test_from_entries_history_summaries_are_none() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        // from_entries 不应从 trace 条目解析历史摘要
+        assert!(summary.search_quality_history_summary.is_none());
+        assert!(summary.cache_tuning_history_summary.is_none());
     }
 }
