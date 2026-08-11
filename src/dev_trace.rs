@@ -3197,10 +3197,11 @@ impl DevTraceSummary {
                 ));
             }
 
-            // === Sparkline 可视化 (Session 94) ===
+            // === Sparkline 可视化 (Session 94, 颜色编码 Session 96) ===
             // 关联差值趋势
             if tuning.correlation_diffs.len() >= 2 {
-                let config = crate::sparkline::SparklineConfig::new(40);
+                let config = crate::sparkline::SparklineConfig::new(40)
+                    .with_color_mode(crate::sparkline::SparklineColorMode::PositiveNegative);
                 report.push_str(&crate::sparkline::format_trend_sparkline_with(
                     "  差值趋势图",
                     &tuning.correlation_diffs,
@@ -3270,10 +3271,11 @@ impl DevTraceSummary {
                 ));
             }
 
-            // === Sparkline 可视化 (Session 95) ===
+            // === Sparkline 可视化 (Session 95, 颜色编码 Session 96) ===
             if let Some(ref diffs) = self.search_diff_history {
                 if diffs.len() >= 2 {
-                    let config = crate::sparkline::SparklineConfig::new(40);
+                    let config = crate::sparkline::SparklineConfig::new(40)
+                        .with_color_mode(crate::sparkline::SparklineColorMode::PositiveNegative);
                     report.push_str(&crate::sparkline::format_trend_sparkline_with(
                         "  搜索差值趋势图",
                         diffs,
@@ -3405,10 +3407,11 @@ impl DevTraceSummary {
                 ));
             }
 
-            // === Sparkline 可视化 (Session 95) ===
+            // === Sparkline 可视化 (Session 95, 颜色编码 Session 96) ===
             if let Some(ref diffs) = self.memory_diff_history {
                 if diffs.len() >= 2 {
-                    let config = crate::sparkline::SparklineConfig::new(40);
+                    let config = crate::sparkline::SparklineConfig::new(40)
+                        .with_color_mode(crate::sparkline::SparklineColorMode::PositiveNegative);
                     report.push_str(&crate::sparkline::format_trend_sparkline_with(
                         "  Memory 差值趋势图",
                         diffs,
@@ -10969,6 +10972,304 @@ mod tests {
         let report = summary.to_report();
 
         assert!(!report.contains("Memory 差值趋势图"));
+    }
+
+    // --- to_report: Sparkline 颜色编码测试 (Session 96) ---
+
+    #[test]
+    fn test_to_report_search_diff_sparkline_has_ansi_colors() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        let report = summary.to_report();
+
+        // 混合正负差值 → 应同时包含绿色和红色 ANSI 码
+        assert!(report.contains("\x1b[32m")); // 绿色 (正值)
+        assert!(report.contains("\x1b[31m")); // 红色 (负值)
+        assert!(report.contains("\x1b[0m")); // 重置
+    }
+
+    #[test]
+    fn test_to_report_search_diff_sparkline_all_positive_green() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_sparkline(vec![0.1, 0.2, 0.3]);
+        let report = summary.to_report();
+
+        // 全正值 → 只有绿色, 无红色
+        assert!(report.contains("\x1b[32m")); // 绿色
+        assert!(!report.contains("\x1b[31m")); // 无红色
+    }
+
+    #[test]
+    fn test_to_report_search_diff_sparkline_all_negative_red() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_sparkline(vec![-0.1, -0.2, -0.3]);
+        let report = summary.to_report();
+
+        // 全负值 → 只有红色, 无绿色
+        assert!(!report.contains("\x1b[32m")); // 无绿色
+        assert!(report.contains("\x1b[31m")); // 红色
+    }
+
+    #[test]
+    fn test_to_report_memory_diff_sparkline_has_ansi_colors() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_memory_evaluation_sparkline(vec![0.1, -0.05, 0.2]);
+        let report = summary.to_report();
+
+        // 混合正负差值 → 应同时包含绿色和红色
+        assert!(report.contains("\x1b[32m")); // 绿色
+        assert!(report.contains("\x1b[31m")); // 红色
+        assert!(report.contains("\x1b[0m")); // 重置
+    }
+
+    #[test]
+    fn test_to_report_memory_diff_sparkline_all_positive_green() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_memory_evaluation_sparkline(vec![0.1, 0.2, 0.3]);
+        let report = summary.to_report();
+
+        assert!(report.contains("\x1b[32m")); // 绿色
+        assert!(!report.contains("\x1b[31m")); // 无红色
+    }
+
+    #[test]
+    fn test_to_report_memory_diff_sparkline_all_negative_red() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_memory_evaluation_sparkline(vec![-0.1, -0.2, -0.3]);
+        let report = summary.to_report();
+
+        assert!(!report.contains("\x1b[32m")); // 无绿色
+        assert!(report.contains("\x1b[31m")); // 红色
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_diff_sparkline_has_ansi_colors() {
+        // 关联差值 sparkline 也应使用颜色编码
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=1/3 miss=2/3",
+                "缓存调优: 调整 TTL: 2700s → 1800s (差值 -10.0%, 原因: 缓存有害)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        // 应有颜色编码 (绿色正值 + 红色负值)
+        assert!(report.contains("\x1b[32m")); // 绿色
+        assert!(report.contains("\x1b[31m")); // 红色
+    }
+
+    #[test]
+    fn test_to_report_search_diff_sparkline_strip_ansi_matches_content() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        let report = summary.to_report();
+        let stripped = crate::sparkline::strip_ansi_codes(&report);
+
+        // strip 后应仍包含关键文本
+        assert!(stripped.contains("搜索差值趋势图"));
+        // format_trend_sparkline_with 只显示首尾值, 不显示中间值
+        assert!(stripped.contains("+10.0%")); // first=0.1
+        assert!(stripped.contains("+20.0%")); // last=0.2
+                                              // 但不应包含 ANSI 码
+        assert!(!stripped.contains("\x1b["));
     }
 
     // --- serde 测试: DevTraceSummary 中的新字段 ---

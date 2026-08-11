@@ -188,8 +188,9 @@ pub use evaluator_synergy::{
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
-    generate_chart_js_bar, generate_chart_js_line, generate_chart_js_line_raw, generate_css_styles,
-    generate_html_report, generate_html_report_file, generate_stat_card,
+    generate_chart_js_bar, generate_chart_js_line, generate_chart_js_line_colored,
+    generate_chart_js_line_raw, generate_css_styles, generate_html_report,
+    generate_html_report_file, generate_point_colors, generate_stat_card,
     HTML_REPORT_FORMAT_VERSION,
 };
 pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteraction};
@@ -261,8 +262,9 @@ pub use slash_command::{
 pub use sparkline::{
     compute_sparkline_stats, escape_html, format_multi_sparkline, format_trend_sparkline,
     format_trend_sparkline_with, map_value_to_char, normalize_value, render_percentage_sparkline,
-    render_sparkline, render_sparkline_with_range, SparklineConfig, SparklineStats, TrendDirection,
-    DEFAULT_FILL_CHAR, DEFAULT_SPARKLINE_MAX_WIDTH, SPARKLINE_CHARS,
+    render_sparkline, render_sparkline_with_range, strip_ansi_codes, value_to_ansi_color,
+    SparklineColorMode, SparklineConfig, SparklineStats, TrendDirection, ANSI_GREEN, ANSI_RED,
+    ANSI_RESET, ANSI_YELLOW, DEFAULT_FILL_CHAR, DEFAULT_SPARKLINE_MAX_WIDTH, SPARKLINE_CHARS,
     SPARKLINE_CHARS as SPARKLINE_BLOCK_CHARS, TREND_THRESHOLD,
 };
 pub use stealth_patches::{

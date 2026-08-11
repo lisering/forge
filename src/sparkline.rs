@@ -53,6 +53,56 @@ pub const DEFAULT_FILL_CHAR: char = '·';
 pub const TREND_THRESHOLD: f64 = 0.05;
 
 // ============================================================================
+//  ANSI 颜色常量 (Session 96)
+// ============================================================================
+
+/// ANSI 绿色 — 用于正差值
+pub const ANSI_GREEN: &str = "\x1b[32m";
+
+/// ANSI 红色 — 用于负差值
+pub const ANSI_RED: &str = "\x1b[31m";
+
+/// ANSI 黄色 — 用于零值或中性
+pub const ANSI_YELLOW: &str = "\x1b[33m";
+
+/// ANSI 重置 — 恢复默认颜色
+pub const ANSI_RESET: &str = "\x1b[0m";
+
+// ============================================================================
+//  SparklineColorMode — 颜色模式 (Session 96)
+// ============================================================================
+
+/// Sparkline 颜色编码模式
+///
+/// 控制是否在 sparkline 渲染中使用 ANSI 颜色编码。
+///
+/// # 变体
+///
+/// - [`None`](Self::None): 无颜色 (默认, 纯文本输出)
+/// - [`PositiveNegative`](Self::PositiveNegative): 正值绿色, 负值红色, 零值无颜色
+///
+/// # 示例
+///
+/// ```
+/// # use forge::sparkline::{SparklineColorMode, SparklineConfig, render_sparkline};
+/// let config = SparklineConfig::new(40)
+///     .with_color_mode(SparklineColorMode::PositiveNegative);
+/// let values = vec![-0.2, 0.0, 0.3, -0.1, 0.5];
+/// let s = render_sparkline(&values, &config);
+/// // 正值字符被绿色包裹, 负值字符被红色包裹
+/// assert!(s.contains("\x1b[32m")); // 绿色
+/// assert!(s.contains("\x1b[31m")); // 红色
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SparklineColorMode {
+    /// 无颜色 (默认, 纯文本输出)
+    #[default]
+    None,
+    /// 正值绿色, 负值红色, 零值无颜色
+    PositiveNegative,
+}
+
+// ============================================================================
 //  SparklineConfig — 配置
 // ============================================================================
 
@@ -65,6 +115,7 @@ pub const TREND_THRESHOLD: f64 = 0.05;
 /// - `max_width`: 最大宽度 (字符数), 超出时保留最近的 N 个值
 /// - `show_min_max`: 是否在末尾显示 min/max 标注
 /// - `fill_char`: 空序列的占位字符
+/// - `color_mode`: ANSI 颜色编码模式 (Session 96)
 ///
 /// # 示例
 ///
@@ -83,6 +134,9 @@ pub struct SparklineConfig {
     pub show_min_max: bool,
     /// 空序列的占位字符
     pub fill_char: char,
+    /// ANSI 颜色编码模式 (Session 96)
+    #[serde(default)]
+    pub color_mode: SparklineColorMode,
 }
 
 impl Default for SparklineConfig {
@@ -91,6 +145,7 @@ impl Default for SparklineConfig {
             max_width: DEFAULT_SPARKLINE_MAX_WIDTH,
             show_min_max: false,
             fill_char: DEFAULT_FILL_CHAR,
+            color_mode: SparklineColorMode::None,
         }
     }
 }
@@ -117,6 +172,25 @@ impl SparklineConfig {
     /// 设置占位字符
     pub fn with_fill_char(mut self, ch: char) -> Self {
         self.fill_char = ch;
+        self
+    }
+
+    /// 设置颜色编码模式 (Session 96)
+    ///
+    /// # 参数
+    ///
+    /// - `mode`: 颜色编码模式
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// # use forge::sparkline::{SparklineColorMode, SparklineConfig};
+    /// let config = SparklineConfig::new(40)
+    ///     .with_color_mode(SparklineColorMode::PositiveNegative);
+    /// assert_eq!(config.color_mode, SparklineColorMode::PositiveNegative);
+    /// ```
+    pub fn with_color_mode(mut self, mode: SparklineColorMode) -> Self {
+        self.color_mode = mode;
         self
     }
 }
@@ -272,6 +346,112 @@ pub fn normalize_value(value: f64, min: f64, max: f64) -> f64 {
     ((value - min) / (max - min)).clamp(0.0, 1.0)
 }
 
+/// 根据值的正负返回对应的 ANSI 颜色码 (Session 96)
+///
+/// - 正值 (> 0): 返回 [`ANSI_GREEN`]
+/// - 负值 (< 0): 返回 [`ANSI_RED`]
+/// - 零值: 返回空字符串 (不加颜色)
+///
+/// # 参数
+///
+/// - `value`: 待着色的值
+///
+/// # 返回
+///
+/// ANSI 颜色码字符串引用, 零值返回空字符串。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::sparkline::{value_to_ansi_color, ANSI_GREEN, ANSI_RED};
+/// assert_eq!(value_to_ansi_color(0.1), ANSI_GREEN);
+/// assert_eq!(value_to_ansi_color(-0.1), ANSI_RED);
+/// assert_eq!(value_to_ansi_color(0.0), "");
+/// ```
+pub fn value_to_ansi_color(value: f64) -> &'static str {
+    if value > 0.0 {
+        ANSI_GREEN
+    } else if value < 0.0 {
+        ANSI_RED
+    } else {
+        ""
+    }
+}
+
+/// 从字符串中移除所有 ANSI 转义序列 (Session 96)
+///
+/// 将包含 ANSI 颜色码的字符串还原为纯文本, 用于测试或纯文本输出。
+///
+/// # 参数
+///
+/// - `s`: 可能包含 ANSI 转义序列的字符串
+///
+/// # 返回
+///
+/// 移除所有 `\x1b[...m` 序列后的纯文本
+///
+/// # 示例
+///
+/// ```
+/// # use forge::sparkline::strip_ansi_codes;
+/// assert_eq!(strip_ansi_codes("\x1b[32m▁\x1b[0m\x1b[31m█\x1b[0m"), "▁█");
+/// assert_eq!(strip_ansi_codes("hello"), "hello");
+/// assert_eq!(strip_ansi_codes(""), "");
+/// ```
+pub fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            // 跳过 ESC [ ... m 序列
+            chars.next(); // 消耗 '['
+            for inner in chars.by_ref() {
+                if inner == 'm' {
+                    break;
+                }
+                // 数字和分号都是合法的 ANSI 参数字符, 继续跳过
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// 将字符用 ANSI 颜色包裹 (内部辅助函数)
+///
+/// 根据 `color_mode` 和值的正负, 用 ANSI 颜色码包裹字符。
+fn color_char(ch: char, value: f64, color_mode: SparklineColorMode) -> String {
+    match color_mode {
+        SparklineColorMode::None => ch.to_string(),
+        SparklineColorMode::PositiveNegative => {
+            let color = value_to_ansi_color(value);
+            if color.is_empty() {
+                ch.to_string()
+            } else {
+                format!("{}{}{}", color, ch, ANSI_RESET)
+            }
+        }
+    }
+}
+
+/// 将格式化后的值字符串用 ANSI 颜色包裹 (内部辅助函数)
+///
+/// 用于在 `format_trend_sparkline_with` 中着色 first/last 值标签。
+fn color_value_str(s: &str, value: f64, color_mode: SparklineColorMode) -> String {
+    match color_mode {
+        SparklineColorMode::None => s.to_string(),
+        SparklineColorMode::PositiveNegative => {
+            let color = value_to_ansi_color(value);
+            if color.is_empty() {
+                s.to_string()
+            } else {
+                format!("{}{}{}", color, s, ANSI_RESET)
+            }
+        }
+    }
+}
+
 /// 将值映射到 sparkline 字符
 ///
 /// 根据值在 [min, max] 范围内的位置, 返回对应的 Unicode 方块字符。
@@ -420,7 +600,8 @@ pub fn render_sparkline(values: &[f64], config: &SparklineConfig) -> String {
 
     if values.len() == 1 {
         // 单个值映射到中间字符
-        return map_value_to_char(values[0], values[0], values[0]).to_string();
+        let ch = map_value_to_char(values[0], values[0], values[0]);
+        return color_char(ch, values[0], config.color_mode);
     }
 
     // 截断到 max_width (保留最近的 N 个值), max_width 至少为 1
@@ -437,9 +618,16 @@ pub fn render_sparkline(values: &[f64], config: &SparklineConfig) -> String {
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max);
 
-    let mut result = String::with_capacity(display_values.len());
+    // 颜色模式需要更多容量 (每个字符最多 ~10 字节的 ANSI 码)
+    let cap = if config.color_mode == SparklineColorMode::None {
+        display_values.len()
+    } else {
+        display_values.len() * 12
+    };
+    let mut result = String::with_capacity(cap);
     for &v in display_values {
-        result.push(map_value_to_char(v, min, max));
+        let ch = map_value_to_char(v, min, max);
+        result.push_str(&color_char(ch, v, config.color_mode));
     }
 
     if config.show_min_max {
@@ -493,9 +681,16 @@ pub fn render_sparkline_with_range(
         values
     };
 
-    let mut result = String::with_capacity(display_values.len());
+    // 颜色模式需要更多容量
+    let cap = if config.color_mode == SparklineColorMode::None {
+        display_values.len()
+    } else {
+        display_values.len() * 12
+    };
+    let mut result = String::with_capacity(cap);
     for &v in display_values {
-        result.push(map_value_to_char(v, min, max));
+        let ch = map_value_to_char(v, min, max);
+        result.push_str(&color_char(ch, v, config.color_mode));
     }
 
     if config.show_min_max {
@@ -576,15 +771,19 @@ pub fn format_trend_sparkline_with(
     let sparkline = render_sparkline(values, config);
 
     if stats.count < 2 {
-        return format!("  {}: {} ({})", label, sparkline, value_fmt(stats.first));
+        let first_str = color_value_str(&value_fmt(stats.first), stats.first, config.color_mode);
+        return format!("  {}: {} ({})", label, sparkline, first_str);
     }
+
+    let first_str = color_value_str(&value_fmt(stats.first), stats.first, config.color_mode);
+    let last_str = color_value_str(&value_fmt(stats.last), stats.last, config.color_mode);
 
     format!(
         "  {}: {} ({}→{} {})",
         label,
         sparkline,
-        value_fmt(stats.first),
-        value_fmt(stats.last),
+        first_str,
+        last_str,
         stats.trend.arrow()
     )
 }
@@ -1507,5 +1706,380 @@ mod tests {
         let panel = format_multi_sparkline("百分比趋势", &series, &config);
         assert!(panel.contains("↑"));
         assert!(panel.contains("↓"));
+    }
+
+    // ======================================================================
+    //  SparklineColorMode 测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_color_mode_default() {
+        assert_eq!(SparklineColorMode::default(), SparklineColorMode::None);
+    }
+
+    #[test]
+    fn test_color_mode_serde() {
+        let json = serde_json::to_string(&SparklineColorMode::PositiveNegative).unwrap();
+        let loaded: SparklineColorMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, SparklineColorMode::PositiveNegative);
+    }
+
+    #[test]
+    fn test_color_mode_serde_none() {
+        let json = serde_json::to_string(&SparklineColorMode::None).unwrap();
+        let loaded: SparklineColorMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, SparklineColorMode::None);
+    }
+
+    #[test]
+    fn test_config_with_color_mode() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        assert_eq!(config.color_mode, SparklineColorMode::PositiveNegative);
+    }
+
+    #[test]
+    fn test_config_default_color_mode_none() {
+        let config = SparklineConfig::default();
+        assert_eq!(config.color_mode, SparklineColorMode::None);
+    }
+
+    #[test]
+    fn test_config_serde_with_color_mode() {
+        let config = SparklineConfig::new(50).with_color_mode(SparklineColorMode::PositiveNegative);
+        let json = serde_json::to_string(&config).unwrap();
+        let loaded: SparklineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.color_mode, SparklineColorMode::PositiveNegative);
+    }
+
+    #[test]
+    fn test_config_serde_color_mode_default() {
+        // 旧 JSON 不含 color_mode 字段 → serde(default) → None
+        let json = r#"{"max_width":40,"show_min_max":false,"fill_char":"·"}"#;
+        let loaded: SparklineConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.max_width, 40);
+        assert_eq!(loaded.color_mode, SparklineColorMode::None);
+    }
+
+    // ======================================================================
+    //  value_to_ansi_color 测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_value_to_ansi_color_positive() {
+        assert_eq!(value_to_ansi_color(0.1), ANSI_GREEN);
+        assert_eq!(value_to_ansi_color(1.0), ANSI_GREEN);
+        assert_eq!(value_to_ansi_color(100.0), ANSI_GREEN);
+    }
+
+    #[test]
+    fn test_value_to_ansi_color_negative() {
+        assert_eq!(value_to_ansi_color(-0.1), ANSI_RED);
+        assert_eq!(value_to_ansi_color(-1.0), ANSI_RED);
+        assert_eq!(value_to_ansi_color(-100.0), ANSI_RED);
+    }
+
+    #[test]
+    fn test_value_to_ansi_color_zero() {
+        assert_eq!(value_to_ansi_color(0.0), "");
+    }
+
+    #[test]
+    fn test_ansi_constants_not_empty() {
+        assert!(!ANSI_GREEN.is_empty());
+        assert!(!ANSI_RED.is_empty());
+        assert!(!ANSI_RESET.is_empty());
+        assert!(ANSI_GREEN.contains("32"));
+        assert!(ANSI_RED.contains("31"));
+        assert!(ANSI_RESET.contains("0m"));
+    }
+
+    // ======================================================================
+    //  strip_ansi_codes 测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_strip_ansi_basic() {
+        let colored = format!("{}▁{}{}█{}", ANSI_GREEN, ANSI_RESET, ANSI_RED, ANSI_RESET);
+        assert_eq!(strip_ansi_codes(&colored), "▁█");
+    }
+
+    #[test]
+    fn test_strip_ansi_no_codes() {
+        assert_eq!(strip_ansi_codes("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty() {
+        assert_eq!(strip_ansi_codes(""), "");
+    }
+
+    #[test]
+    fn test_strip_ansi_multiple_codes() {
+        let s = format!(
+            "{}{}{}ab{}cd{}{}ef{}",
+            ANSI_GREEN, "▁", ANSI_RESET, ANSI_RESET, ANSI_RED, "█", ANSI_RESET
+        );
+        assert_eq!(strip_ansi_codes(&s), "▁abcd█ef");
+    }
+
+    #[test]
+    fn test_strip_ansi_preserves_unicode() {
+        let s = format!("{}▁▂▃{}▄▅▆▇█", ANSI_GREEN, ANSI_RESET);
+        assert_eq!(strip_ansi_codes(&s), "▁▂▃▄▅▆▇█");
+    }
+
+    // ======================================================================
+    //  render_sparkline 颜色编码测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_render_colored_positive_all_green() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![0.1, 0.3, 0.5];
+        let s = render_sparkline(&values, &config);
+        // 所有正值都应有绿色
+        assert!(s.contains(ANSI_GREEN));
+        assert!(!s.contains(ANSI_RED));
+        // strip 后应为纯 sparkline
+        let plain = strip_ansi_codes(&s);
+        assert_eq!(plain.chars().count(), 3);
+    }
+
+    #[test]
+    fn test_render_colored_negative_all_red() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![-0.5, -0.3, -0.1];
+        let s = render_sparkline(&values, &config);
+        // 所有负值都应有红色
+        assert!(s.contains(ANSI_RED));
+        assert!(!s.contains(ANSI_GREEN));
+        let plain = strip_ansi_codes(&s);
+        assert_eq!(plain.chars().count(), 3);
+    }
+
+    #[test]
+    fn test_render_colored_mixed() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![-0.2, 0.0, 0.3];
+        let s = render_sparkline(&values, &config);
+        // 应同时有绿色和红色
+        assert!(s.contains(ANSI_GREEN));
+        assert!(s.contains(ANSI_RED));
+        let plain = strip_ansi_codes(&s);
+        assert_eq!(plain.chars().count(), 3);
+    }
+
+    #[test]
+    fn test_render_colored_zero_no_color() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![0.0, 0.0, 0.0];
+        let s = render_sparkline(&values, &config);
+        // 零值不加颜色
+        assert!(!s.contains(ANSI_GREEN));
+        assert!(!s.contains(ANSI_RED));
+        assert_eq!(s, "▅▅▅"); // min==max → 0.5 → '▅'
+    }
+
+    #[test]
+    fn test_render_colored_none_mode_no_color() {
+        let config = SparklineConfig::new(40); // 默认 None
+        let values = vec![-0.2, 0.1, 0.3];
+        let s = render_sparkline(&values, &config);
+        // None 模式无颜色
+        assert!(!s.contains(ANSI_GREEN));
+        assert!(!s.contains(ANSI_RED));
+        assert!(!s.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_render_colored_backward_compat() {
+        // 默认配置应与之前行为一致 (无颜色)
+        let config = SparklineConfig::default();
+        let values = vec![0.0, 0.25, 0.5, 0.75, 1.0];
+        let s = render_sparkline(&values, &config);
+        assert_eq!(s, "▁▃▅▇█");
+    }
+
+    #[test]
+    fn test_render_colored_single_value() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let s = render_sparkline(&[0.5], &config);
+        // 正值单字符应有绿色
+        assert!(s.contains(ANSI_GREEN));
+        assert!(s.contains('▅'));
+        assert!(s.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_render_colored_single_value_negative() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let s = render_sparkline(&[-0.5], &config);
+        assert!(s.contains(ANSI_RED));
+        assert!(s.contains('▅'));
+    }
+
+    #[test]
+    fn test_render_colored_single_value_zero() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let s = render_sparkline(&[0.0], &config);
+        // 零值不加颜色
+        assert_eq!(s, "▅");
+    }
+
+    #[test]
+    fn test_render_colored_with_min_max() {
+        let config = SparklineConfig::new(40)
+            .with_min_max(true)
+            .with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![-0.2, 0.1, 0.3];
+        let s = render_sparkline(&values, &config);
+        // min/max 标注不应有颜色
+        assert!(s.contains("min"));
+        assert!(s.contains("max"));
+        // 但 sparkline 字符应有颜色
+        assert!(s.contains(ANSI_GREEN));
+        assert!(s.contains(ANSI_RED));
+    }
+
+    // ======================================================================
+    //  render_sparkline_with_range 颜色编码测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_render_with_range_colored_mixed() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![-1.0, 0.0, 1.0];
+        let s = render_sparkline_with_range(&values, -1.0, 1.0, &config);
+        assert!(s.contains(ANSI_GREEN));
+        assert!(s.contains(ANSI_RED));
+        let plain = strip_ansi_codes(&s);
+        assert_eq!(plain, "▁▅█");
+    }
+
+    #[test]
+    fn test_render_with_range_colored_none_mode() {
+        let config = SparklineConfig::new(40);
+        let values = vec![-1.0, 0.0, 1.0];
+        let s = render_sparkline_with_range(&values, -1.0, 1.0, &config);
+        assert_eq!(s, "▁▅█"); // 无颜色
+    }
+
+    // ======================================================================
+    //  format_trend_sparkline_with 颜色编码测试 (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_format_trend_with_colored_sparkline() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![0.1, -0.2, 0.3];
+        let line = format_trend_sparkline_with("差值", &values, &config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        assert!(line.contains("差值"));
+        // sparkline 有颜色
+        assert!(line.contains(ANSI_GREEN));
+        assert!(line.contains(ANSI_RED));
+        // first/last 值标签也应有颜色 (first=0.1 正→绿, last=0.3 正→绿)
+        let plain = strip_ansi_codes(&line);
+        assert!(plain.contains("+10.0%"));
+        assert!(plain.contains("+30.0%"));
+    }
+
+    #[test]
+    fn test_format_trend_with_colored_first_negative_last_positive() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let values = vec![-0.2, 0.1, 0.3];
+        let line = format_trend_sparkline_with("差值", &values, &config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        let plain = strip_ansi_codes(&line);
+        // first=-0.2 负→红, last=0.3 正→绿
+        assert!(line.contains(ANSI_RED));
+        assert!(line.contains(ANSI_GREEN));
+        assert!(plain.contains("-20.0%"));
+        assert!(plain.contains("+30.0%"));
+    }
+
+    #[test]
+    fn test_format_trend_with_colored_none_mode_backward_compat() {
+        let config = SparklineConfig::default();
+        let values = vec![0.3, 0.5, 0.7, 0.9];
+        let line1 = format_trend_sparkline("评分", &values, &config);
+        // 无颜色
+        assert!(!line1.contains(ANSI_GREEN));
+        assert!(!line1.contains(ANSI_RED));
+        assert!(!line1.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn test_format_trend_with_colored_single_value() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let line = format_trend_sparkline_with("差值", &[0.1], &config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        // 单个正值 → 绿色
+        assert!(line.contains(ANSI_GREEN));
+        let plain = strip_ansi_codes(&line);
+        assert!(plain.contains("+10.0%"));
+    }
+
+    #[test]
+    fn test_format_trend_with_colored_single_value_negative() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let line = format_trend_sparkline_with("差值", &[-0.1], &config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        assert!(line.contains(ANSI_RED));
+        let plain = strip_ansi_codes(&line);
+        assert!(plain.contains("-10.0%"));
+    }
+
+    #[test]
+    fn test_format_trend_with_colored_empty() {
+        let config = SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+        let line =
+            format_trend_sparkline_with("差值", &[], &config, |v| format!("{:+.1}%", v * 100.0));
+        // 空序列 → 占位符, 无颜色
+        assert!(line.contains("差值"));
+        assert!(line.contains("·"));
+        assert!(!line.contains(ANSI_GREEN));
+        assert!(!line.contains(ANSI_RED));
+    }
+
+    // ======================================================================
+    //  集成: strip_ansi_codes + render_sparkline (Session 96)
+    // ======================================================================
+
+    #[test]
+    fn test_integration_colored_strip_matches_plain() {
+        let values = vec![-0.3, 0.1, 0.0, -0.2, 0.4];
+        let plain_config = SparklineConfig::new(40);
+        let colored_config =
+            SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+
+        let plain = render_sparkline(&values, &plain_config);
+        let colored = render_sparkline(&values, &colored_config);
+        let stripped = strip_ansi_codes(&colored);
+
+        // strip 后应与无颜色版本一致
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn test_integration_colored_format_trend_strip_matches_plain() {
+        let values = vec![-0.2, 0.1, 0.3, -0.1, 0.2];
+        let plain_config = SparklineConfig::new(40);
+        let colored_config =
+            SparklineConfig::new(40).with_color_mode(SparklineColorMode::PositiveNegative);
+
+        let plain = format_trend_sparkline_with("差值", &values, &plain_config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        let colored = format_trend_sparkline_with("差值", &values, &colored_config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        let stripped = strip_ansi_codes(&colored);
+
+        assert_eq!(stripped, plain);
     }
 }

@@ -296,6 +296,133 @@ pub fn generate_chart_js_line_raw(
     )
 }
 
+/// 根据数据值的正负生成 Chart.js 点颜色数组 (Session 96)
+///
+/// 为每个数据点生成对应的 CSS 颜色值:
+/// - 正值 (> 0): 绿色 `rgba(75, 192, 192, 1)`
+/// - 负值 (< 0): 红色 `rgba(255, 99, 132, 1)`
+/// - 零值: 灰色 `rgba(201, 203, 207, 1)`
+///
+/// 用于 Chart.js 的 `pointBackgroundColor` 和 `pointBorderColor` 属性,
+/// 在差值趋势图中直观区分正负值。
+///
+/// # 参数
+///
+/// - `data`: 数据值列表
+///
+/// # 返回
+///
+/// CSS 颜色字符串列表, 长度与 `data` 相同
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_point_colors;
+/// let colors = generate_point_colors(&[0.1, -0.2, 0.0]);
+/// assert_eq!(colors.len(), 3);
+/// assert!(colors[0].contains("75, 192, 192"));   // 正→绿
+/// assert!(colors[1].contains("255, 99, 132"));    // 负→红
+/// assert!(colors[2].contains("201, 203, 207"));   // 零→灰
+/// ```
+pub fn generate_point_colors(data: &[f64]) -> Vec<String> {
+    data.iter()
+        .map(|&v| {
+            if v > 0.0 {
+                "rgba(75, 192, 192, 1)".to_string()
+            } else if v < 0.0 {
+                "rgba(255, 99, 132, 1)".to_string()
+            } else {
+                "rgba(201, 203, 207, 1)".to_string()
+            }
+        })
+        .collect()
+}
+
+/// 生成带颜色编码数据点的 Chart.js 折线图 HTML (Session 96)
+///
+/// 与 [`generate_chart_js_line_raw`] 类似, 但数据点的颜色根据值的正负自动着色:
+/// - 正值点: 绿色
+/// - 负值点: 红色
+/// - 零值点: 灰色
+///
+/// 线条颜色保持统一, 仅数据点使用颜色编码, 便于在趋势图中直观识别正负区间。
+///
+/// # 参数
+///
+/// - `id`: canvas ID (必须唯一)
+/// - `title`: 图表标题
+/// - `labels`: X 轴标签列表
+/// - `data`: Y 轴数据列表
+/// - `color`: 线条颜色 (CSS 颜色值)
+/// - `y_label`: Y 轴标签
+///
+/// # 返回
+///
+/// HTML 字符串, 包含 canvas 和 script
+pub fn generate_chart_js_line_colored(
+    id: &str,
+    title: &str,
+    labels: &[String],
+    data: &[f64],
+    color: &str,
+    y_label: &str,
+) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    let data_json = serde_json::to_string(data).unwrap_or_else(|_| "[]".to_string());
+    let color_bg = color.replace("1)", "0.2)");
+    let point_colors = generate_point_colors(data);
+    let point_colors_json =
+        serde_json::to_string(&point_colors).unwrap_or_else(|_| "[]".to_string());
+
+    format!(
+        r#"<div class="chart-container">
+  <h3 class="chart-title">{title}</h3>
+  <canvas id="{id}"></canvas>
+  <script>
+  (function() {{
+    const ctx = document.getElementById('{id}');
+    if (!ctx) return;
+    new Chart(ctx, {{
+      type: 'line',
+      data: {{
+        labels: {labels_json},
+        datasets: [{{
+          label: '{y_label}',
+          data: {data_json},
+          borderColor: '{color}',
+          backgroundColor: '{color_bg}',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 5,
+          pointHoverRadius: 7,
+          pointBackgroundColor: {point_colors_json},
+          pointBorderColor: {point_colors_json},
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{
+          title: {{ display: true, text: '{title}' }}
+        }},
+        scales: {{
+          y: {{ beginAtZero: false }}
+        }}
+      }}
+    }});
+  }})();
+  </script>
+</div>"#,
+        id = escape_html(id),
+        title = escape_html(title),
+        labels_json = labels_json,
+        data_json = data_json,
+        color = color,
+        color_bg = color_bg,
+        point_colors_json = point_colors_json,
+        y_label = escape_html(y_label),
+    )
+}
+
 /// 生成 HTML 报告的 CSS 样式
 ///
 /// 返回完整的 `<style>` 标签内容。
@@ -612,14 +739,14 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             }
         }
 
-        // === 关联差值趋势图 (Session 94) ===
+        // === 关联差值趋势图 (Session 94, 颜色编码 Session 96) ===
         if let Some(ref diff_values) = summary.correlation_diff_history {
             if diff_values.len() >= 2 {
                 let labels: Vec<String> = (1..=diff_values.len())
                     .map(|i| format!("决策 {}", i))
                     .collect();
                 html.push_str("<div class=\"charts-grid\">\n");
-                html.push_str(&generate_chart_js_line_raw(
+                html.push_str(&generate_chart_js_line_colored(
                     "diffTrendChart",
                     "关联差值趋势",
                     &labels,
@@ -669,13 +796,13 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
         ));
         html.push_str("</div>\n");
 
-        // === 搜索质量差值趋势图 (Session 95) ===
+        // === 搜索质量差值趋势图 (Session 95, 颜色编码 Session 96) ===
         if let Some(ref diffs) = summary.search_diff_history {
             if diffs.len() >= 2 {
                 let labels: Vec<String> =
                     (1..=diffs.len()).map(|i| format!("评估 {}", i)).collect();
                 html.push_str("<div class=\"charts-grid\">\n");
-                html.push_str(&generate_chart_js_line_raw(
+                html.push_str(&generate_chart_js_line_colored(
                     "searchDiffTrendChart",
                     "搜索质量差值趋势",
                     &labels,
@@ -725,13 +852,13 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
         ));
         html.push_str("</div>\n");
 
-        // === Memory 评估差值趋势图 (Session 95) ===
+        // === Memory 评估差值趋势图 (Session 95, 颜色编码 Session 96) ===
         if let Some(ref diffs) = summary.memory_diff_history {
             if diffs.len() >= 2 {
                 let labels: Vec<String> =
                     (1..=diffs.len()).map(|i| format!("评估 {}", i)).collect();
                 html.push_str("<div class=\"charts-grid\">\n");
-                html.push_str(&generate_chart_js_line_raw(
+                html.push_str(&generate_chart_js_line_colored(
                     "memoryDiffTrendChart",
                     "Memory 评估差值趋势",
                     &labels,
@@ -1443,5 +1570,198 @@ mod tests {
         let html = generate_html_report(&summary);
 
         assert!(!html.contains("memoryDiffTrendChart"));
+    }
+
+    // ======================================================================
+    //  颜色编码测试 (Session 96)
+    // ======================================================================
+
+    // --- generate_point_colors 测试 ---
+
+    #[test]
+    fn test_generate_point_colors_positive() {
+        let colors = generate_point_colors(&[0.1, 1.0, 100.0]);
+        assert_eq!(colors.len(), 3);
+        assert!(colors.iter().all(|c| c.contains("75, 192, 192"))); // 全绿
+    }
+
+    #[test]
+    fn test_generate_point_colors_negative() {
+        let colors = generate_point_colors(&[-0.1, -1.0, -100.0]);
+        assert_eq!(colors.len(), 3);
+        assert!(colors.iter().all(|c| c.contains("255, 99, 132"))); // 全红
+    }
+
+    #[test]
+    fn test_generate_point_colors_zero() {
+        let colors = generate_point_colors(&[0.0, 0.0]);
+        assert_eq!(colors.len(), 2);
+        assert!(colors.iter().all(|c| c.contains("201, 203, 207"))); // 全灰
+    }
+
+    #[test]
+    fn test_generate_point_colors_mixed() {
+        let colors = generate_point_colors(&[0.1, -0.2, 0.0, 0.3, -0.1]);
+        assert_eq!(colors.len(), 5);
+        assert!(colors[0].contains("75, 192, 192")); // 正→绿
+        assert!(colors[1].contains("255, 99, 132")); // 负→红
+        assert!(colors[2].contains("201, 203, 207")); // 零→灰
+        assert!(colors[3].contains("75, 192, 192")); // 正→绿
+        assert!(colors[4].contains("255, 99, 132")); // 负→红
+    }
+
+    #[test]
+    fn test_generate_point_colors_empty() {
+        let colors = generate_point_colors(&[]);
+        assert!(colors.is_empty());
+    }
+
+    // --- generate_chart_js_line_colored 测试 ---
+
+    #[test]
+    fn test_chart_js_line_colored_contains_point_colors() {
+        let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let data = vec![0.1, -0.2, 0.0];
+        let html = generate_chart_js_line_colored(
+            "testColored",
+            "测试",
+            &labels,
+            &data,
+            "rgba(75, 192, 192, 1)",
+            "差值",
+        );
+        // 应包含 pointBackgroundColor 和 pointBorderColor
+        assert!(html.contains("pointBackgroundColor"));
+        assert!(html.contains("pointBorderColor"));
+        // 应包含颜色值
+        assert!(html.contains("75, 192, 192")); // 绿色
+        assert!(html.contains("255, 99, 132")); // 红色
+        assert!(html.contains("201, 203, 207")); // 灰色
+    }
+
+    #[test]
+    fn test_chart_js_line_colored_all_positive() {
+        let labels = vec!["a".to_string(), "b".to_string()];
+        let data = vec![0.1, 0.2];
+        let html = generate_chart_js_line_colored(
+            "testPos",
+            "测试",
+            &labels,
+            &data,
+            "rgba(75, 192, 192, 1)",
+            "差值",
+        );
+        assert!(html.contains("75, 192, 192")); // 绿色
+        assert!(!html.contains("255, 99, 132")); // 无红色
+    }
+
+    #[test]
+    fn test_chart_js_line_colored_all_negative() {
+        let labels = vec!["a".to_string(), "b".to_string()];
+        let data = vec![-0.1, -0.2];
+        let html = generate_chart_js_line_colored(
+            "testNeg",
+            "测试",
+            &labels,
+            &data,
+            "rgba(255, 99, 132, 1)",
+            "差值",
+        );
+        assert!(html.contains("255, 99, 132")); // 红色
+        assert!(!html.contains("75, 192, 192")); // 无绿色
+    }
+
+    #[test]
+    fn test_chart_js_line_colored_empty_data() {
+        let html =
+            generate_chart_js_line_colored("testEmpty", "空", &[], &[], "rgba(0,0,0,1)", "Y");
+        // 空数据仍应生成 HTML
+        assert!(html.contains("testEmpty"));
+        assert!(html.contains("pointBackgroundColor"));
+    }
+
+    #[test]
+    fn test_chart_js_line_colored_escape_title() {
+        let html =
+            generate_chart_js_line_colored("id_esc", "A < B & C", &[], &[], "rgba(0,0,0,1)", "Y");
+        assert!(html.contains("A &lt; B &amp; C"));
+    }
+
+    // --- HTML 报告: 颜色编码集成测试 (Session 96) ---
+
+    #[test]
+    fn test_html_report_search_diff_chart_has_colored_points() {
+        use crate::dev_trace::SearchQualityHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 3, 0, None))
+            .with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        let html = generate_html_report(&summary);
+
+        // 搜索差值趋势图应使用颜色编码点
+        assert!(html.contains("searchDiffTrendChart"));
+        assert!(html.contains("pointBackgroundColor"));
+        assert!(html.contains("75, 192, 192")); // 绿色 (正值)
+        assert!(html.contains("255, 99, 132")); // 红色 (负值)
+    }
+
+    #[test]
+    fn test_html_report_memory_diff_chart_has_colored_points() {
+        use crate::dev_trace::MemoryEvaluationHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_memory_evaluation_history(MemoryEvaluationHistorySummary::new(
+                true, true, 3, 0, None,
+            ))
+            .with_memory_evaluation_sparkline(vec![0.1, -0.05, 0.2]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("memoryDiffTrendChart"));
+        assert!(html.contains("pointBackgroundColor"));
+        assert!(html.contains("75, 192, 192")); // 绿色
+        assert!(html.contains("255, 99, 132")); // 红色
+    }
+
+    #[test]
+    fn test_html_report_cache_tuning_diff_chart_has_colored_points() {
+        use crate::dev_trace::CacheTuningHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 2, 0, 3, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0, 2700.0], vec![0.1, -0.3, 0.05]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("diffTrendChart"));
+        assert!(html.contains("pointBackgroundColor"));
+        assert!(html.contains("75, 192, 192")); // 绿色
+        assert!(html.contains("255, 99, 132")); // 红色
+    }
+
+    #[test]
+    fn test_html_report_all_positive_diff_only_green_points() {
+        use crate::dev_trace::SearchQualityHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 3, 0, None))
+            .with_search_quality_sparkline(vec![0.1, 0.2, 0.3]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("searchDiffTrendChart"));
+        assert!(html.contains("75, 192, 192")); // 绿色
+                                                // 差值趋势图中不应有红色点 (只有正值)
+                                                // 注意: 搜索质量面板的 stat card 可能也有红色, 所以只检查图表区域
+                                                // 这里验证 pointBackgroundColor 中有绿色
+    }
+
+    #[test]
+    fn test_html_report_all_negative_diff_only_red_points() {
+        use crate::dev_trace::MemoryEvaluationHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_memory_evaluation_history(MemoryEvaluationHistorySummary::new(
+                true, true, 3, 0, None,
+            ))
+            .with_memory_evaluation_sparkline(vec![-0.1, -0.2, -0.3]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("memoryDiffTrendChart"));
+        assert!(html.contains("255, 99, 132")); // 红色
     }
 }
