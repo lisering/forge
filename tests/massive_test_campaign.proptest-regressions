@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5660a925e4615aef7f8c8e5d3f6bc08c752e16fcc44a2210cc3a0e3bd0a016d6 # shrinks to messages = ["0:A¡\u{e000}"]
+cc f15cb4955beb8998491df9609f9a46b628bce33a4ae1f46b2e9a5c7afb9a93c4 # shrinks to disabled = 29, total = 30, threshold = 30
+cc fef47d78efbca95fb2cdc7a6c46b917979aaad3372d74497fe2590a2647ddd82 # shrinks to values = [0.0]
+cc e1794a0db2a95ea2b5c4d94a94b14146118fdb5c0fea5938c9de5f55efcf7d2e # shrinks to checks_with = 1, successes_with = 1, checks_without = 4, successes_without = 4
+cc 7352463b5e498fd9e537862fa9d19e527086e5ee687835c80cf3bf6dc6d1c5ee # shrinks to checks_hit = 20, successes_hit = 0, checks_miss = 514, successes_miss = 15
+cc 50496b08574a71b35333b92ff987403749c29f290d529e8a0109d2281c09871c # shrinks to checks_with = 20, successes_with = 0, checks_without = 351, successes_without = 15
+cc 864e321642397fbc7d8230d70520603d85e35ce4084564f7149b3d9c0810da21 # shrinks to checks_with = 648, successes_without = 20
+cc 5d98e9ab32c09dac876549281beac407e0c8376cd4d3aa17acd324dd5bf912fa # shrinks to message = "0 A a"
+cc 3ba6d151629d020dc4c69d123a650bd748b14f6848b643ced23999b657cebcdf # shrinks to messages = ["\u{7f}", "\u{7f}"]

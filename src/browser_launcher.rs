@@ -787,9 +787,13 @@ mod tests {
     }
 
     // ===== browser_from_env 测试 =====
+    // 使用 Mutex 串行化, 避免并行测试时环境变量竞争
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_browser_from_env_not_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // 确保环境变量未设置 (可能影响其他测试, 先保存)
         let saved = std::env::var_os("FORGE_BROWSER");
         std::env::remove_var("FORGE_BROWSER");
@@ -804,6 +808,7 @@ mod tests {
 
     #[test]
     fn test_browser_from_env_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_BROWSER");
         std::env::set_var("FORGE_BROWSER", "/custom/browser/path");
 
