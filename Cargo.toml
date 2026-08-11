@@ -63,6 +63,22 @@ harness = false
 name = "search_cache_performance"
 harness = false
 
+[[bench]]
+name = "search_quality_performance"
+harness = false
+
+[[bench]]
+name = "memory_evaluation_performance"
+harness = false
+
+[[bench]]
+name = "live_continuation_performance"
+harness = false
+
+[[bench]]
+name = "radix_tree_performance"
+harness = false
+
 # ── docs.rs 官方文档配置 ──────────────────────────────────
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]
