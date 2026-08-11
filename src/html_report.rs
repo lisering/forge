@@ -221,6 +221,81 @@ pub fn generate_chart_js_bar(
     )
 }
 
+/// 生成 Chart.js 折线图 HTML (自动 Y 轴范围)
+///
+/// 与 [`generate_chart_js_line`] 类似, 但 Y 轴不强制 0.0~1.0 范围,
+/// 也不使用百分比刻度。适用于 TTL 秒数、带符号差值等非百分比数据。
+///
+/// # 参数
+///
+/// - `id`: canvas ID (必须唯一)
+/// - `title`: 图表标题
+/// - `labels`: X 轴标签列表
+/// - `data`: Y 轴数据列表
+/// - `color`: 线条颜色 (CSS 颜色值)
+/// - `y_label`: Y 轴标签
+///
+/// # 返回
+///
+/// HTML 字符串, 包含 canvas 和 script
+pub fn generate_chart_js_line_raw(
+    id: &str,
+    title: &str,
+    labels: &[String],
+    data: &[f64],
+    color: &str,
+    y_label: &str,
+) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    let data_json = serde_json::to_string(data).unwrap_or_else(|_| "[]".to_string());
+    let color_bg = color.replace("1)", "0.2)");
+
+    format!(
+        r#"<div class="chart-container">
+  <h3 class="chart-title">{title}</h3>
+  <canvas id="{id}"></canvas>
+  <script>
+  (function() {{
+    const ctx = document.getElementById('{id}');
+    if (!ctx) return;
+    new Chart(ctx, {{
+      type: 'line',
+      data: {{
+        labels: {labels_json},
+        datasets: [{{
+          label: '{y_label}',
+          data: {data_json},
+          borderColor: '{color}',
+          backgroundColor: '{color_bg}',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{
+          title: {{ display: true, text: '{title}' }}
+        }},
+        scales: {{
+          y: {{ beginAtZero: false }}
+        }}
+      }}
+    }});
+  }})();
+  </script>
+</div>"#,
+        id = escape_html(id),
+        title = escape_html(title),
+        labels_json = labels_json,
+        data_json = data_json,
+        color = color,
+        color_bg = color_bg,
+        y_label = escape_html(y_label),
+    )
+}
+
 /// 生成 HTML 报告的 CSS 样式
 ///
 /// 返回完整的 `<style>` 标签内容。
@@ -517,6 +592,44 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             "purple",
         ));
         html.push_str("</div>\n");
+
+        // === TTL 变化趋势图 (Session 94) ===
+        if let Some(ref ttl_values) = summary.ttl_history_values {
+            if ttl_values.len() >= 2 {
+                let labels: Vec<String> = (1..=ttl_values.len())
+                    .map(|i| format!("决策 {}", i))
+                    .collect();
+                html.push_str("<div class=\"charts-grid\">\n");
+                html.push_str(&generate_chart_js_line_raw(
+                    "ttlTrendChart",
+                    "TTL 变化趋势",
+                    &labels,
+                    ttl_values,
+                    "rgba(54, 162, 235, 1)",
+                    "TTL (秒)",
+                ));
+                html.push_str("</div>\n");
+            }
+        }
+
+        // === 关联差值趋势图 (Session 94) ===
+        if let Some(ref diff_values) = summary.correlation_diff_history {
+            if diff_values.len() >= 2 {
+                let labels: Vec<String> = (1..=diff_values.len())
+                    .map(|i| format!("决策 {}", i))
+                    .collect();
+                html.push_str("<div class=\"charts-grid\">\n");
+                html.push_str(&generate_chart_js_line_raw(
+                    "diffTrendChart",
+                    "关联差值趋势",
+                    &labels,
+                    diff_values,
+                    "rgba(255, 99, 132, 1)",
+                    "差值",
+                ));
+                html.push_str("</div>\n");
+            }
+        }
     }
 
     // === 搜索质量历史 ===
@@ -1094,5 +1207,130 @@ mod tests {
         assert!(html.contains("</head>"));
         assert!(html.contains("<body>"));
         assert!(html.contains("</body>"));
+    }
+
+    // ======================================================================
+    //  generate_chart_js_line_raw 测试 (Session 94)
+    // ======================================================================
+
+    #[test]
+    fn test_chart_js_line_raw_basic() {
+        let labels = vec!["D1".to_string(), "D2".to_string(), "D3".to_string()];
+        let data = vec![1800.0, 2700.0, 3600.0];
+        let html = generate_chart_js_line_raw(
+            "rawChart",
+            "TTL 趋势",
+            &labels,
+            &data,
+            "rgba(54, 162, 235, 1)",
+            "TTL (秒)",
+        );
+        assert!(html.contains("rawChart"));
+        assert!(html.contains("TTL 趋势"));
+        assert!(html.contains("line"));
+        assert!(html.contains("1800"));
+        assert!(html.contains("3600"));
+    }
+
+    #[test]
+    fn test_chart_js_line_raw_no_max_constraint() {
+        // 不应包含 max: 1.0 百分比约束
+        let html = generate_chart_js_line_raw(
+            "rawNoMax",
+            "原始",
+            &["A".to_string()],
+            &[100.0],
+            "rgba(0,0,0,1)",
+            "值",
+        );
+        assert!(!html.contains("max: 1.0"));
+        assert!(!html.contains("toFixed(0) + '%'"));
+    }
+
+    #[test]
+    fn test_chart_js_line_raw_empty_data() {
+        let html = generate_chart_js_line_raw("rawEmpty", "空", &[], &[], "rgba(0,0,0,1)", "无");
+        assert!(html.contains("[]"));
+    }
+
+    #[test]
+    fn test_chart_js_line_raw_with_negative_values() {
+        let labels = vec!["D1".to_string(), "D2".to_string(), "D3".to_string()];
+        let data = vec![0.1, -0.2, -0.5];
+        let html = generate_chart_js_line_raw(
+            "negChart",
+            "差值趋势",
+            &labels,
+            &data,
+            "rgba(255, 99, 132, 1)",
+            "差值",
+        );
+        assert!(html.contains("negChart"));
+        assert!(html.contains("-0.2"));
+    }
+
+    #[test]
+    fn test_chart_js_line_raw_escape_title() {
+        let html = generate_chart_js_line_raw("id2", "A < B & C", &[], &[], "rgba(0,0,0,1)", "Y");
+        assert!(html.contains("A &lt; B &amp; C"));
+    }
+
+    // ======================================================================
+    //  HTML 报告: 缓存调优 sparkline 测试 (Session 94)
+    // ======================================================================
+
+    #[test]
+    fn test_html_report_with_ttl_trend_chart() {
+        use crate::dev_trace::CacheTuningHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 2, 0, 3, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0, 2700.0], vec![0.1, 0.3, 0.05]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("ttlTrendChart"));
+        assert!(html.contains("TTL 变化趋势"));
+        assert!(html.contains("1800"));
+    }
+
+    #[test]
+    fn test_html_report_with_diff_trend_chart() {
+        use crate::dev_trace::CacheTuningHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 2, 0, 3, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0, 2700.0], vec![0.1, 0.3, 0.05]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("diffTrendChart"));
+        assert!(html.contains("关联差值趋势"));
+    }
+
+    #[test]
+    fn test_html_report_no_ttl_chart_without_data() {
+        use crate::dev_trace::CacheTuningHistorySummary;
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None),
+        );
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("ttlTrendChart"));
+        assert!(!html.contains("diffTrendChart"));
+    }
+
+    #[test]
+    fn test_html_report_no_ttl_chart_with_single_value() {
+        use crate::dev_trace::CacheTuningHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 1800, true, 0, 0, 1, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0], vec![0.05]);
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("ttlTrendChart"));
+        assert!(!html.contains("diffTrendChart"));
     }
 }

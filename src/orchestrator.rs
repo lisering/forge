@@ -22,7 +22,7 @@
 //! - `VersionManager` — 封装快照保存/回滚操作
 
 use crate::auto_recovery::{AutoRecovery, RecoveryConfig};
-use crate::cache_tuning::CacheTuner;
+use crate::cache_tuning::{extract_correlation_diffs, extract_ttl_trajectory, CacheTuner};
 use crate::clarify::HeuristicClarificationChecker;
 use crate::connection_monitor::ConnectionMonitor;
 use crate::context_handoff::ContextHandoff;
@@ -3177,6 +3177,13 @@ where
                     h.saved_at.clone(),
                 );
                 summary = summary.with_cache_tuning_history(ct_summary);
+
+                // 附加缓存调优 sparkline 数据 (Session 94)
+                let ttl_values = extract_ttl_trajectory(&h.decisions);
+                let diff_values = extract_correlation_diffs(&h.decisions);
+                if !ttl_values.is_empty() || !diff_values.is_empty() {
+                    summary = summary.with_cache_tuning_sparkline(ttl_values, diff_values);
+                }
             }
 
             // 附加搜索质量历史摘要 (Session 87)
@@ -9039,6 +9046,149 @@ mod tests {
         assert!(content.contains("修复率趋势"));
         assert!(content.contains("synergyScoreChart"));
         assert!(content.contains("fixRateChart"));
+    }
+
+    // ===== Session 94: 缓存调优 sparkline 集成测试 =====
+
+    #[test]
+    fn test_final_report_extracts_cache_tuning_sparkline_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 模拟调优决策
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let d1 = crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&d1);
+            let d2 =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(2700, 3600, 0.10, "再次延长");
+            tuner.apply_decision(&d2);
+        }
+
+        orch.final_report().unwrap();
+
+        // 验证 DevTraceSummary JSON 包含 sparkline 数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json_content.contains("ttl_history_values"),
+            "JSON 应包含 ttl_history_values 字段"
+        );
+        assert!(
+            json_content.contains("correlation_diff_history"),
+            "JSON 应包含 correlation_diff_history 字段"
+        );
+        assert!(json_content.contains("2700"), "JSON 应包含 TTL 值 2700");
+    }
+
+    #[test]
+    fn test_final_report_no_sparkline_without_decisions() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 不添加任何调优决策
+        orch.final_report().unwrap();
+
+        // JSON 应存在但不包含 sparkline 数据 (或包含空数组)
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        // 没有决策时, ttl_history_values 可能为 null 或不存在
+        // 关键是不应崩溃
+    }
+
+    #[test]
+    fn test_final_report_html_contains_ttl_trend_chart() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 模拟调优决策
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let d1 = crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&d1);
+            let d2 =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(2700, 3600, 0.10, "再次延长");
+            tuner.apply_decision(&d2);
+        }
+
+        orch.final_report().unwrap();
+
+        // HTML 报告应包含 TTL 趋势图
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            content.contains("ttlTrendChart"),
+            "HTML 应包含 TTL 趋势图 canvas"
+        );
+        assert!(
+            content.contains("TTL 变化趋势"),
+            "HTML 应包含 TTL 变化趋势标题"
+        );
+    }
+
+    #[test]
+    fn test_final_report_html_contains_diff_trend_chart() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 模拟调优决策
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let d1 = crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 2700, 0.33, "延长");
+            tuner.apply_decision(&d1);
+            let d2 =
+                crate::cache_tuning::CacheTuningDecision::adjust_ttl(2700, 3600, -0.10, "缩短");
+            tuner.apply_decision(&d2);
+        }
+
+        orch.final_report().unwrap();
+
+        // HTML 报告应包含关联差值趋势图
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            content.contains("diffTrendChart"),
+            "HTML 应包含关联差值趋势图 canvas"
+        );
+        assert!(
+            content.contains("关联差值趋势"),
+            "HTML 应包含关联差值趋势标题"
+        );
+    }
+
+    #[test]
+    fn test_final_report_sparkline_with_disable_decision() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_tuning(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 模拟禁用决策
+        if let Some(ref mut tuner) = orch.cache_tuner {
+            let d1 = crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 900, -0.10, "缩短");
+            tuner.apply_decision(&d1);
+            let d2 = crate::cache_tuning::CacheTuningDecision::disable_cache(900, -0.20, "缓存有害");
+            tuner.apply_decision(&d2);
+        }
+
+        orch.final_report().unwrap();
+
+        // 验证 JSON 包含 sparkline 数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json_content.contains("ttl_history_values"),
+            "JSON 应包含 ttl_history_values 字段"
+        );
     }
 }
 

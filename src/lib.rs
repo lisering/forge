@@ -124,11 +124,12 @@ pub use browser_launcher::{
     is_browser_running, is_port_available_sync, BrowserLauncher,
 };
 pub use cache_tuning::{
-    compute_new_ttl, has_sufficient_data, make_tuning_decision, should_adjust_ttl,
-    should_disable_cache, CacheTuner, CacheTuningConfig, CacheTuningDecision, CacheTuningHistory,
-    TuningAction, DEFAULT_DISABLE_THRESHOLD, DEFAULT_INCREASE_TTL_THRESHOLD, DEFAULT_MAX_TTL_SECS,
-    DEFAULT_MIN_SAMPLES, DEFAULT_MIN_TTL_SECS, DEFAULT_REDUCE_TTL_THRESHOLD,
-    DEFAULT_TTL_INCREASE_FACTOR, DEFAULT_TTL_REDUCE_FACTOR, TUNING_HISTORY_FILENAME,
+    compute_new_ttl, extract_correlation_diffs, extract_ttl_trajectory, has_sufficient_data,
+    make_tuning_decision, should_adjust_ttl, should_disable_cache, CacheTuner, CacheTuningConfig,
+    CacheTuningDecision, CacheTuningHistory, TuningAction, DEFAULT_DISABLE_THRESHOLD,
+    DEFAULT_INCREASE_TTL_THRESHOLD, DEFAULT_MAX_TTL_SECS, DEFAULT_MIN_SAMPLES,
+    DEFAULT_MIN_TTL_SECS, DEFAULT_REDUCE_TTL_THRESHOLD, DEFAULT_TTL_INCREASE_FACTOR,
+    DEFAULT_TTL_REDUCE_FACTOR, TUNING_HISTORY_FILENAME,
 };
 pub use cancellation_token::{CancelError, CancellationToken, CancellationTokenSource};
 pub use chat::{ChatMessage, ChatSession, TimeoutConfig};
@@ -186,8 +187,9 @@ pub use evaluator_synergy::{
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
-    generate_chart_js_bar, generate_chart_js_line, generate_css_styles, generate_html_report,
-    generate_html_report_file, generate_stat_card, HTML_REPORT_FORMAT_VERSION,
+    generate_chart_js_bar, generate_chart_js_line, generate_chart_js_line_raw, generate_css_styles,
+    generate_html_report, generate_html_report_file, generate_stat_card,
+    HTML_REPORT_FORMAT_VERSION,
 };
 pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteraction};
 pub use language::{
@@ -257,8 +259,8 @@ pub use slash_command::{
 };
 pub use sparkline::{
     compute_sparkline_stats, escape_html, format_multi_sparkline, format_trend_sparkline,
-    map_value_to_char, normalize_value, render_percentage_sparkline, render_sparkline,
-    render_sparkline_with_range, SparklineConfig, SparklineStats, TrendDirection,
+    format_trend_sparkline_with, map_value_to_char, normalize_value, render_percentage_sparkline,
+    render_sparkline, render_sparkline_with_range, SparklineConfig, SparklineStats, TrendDirection,
     DEFAULT_FILL_CHAR, DEFAULT_SPARKLINE_MAX_WIDTH, SPARKLINE_CHARS,
     SPARKLINE_CHARS as SPARKLINE_BLOCK_CHARS, TREND_THRESHOLD,
 };

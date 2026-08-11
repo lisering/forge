@@ -2630,6 +2630,20 @@ pub struct DevTraceSummary {
     /// `None` 表示没有历史数据或未启用 sparkline 可视化。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_rate_history: Option<Vec<f64>>,
+
+    /// 缓存调优 TTL 变化轨迹 (Session 94) — 用于 sparkline 可视化
+    ///
+    /// 存储每次调优决策后的 TTL 值 (秒), 用于在报告中渲染 ASCII sparkline。
+    /// `None` 表示没有调优历史或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_history_values: Option<Vec<f64>>,
+
+    /// 缓存调优关联差值历史 (Session 94) — 用于 sparkline 可视化
+    ///
+    /// 存储每次调优决策的关联差值 (-1.0~1.0), 用于在报告中渲染 ASCII sparkline。
+    /// `None` 表示没有调优历史或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_diff_history: Option<Vec<f64>>,
 }
 
 impl DevTraceSummary {
@@ -2654,6 +2668,8 @@ impl DevTraceSummary {
             evaluator_synergy_history_summary: None,
             synergy_score_history: None,
             fix_rate_history: None,
+            ttl_history_values: None,
+            correlation_diff_history: None,
         }
     }
 
@@ -2750,6 +2766,8 @@ impl DevTraceSummary {
             evaluator_synergy_history_summary: None,
             synergy_score_history: None,
             fix_rate_history: None,
+            ttl_history_values: None,
+            correlation_diff_history: None,
         }
     }
 
@@ -2833,6 +2851,24 @@ impl DevTraceSummary {
     pub fn with_synergy_sparkline(mut self, scores: Vec<f64>, fix_rates: Vec<f64>) -> Self {
         self.synergy_score_history = Some(scores);
         self.fix_rate_history = Some(fix_rates);
+        self
+    }
+
+    /// 附加缓存调优 TTL 和关联差值历史列表 (Session 94)
+    ///
+    /// 用于在 `to_report()` 中渲染 ASCII sparkline 趋势图。
+    ///
+    /// # 参数
+    ///
+    /// - `ttl_values`: 每次调优决策后的 TTL 值列表 (秒)
+    /// - `diff_values`: 每次调优决策的关联差值列表 (-1.0~1.0)
+    pub fn with_cache_tuning_sparkline(
+        mut self,
+        ttl_values: Vec<f64>,
+        diff_values: Vec<f64>,
+    ) -> Self {
+        self.ttl_history_values = Some(ttl_values);
+        self.correlation_diff_history = Some(diff_values);
         self
     }
 
@@ -3022,6 +3058,39 @@ impl DevTraceSummary {
                     tuning.avg_correlation_diff() * 100.0
                 ));
             }
+
+            // === Sparkline 可视化 (Session 94) ===
+            // 关联差值趋势
+            if tuning.correlation_diffs.len() >= 2 {
+                let config = crate::sparkline::SparklineConfig::new(40);
+                report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                    "  差值趋势图",
+                    &tuning.correlation_diffs,
+                    &config,
+                    |v| format!("{:+.1}%", v * 100.0),
+                ));
+                report.push('\n');
+            }
+            // TTL 变化轨迹
+            if !tuning.ttl_history.is_empty() {
+                let mut ttl_values: Vec<f64> = Vec::with_capacity(tuning.ttl_history.len() + 1);
+                if let Some(initial) = tuning.initial_ttl() {
+                    ttl_values.push(initial as f64);
+                }
+                for (_, new_ttl) in &tuning.ttl_history {
+                    ttl_values.push(*new_ttl as f64);
+                }
+                if ttl_values.len() >= 2 {
+                    let config = crate::sparkline::SparklineConfig::new(40);
+                    report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                        "  TTL 轨迹图",
+                        &ttl_values,
+                        &config,
+                        |v| format!("{}s", v as u64),
+                    ));
+                    report.push('\n');
+                }
+            }
         }
 
         // === 搜索质量评估 (Session 85) ===
@@ -3119,6 +3188,32 @@ impl DevTraceSummary {
             report.push_str(&format!("  决策记录: {} 条\n", cth.decision_count));
             if let Some(ref saved_at) = cth.saved_at {
                 report.push_str(&format!("  保存时间: {}\n", saved_at));
+            }
+
+            // === Sparkline 可视化 (Session 94) ===
+            if let Some(ref ttl_values) = self.ttl_history_values {
+                if ttl_values.len() >= 2 {
+                    let config = crate::sparkline::SparklineConfig::new(40);
+                    report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                        "  TTL 历史图",
+                        ttl_values,
+                        &config,
+                        |v| format!("{}s", v as u64),
+                    ));
+                    report.push('\n');
+                }
+            }
+            if let Some(ref diff_values) = self.correlation_diff_history {
+                if diff_values.len() >= 2 {
+                    let config = crate::sparkline::SparklineConfig::new(40);
+                    report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                        "  差值历史图",
+                        diff_values,
+                        &config,
+                        |v| format!("{:+.1}%", v * 100.0),
+                    ));
+                    report.push('\n');
+                }
             }
         }
 
@@ -10048,6 +10143,215 @@ mod tests {
         assert!(report.contains("最终状态: 禁用"));
         assert!(report.contains("初始 TTL: 1800s"));
         assert!(report.contains("最终 TTL: 2700s"));
+    }
+
+    // --- to_report: 缓存调优 sparkline 测试 (Session 94) ---
+
+    #[test]
+    fn test_to_report_cache_tuning_diff_sparkline() {
+        // 3 次评估, 差值各不同 → 应渲染差值趋势 sparkline
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=1/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 -10.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("差值趋势图"));
+        // sparkline 字符应出现
+        assert!(report.contains('▁') || report.contains('▃') || report.contains('▅'));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_ttl_sparkline() {
+        // 2 次 TTL 调整 → 应渲染 TTL 轨迹 sparkline
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 1800s → 2700s (差值 +67.0%, 原因: 缓存有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=3/3 miss=1/3",
+                "缓存调优: 调整 TTL: 2700s → 4050s (差值 +80.0%, 原因: 缓存有效)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(report.contains("TTL 轨迹图"));
+        assert!(report.contains("1800s"));
+        assert!(report.contains("4050s"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_no_sparkline_single_diff() {
+        // 只有 1 次评估 → 不渲染差值 sparkline
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CacheTuning,
+            None,
+            None,
+            None,
+            "hit=2/3 miss=3/3",
+            "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+            0,
+            true,
+            None,
+        )];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("差值趋势图"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_no_sparkline_no_ttl_adjust() {
+        // 只有 KeepCurrent, 无 TTL 调整 → 不渲染 TTL sparkline
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                None,
+                None,
+                None,
+                "hit=2/3 miss=3/3",
+                "缓存调优: 保持当前配置 (差值 +10.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("TTL 轨迹图"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_sparkline() {
+        // 跨 Session 历史 sparkline
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 2700, true, 1, 0, 3, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0, 2700.0], vec![0.05, 0.30, 0.10]);
+        let report = summary.to_report();
+
+        assert!(report.contains("TTL 历史图"));
+        assert!(report.contains("差值历史图"));
+        assert!(report.contains("1800s"));
+        assert!(report.contains("2700s"));
+        // sparkline 字符
+        assert!(report.contains('▁') || report.contains('▃') || report.contains('▅'));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_no_sparkline_without_data() {
+        // 有历史摘要但没有 sparkline 数据 → 不渲染
+        let summary = DevTraceSummary::empty().with_cache_tuning_history(
+            CacheTuningHistorySummary::new(1800, 2700, true, 1, 0, 1, None),
+        );
+        let report = summary.to_report();
+
+        assert!(!report.contains("TTL 历史图"));
+        assert!(!report.contains("差值历史图"));
+    }
+
+    #[test]
+    fn test_to_report_cache_tuning_history_no_sparkline_single_value() {
+        // 只有 1 个值 → 不渲染
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_history(CacheTuningHistorySummary::new(
+                1800, 1800, true, 0, 0, 1, None,
+            ))
+            .with_cache_tuning_sparkline(vec![1800.0], vec![0.05]);
+        let report = summary.to_report();
+
+        assert!(!report.contains("TTL 历史图"));
+        assert!(!report.contains("差值历史图"));
+    }
+
+    #[test]
+    fn test_with_cache_tuning_sparkline_builder() {
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0, 3600.0], vec![0.1, 0.2, -0.1]);
+        assert_eq!(
+            summary.ttl_history_values,
+            Some(vec![1800.0, 2700.0, 3600.0])
+        );
+        assert_eq!(summary.correlation_diff_history, Some(vec![0.1, 0.2, -0.1]));
+    }
+
+    #[test]
+    fn test_cache_tuning_sparkline_serde_roundtrip() {
+        let summary = DevTraceSummary::empty()
+            .with_cache_tuning_sparkline(vec![1800.0, 2700.0], vec![0.1, -0.2]);
+        let json = serde_json::to_string(&summary).unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.ttl_history_values, Some(vec![1800.0, 2700.0]));
+        assert_eq!(loaded.correlation_diff_history, Some(vec![0.1, -0.2]));
+    }
+
+    #[test]
+    fn test_cache_tuning_sparkline_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("ttl_history_values"));
+        assert!(!json.contains("correlation_diff_history"));
     }
 
     // --- serde 测试: DevTraceSummary 中的新字段 ---

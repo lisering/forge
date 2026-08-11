@@ -515,6 +515,9 @@ pub fn render_sparkline_with_range(
 ///
 /// 生成格式: `  {label}: {sparkline} ({first:.0%}→{last:.0%} {trend_arrow})`
 ///
+/// 值以百分比形式显示 (0.0~1.0 → 0%~100%)。
+/// 对于非百分比值 (如 TTL 秒数、带符号差值), 请使用 [`format_trend_sparkline_with`]。
+///
 /// # 参数
 ///
 /// - `label`: 行标签 (如 "协同评分")
@@ -532,6 +535,39 @@ pub fn render_sparkline_with_range(
 /// assert!(line.contains("█"));
 /// ```
 pub fn format_trend_sparkline(label: &str, values: &[f64], config: &SparklineConfig) -> String {
+    format_trend_sparkline_with(label, values, config, |v| format!("{:.0}%", v * 100.0))
+}
+
+/// 格式化带标签和统计的趋势行 (自定义值格式)
+///
+/// 与 [`format_trend_sparkline`] 类似, 但使用自定义的值格式化函数,
+/// 适用于非百分比值 (如 TTL 秒数、带符号差值等)。
+///
+/// 生成格式: `  {label}: {sparkline} ({first_fmt}→{last_fmt} {trend_arrow})`
+///
+/// # 参数
+///
+/// - `label`: 行标签
+/// - `values`: 数值序列
+/// - `config`: 渲染配置
+/// - `value_fmt`: 值格式化闭包, 接收 `f64` 返回格式化字符串
+///
+/// # 示例
+///
+/// ```
+/// # use forge::sparkline::{format_trend_sparkline_with, SparklineConfig};
+/// let values = vec![1800.0, 2700.0, 3600.0];
+/// let line = format_trend_sparkline_with("TTL", &values, &SparklineConfig::default(), |v| format!("{}s", v as u64));
+/// assert!(line.contains("TTL"));
+/// assert!(line.contains("1800s"));
+/// assert!(line.contains("3600s"));
+/// ```
+pub fn format_trend_sparkline_with(
+    label: &str,
+    values: &[f64],
+    config: &SparklineConfig,
+    value_fmt: impl Fn(f64) -> String,
+) -> String {
     if values.is_empty() {
         return format!("  {}: {}", label, config.fill_char);
     }
@@ -540,15 +576,15 @@ pub fn format_trend_sparkline(label: &str, values: &[f64], config: &SparklineCon
     let sparkline = render_sparkline(values, config);
 
     if stats.count < 2 {
-        return format!("  {}: {} ({:.0}%)", label, sparkline, stats.first * 100.0);
+        return format!("  {}: {} ({})", label, sparkline, value_fmt(stats.first));
     }
 
     format!(
-        "  {}: {} ({:.0}%→{:.0}% {})",
+        "  {}: {} ({}→{} {})",
         label,
         sparkline,
-        stats.first * 100.0,
-        stats.last * 100.0,
+        value_fmt(stats.first),
+        value_fmt(stats.last),
         stats.trend.arrow()
     )
 }
@@ -1163,6 +1199,86 @@ mod tests {
         let config = SparklineConfig::default();
         let line = format_trend_sparkline("稳定度", &[0.50, 0.51, 0.52, 0.51], &config);
         assert!(line.contains("→"));
+    }
+
+    // ======================================================================
+    //  format_trend_sparkline_with 测试
+    // ======================================================================
+
+    #[test]
+    fn test_format_trend_with_empty() {
+        let config = SparklineConfig::default();
+        let line = format_trend_sparkline_with("TTL", &[], &config, |v| format!("{}s", v as u64));
+        assert!(line.contains("TTL"));
+        assert!(line.contains("·"));
+    }
+
+    #[test]
+    fn test_format_trend_with_single() {
+        let config = SparklineConfig::default();
+        let line =
+            format_trend_sparkline_with("TTL", &[1800.0], &config, |v| format!("{}s", v as u64));
+        assert!(line.contains("TTL"));
+        assert!(line.contains("1800s"));
+    }
+
+    #[test]
+    fn test_format_trend_with_seconds_ascending() {
+        let config = SparklineConfig::default();
+        let values = vec![1800.0, 2700.0, 3600.0];
+        let line =
+            format_trend_sparkline_with("TTL", &values, &config, |v| format!("{}s", v as u64));
+        assert!(line.contains("TTL"));
+        assert!(line.contains("1800s"));
+        assert!(line.contains("3600s"));
+        assert!(line.contains("↑"));
+    }
+
+    #[test]
+    fn test_format_trend_with_seconds_descending() {
+        let config = SparklineConfig::default();
+        let values = vec![3600.0, 2700.0, 1800.0];
+        let line =
+            format_trend_sparkline_with("TTL", &values, &config, |v| format!("{}s", v as u64));
+        assert!(line.contains("↓"));
+        assert!(line.contains("3600s"));
+        assert!(line.contains("1800s"));
+    }
+
+    #[test]
+    fn test_format_trend_with_signed_percentage() {
+        let config = SparklineConfig::default();
+        let values = vec![0.1, -0.2, -0.5];
+        let line = format_trend_sparkline_with("差值", &values, &config, |v| {
+            format!("{:+.1}%", v * 100.0)
+        });
+        assert!(line.contains("差值"));
+        assert!(line.contains("+10.0%"));
+        assert!(line.contains("-50.0%"));
+        assert!(line.contains("↓"));
+    }
+
+    #[test]
+    fn test_format_trend_with_raw_values() {
+        let config = SparklineConfig::default();
+        let values = vec![0.67, 0.80, 0.50, 0.90];
+        let line =
+            format_trend_sparkline_with("相关差值", &values, &config, |v| format!("{:.2}", v));
+        assert!(line.contains("相关差值"));
+        assert!(line.contains("0.67"));
+        assert!(line.contains("0.90"));
+    }
+
+    #[test]
+    fn test_format_trend_with_percentage_compat() {
+        // format_trend_sparkline 应与 format_trend_sparkline_with 百分比格式一致
+        let config = SparklineConfig::default();
+        let values = vec![0.3, 0.5, 0.7, 0.9];
+        let line1 = format_trend_sparkline("评分", &values, &config);
+        let line2 = format_trend_sparkline_with("评分", &values, &config, |v| {
+            format!("{:.0}%", v * 100.0)
+        });
+        assert_eq!(line1, line2);
     }
 
     // ======================================================================

@@ -580,6 +580,74 @@ pub fn make_tuning_decision(
     )
 }
 
+/// 从调优决策列表中提取 TTL 变化轨迹 (Session 94)
+///
+/// 遍历决策列表, 返回每次决策后的 TTL 值序列, 用于 sparkline 可视化。
+///
+/// - `KeepCurrent`: TTL 不变, 使用 `old_ttl`
+/// - `AdjustTtl { new_ttl }`: TTL 变为 `new_ttl`
+/// - `DisableCache`: TTL 不变 (缓存禁用但 TTL 值保留), 使用 `old_ttl`
+///
+/// # 参数
+///
+/// - `decisions`: 调优决策列表 (按时间顺序)
+///
+/// # 返回
+///
+/// TTL 值序列 (秒), 每个元素对应一次决策后的 TTL。
+/// 空列表返回空 `Vec`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::cache_tuning::{extract_ttl_trajectory, CacheTuningDecision};
+/// let decisions = vec![
+///     CacheTuningDecision::keep_current(1800, 0.0, "正常"),
+///     CacheTuningDecision::adjust_ttl(1800, 2700, 0.3, "延长"),
+///     CacheTuningDecision::keep_current(2700, 0.1, "稳定"),
+/// ];
+/// let trajectory = extract_ttl_trajectory(&decisions);
+/// assert_eq!(trajectory, vec![1800.0, 2700.0, 2700.0]);
+/// ```
+pub fn extract_ttl_trajectory(decisions: &[CacheTuningDecision]) -> Vec<f64> {
+    decisions
+        .iter()
+        .map(|d| match &d.action {
+            TuningAction::AdjustTtl { new_ttl } => *new_ttl as f64,
+            TuningAction::KeepCurrent | TuningAction::DisableCache => d.old_ttl as f64,
+        })
+        .collect()
+}
+
+/// 从调优决策列表中提取关联差值序列 (Session 94)
+///
+/// 返回每次决策的缓存命中与未命中修复成功率差值, 用于 sparkline 可视化。
+///
+/// # 参数
+///
+/// - `decisions`: 调优决策列表 (按时间顺序)
+///
+/// # 返回
+///
+/// 差值序列 (-1.0 ~ 1.0), 每个元素对应一次决策的 `correlation_diff`。
+/// 空列表返回空 `Vec`。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::cache_tuning::{extract_correlation_diffs, CacheTuningDecision};
+/// let decisions = vec![
+///     CacheTuningDecision::keep_current(1800, 0.05, "正常"),
+///     CacheTuningDecision::adjust_ttl(1800, 2700, 0.30, "延长"),
+///     CacheTuningDecision::disable_cache(2700, -0.50, "有害"),
+/// ];
+/// let diffs = extract_correlation_diffs(&decisions);
+/// assert_eq!(diffs, vec![0.05, 0.30, -0.50]);
+/// ```
+pub fn extract_correlation_diffs(decisions: &[CacheTuningDecision]) -> Vec<f64> {
+    decisions.iter().map(|d| d.correlation_diff).collect()
+}
+
 /// 持久化文件名 — 存储在 `.forge/cache_tuning_history.json`
 pub const TUNING_HISTORY_FILENAME: &str = "cache_tuning_history.json";
 
@@ -1936,6 +2004,98 @@ mod tests {
         // 7200 × 1.5 = 10800 → clamp to 7200 → 与当前相同 → keep
         assert!(decision.is_keep());
         assert_eq!(tuner.current_ttl(), 7200);
+    }
+
+    // ===== extract_ttl_trajectory / extract_correlation_diffs (Session 94) =====
+
+    #[test]
+    fn test_extract_ttl_trajectory_empty() {
+        let trajectory = extract_ttl_trajectory(&[]);
+        assert!(trajectory.is_empty());
+    }
+
+    #[test]
+    fn test_extract_ttl_trajectory_keep_only() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(1800, 0.0, "a"),
+            CacheTuningDecision::keep_current(1800, 0.05, "b"),
+        ];
+        let trajectory = extract_ttl_trajectory(&decisions);
+        assert_eq!(trajectory, vec![1800.0, 1800.0]);
+    }
+
+    #[test]
+    fn test_extract_ttl_trajectory_with_adjust() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(1800, 0.0, "a"),
+            CacheTuningDecision::adjust_ttl(1800, 2700, 0.3, "b"),
+            CacheTuningDecision::keep_current(2700, 0.1, "c"),
+            CacheTuningDecision::adjust_ttl(2700, 4050, 0.5, "d"),
+        ];
+        let trajectory = extract_ttl_trajectory(&decisions);
+        assert_eq!(trajectory, vec![1800.0, 2700.0, 2700.0, 4050.0]);
+    }
+
+    #[test]
+    fn test_extract_ttl_trajectory_with_disable() {
+        let decisions = vec![
+            CacheTuningDecision::adjust_ttl(1800, 900, -0.1, "a"),
+            CacheTuningDecision::disable_cache(900, -0.5, "b"),
+        ];
+        let trajectory = extract_ttl_trajectory(&decisions);
+        // DisableCache 保留 old_ttl
+        assert_eq!(trajectory, vec![900.0, 900.0]);
+    }
+
+    #[test]
+    fn test_extract_ttl_trajectory_mixed() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(600, 0.0, "a"),
+            CacheTuningDecision::adjust_ttl(600, 900, 0.2, "b"),
+            CacheTuningDecision::adjust_ttl(900, 1350, 0.3, "c"),
+            CacheTuningDecision::disable_cache(1350, -0.4, "d"),
+            CacheTuningDecision::keep_current(1350, 0.0, "e"),
+        ];
+        let trajectory = extract_ttl_trajectory(&decisions);
+        assert_eq!(trajectory, vec![600.0, 900.0, 1350.0, 1350.0, 1350.0]);
+    }
+
+    #[test]
+    fn test_extract_correlation_diffs_empty() {
+        let diffs = extract_correlation_diffs(&[]);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_correlation_diffs_basic() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(1800, 0.05, "a"),
+            CacheTuningDecision::adjust_ttl(1800, 2700, 0.30, "b"),
+            CacheTuningDecision::disable_cache(2700, -0.50, "c"),
+        ];
+        let diffs = extract_correlation_diffs(&decisions);
+        assert_eq!(diffs, vec![0.05, 0.30, -0.50]);
+    }
+
+    #[test]
+    fn test_extract_correlation_diffs_all_keep() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(1800, 0.0, "a"),
+            CacheTuningDecision::keep_current(1800, 0.1, "b"),
+            CacheTuningDecision::keep_current(1800, -0.05, "c"),
+        ];
+        let diffs = extract_correlation_diffs(&decisions);
+        assert_eq!(diffs, vec![0.0, 0.1, -0.05]);
+    }
+
+    #[test]
+    fn test_extract_correlation_diffs_with_negatives() {
+        let decisions = vec![
+            CacheTuningDecision::keep_current(1800, -0.8, "a"),
+            CacheTuningDecision::disable_cache(1800, -1.0, "b"),
+        ];
+        let diffs = extract_correlation_diffs(&decisions);
+        assert_eq!(diffs, vec![-0.8, -1.0]);
     }
 
     // ===== CacheTuningHistory (Session 84: 持久化) =====
