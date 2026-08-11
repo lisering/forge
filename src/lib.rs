@@ -188,9 +188,10 @@ pub use evaluator_synergy::{
 pub use extract::{extract_files, DefaultExtractor};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
-    generate_chart_js_bar, generate_chart_js_line, generate_chart_js_line_colored,
-    generate_chart_js_line_raw, generate_css_styles, generate_html_report,
-    generate_html_report_file, generate_point_colors, generate_stat_card,
+    extract_gantt_data, generate_chart_js_bar, generate_chart_js_doughnut, generate_chart_js_gantt,
+    generate_chart_js_line, generate_chart_js_line_colored, generate_chart_js_line_raw,
+    generate_css_styles, generate_doughnut_colors, generate_html_report, generate_html_report_file,
+    generate_point_colors, generate_report_toolbar, generate_stat_card, DEFAULT_DOUGHNUT_COLORS,
     HTML_REPORT_FORMAT_VERSION,
 };
 pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteraction};

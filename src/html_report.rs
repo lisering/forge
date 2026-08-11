@@ -4,6 +4,10 @@
 //! - 概览统计面板 (总条目数、成功率、总耗时)
 //! - Chart.js 折线图 (协同评分趋势、修复率趋势)
 //! - 柱状图 (操作类型统计)
+//! - Doughnut/Pie 图 (缓存命中率、操作类型分布) (Session 97)
+//! - 甘特图 (时间线可视化) (Session 97)
+//! - 深色模式切换 (Session 97)
+//! - PDF 导出 (打印) (Session 97)
 //! - 历史趋势面板
 //!
 //! ## 核心函数
@@ -11,7 +15,10 @@
 //! - [`generate_html_report`] — 从 DevTraceSummary 生成完整 HTML 报告
 //! - [`generate_chart_js_line`] — 生成 Chart.js 折线图 HTML
 //! - [`generate_chart_js_bar`] — 生成 Chart.js 柱状图 HTML
+//! - [`generate_chart_js_doughnut`] — 生成 Chart.js Doughnut/Pie 图 HTML (Session 97)
+//! - [`generate_chart_js_gantt`] — 生成 Chart.js 甘特图 HTML (Session 97)
 //! - [`generate_stat_card`] — 生成统计卡片 HTML
+//! - [`generate_report_toolbar`] — 生成报告工具栏 (深色模式 + PDF 导出) (Session 97)
 //! - [`generate_html_report_file`] — 保存 HTML 报告到文件
 //!
 //! ## 示例
@@ -37,7 +44,367 @@ use crate::sparkline::escape_html;
 const CHART_JS_CDN: &str = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
 
 /// HTML 报告格式版本
-pub const HTML_REPORT_FORMAT_VERSION: &str = "1.0";
+pub const HTML_REPORT_FORMAT_VERSION: &str = "1.1";
+
+/// 默认 Doughnut 图表颜色调色板 (Session 97)
+///
+/// 10 种鲜艳的颜色, 循环使用以区分不同数据切片。
+pub const DEFAULT_DOUGHNUT_COLORS: &[&str] = &[
+    "rgba(75, 192, 192, 0.8)",
+    "rgba(255, 99, 132, 0.8)",
+    "rgba(255, 205, 86, 0.8)",
+    "rgba(54, 162, 235, 0.8)",
+    "rgba(153, 102, 255, 0.8)",
+    "rgba(255, 159, 64, 0.8)",
+    "rgba(201, 203, 207, 0.8)",
+    "rgba(75, 192, 192, 0.8)",
+    "rgba(255, 99, 132, 0.8)",
+    "rgba(255, 205, 86, 0.8)",
+];
+
+/// 为数据列表生成颜色数组, 循环使用默认调色板 (Session 97)
+///
+/// # 参数
+///
+/// - `count`: 需要的颜色数量
+///
+/// # 返回
+///
+/// CSS 颜色字符串列表
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_doughnut_colors;
+/// let colors = generate_doughnut_colors(3);
+/// assert_eq!(colors.len(), 3);
+/// assert!(colors[0].contains("75, 192, 192"));
+/// ```
+pub fn generate_doughnut_colors(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| DEFAULT_DOUGHNUT_COLORS[i % DEFAULT_DOUGHNUT_COLORS.len()].to_string())
+        .collect()
+}
+
+/// 生成 Chart.js Doughnut/Pie 图 HTML (Session 97)
+///
+/// 创建一个包含 Chart.js canvas 的 div, 渲染为环形图 (doughnut) 或饼图 (pie)。
+/// Doughnut 图中心可显示总计数, 适合展示占比分布 (如缓存命中率、操作类型分布)。
+///
+/// # 参数
+///
+/// - `id`: canvas ID (必须唯一)
+/// - `title`: 图表标题
+/// - `labels`: 各切片标签列表
+/// - `data`: 各切片数值列表
+/// - `colors`: 各切片颜色列表 (CSS 颜色值), 长度应与 `data` 相同;
+///   如为空则自动使用 [`DEFAULT_DOUGHNUT_COLORS`] 调色板
+///
+/// # 返回
+///
+/// HTML 字符串, 包含 canvas 和 script
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_chart_js_doughnut;
+/// let html = generate_chart_js_doughnut(
+///     "cachePie",
+///     "缓存命中率",
+///     &vec!["命中".to_string(), "未命中".to_string(), "失败".to_string()],
+///     &vec![6.0, 3.0, 1.0],
+///     &[],
+/// );
+/// assert!(html.contains("doughnut"));
+/// assert!(html.contains("命中"));
+/// ```
+pub fn generate_chart_js_doughnut(
+    id: &str,
+    title: &str,
+    labels: &[String],
+    data: &[f64],
+    colors: &[String],
+) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    let data_json = serde_json::to_string(data).unwrap_or_else(|_| "[]".to_string());
+    let colors_vec: Vec<String> = if colors.is_empty() {
+        generate_doughnut_colors(data.len())
+    } else {
+        colors.to_vec()
+    };
+    let colors_json = serde_json::to_string(&colors_vec).unwrap_or_else(|_| "[]".to_string());
+    let total: f64 = data.iter().sum();
+
+    format!(
+        r#"<div class="chart-container">
+  <h3 class="chart-title">{title}</h3>
+  <canvas id="{id}"></canvas>
+  <script>
+  (function() {{
+    const ctx = document.getElementById('{id}');
+    if (!ctx) return;
+    new Chart(ctx, {{
+      type: 'doughnut',
+      data: {{
+        labels: {labels_json},
+        datasets: [{{
+          data: {data_json},
+          backgroundColor: {colors_json},
+          borderColor: '#fff',
+          borderWidth: 2,
+          hoverOffset: 8,
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{
+          title: {{ display: true, text: '{title}' }},
+          legend: {{ position: 'right' }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const total = {total};
+                const pct = total > 0 ? (ctx.parsed / total * 100).toFixed(1) + '%' : '0%';
+                return ctx.label + ': ' + ctx.parsed + ' (' + pct + ')';
+              }}
+            }}
+          }}
+        }}
+      }}
+    }});
+  }})();
+  </script>
+</div>"#,
+        id = escape_html(id),
+        title = escape_html(title),
+        labels_json = labels_json,
+        data_json = data_json,
+        colors_json = colors_json,
+        total = total,
+    )
+}
+
+/// 生成 Chart.js 甘特图 HTML (Session 97)
+///
+/// 创建一个水平条形图, 以时间线形式展示各项操作的执行时段。
+/// 每个条形代表一个 timeline 条目, 条形长度 = 执行耗时, 颜色区分成功/失败。
+///
+/// # 参数
+///
+/// - `id`: canvas ID (必须唯一)
+/// - `title`: 图表标题
+/// - `labels`: Y 轴标签列表 (每个条形的标签)
+/// - `data`: 浮动条数据列表, 每项为 `[start_ms, end_ms]`
+/// - `colors`: 每个条形的颜色列表
+///
+/// # 返回
+///
+/// HTML 字符串, 包含 canvas 和 script
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_chart_js_gantt;
+/// let html = generate_chart_js_gantt(
+///     "ganttChart",
+///     "时间线",
+///     &vec!["Task 0".to_string(), "Task 1".to_string()],
+///     &vec![vec![0.0, 5000.0], vec![5000.0, 8000.0]],
+///     &vec!["rgba(75,192,192,0.6)".to_string(), "rgba(255,99,132,0.6)".to_string()],
+/// );
+/// assert!(html.contains("bar"));
+/// assert!(html.contains("indexAxis: 'y'"));
+/// ```
+pub fn generate_chart_js_gantt(
+    id: &str,
+    title: &str,
+    labels: &[String],
+    data: &[Vec<f64>],
+    colors: &[String],
+) -> String {
+    let labels_json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_string());
+    let data_json = serde_json::to_string(data).unwrap_or_else(|_| "[]".to_string());
+    let colors_vec: Vec<String> = if colors.is_empty() {
+        vec!["rgba(75, 192, 192, 0.6)".to_string(); data.len()]
+    } else {
+        colors.to_vec()
+    };
+    let colors_json = serde_json::to_string(&colors_vec).unwrap_or_else(|_| "[]".to_string());
+
+    format!(
+        r#"<div class="chart-container">
+  <h3 class="chart-title">{title}</h3>
+  <canvas id="{id}"></canvas>
+  <script>
+  (function() {{
+    const ctx = document.getElementById('{id}');
+    if (!ctx) return;
+    new Chart(ctx, {{
+      type: 'bar',
+      data: {{
+        labels: {labels_json},
+        datasets: [{{
+          label: '{title}',
+          data: {data_json},
+          backgroundColor: {colors_json},
+          borderColor: {colors_json},
+          borderWidth: 1,
+          borderSkipped: false,
+        }}]
+      }},
+      options: {{
+        indexAxis: 'y',
+        responsive: true,
+        plugins: {{
+          title: {{ display: true, text: '{title}' }},
+          legend: {{ display: false }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const range = ctx.raw;
+                const dur = (range[1] - range[0]) / 1000;
+                return ctx.label + ': ' + dur.toFixed(1) + 's';
+              }}
+            }}
+          }}
+        }},
+        scales: {{
+          x: {{
+            title: {{ display: true, text: '时间 (ms)' }},
+            beginAtZero: true,
+          }},
+          y: {{
+            beginAtZero: true,
+          }}
+        }}
+      }}
+    }});
+  }})();
+  </script>
+</div>"#,
+        id = escape_html(id),
+        title = escape_html(title),
+        labels_json = labels_json,
+        data_json = data_json,
+        colors_json = colors_json,
+    )
+}
+
+/// 从 TimelineEntry 列表提取甘特图数据 (Session 97)
+///
+/// 将时间线条目转换为 `[start_ms, end_ms]` 浮动条数据, 并生成对应的标签和颜色。
+/// 成功的操作使用绿色, 失败的使用红色。
+///
+/// # 参数
+///
+/// - `timeline`: 时间线条目列表
+///
+/// # 返回
+///
+/// 返回三元组: `(labels, data, colors)`
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceSummary, TimelineEntry, TraceAction};
+/// # use forge::html_report::extract_gantt_data;
+/// # use chrono::Utc;
+/// let timeline = vec![
+///     TimelineEntry {
+///         timestamp: Utc::now(),
+///         action: TraceAction::TaskExecution,
+///         task_name: Some("Task 0".to_string()),
+///         success: true,
+///         duration_ms: 100,
+///     },
+/// ];
+/// let (labels, data, colors) = extract_gantt_data(&timeline);
+/// assert_eq!(labels.len(), 1);
+/// assert_eq!(data.len(), 1);
+/// assert_eq!(data[0].len(), 2); // [start, end]
+/// assert!(colors[0].contains("75, 192, 192")); // 成功→绿
+/// ```
+pub fn extract_gantt_data(
+    timeline: &[crate::dev_trace::TimelineEntry],
+) -> (Vec<String>, Vec<Vec<f64>>, Vec<String>) {
+    let mut cumulative_ms: f64 = 0.0;
+    let labels: Vec<String> = timeline
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let name = e
+                .task_name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", e.action));
+            format!("#{} {}", i, name)
+        })
+        .collect();
+
+    let data: Vec<Vec<f64>> = timeline
+        .iter()
+        .map(|e| {
+            let start = cumulative_ms;
+            let end = cumulative_ms + e.duration_ms as f64;
+            cumulative_ms = end;
+            vec![start, end]
+        })
+        .collect();
+
+    let colors: Vec<String> = timeline
+        .iter()
+        .map(|e| {
+            if e.success {
+                "rgba(75, 192, 192, 0.6)".to_string()
+            } else {
+                "rgba(255, 99, 132, 0.6)".to_string()
+            }
+        })
+        .collect();
+
+    (labels, data, colors)
+}
+
+/// 生成报告工具栏 HTML (Session 97)
+///
+/// 包含深色模式切换按钮和 PDF 导出 (打印) 按钮。
+/// 深色模式使用 localStorage 持久化用户选择。
+///
+/// # 返回
+///
+/// HTML 字符串, 包含工具栏 div 和 JavaScript 脚本
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_report_toolbar;
+/// let html = generate_report_toolbar();
+/// assert!(html.contains("toolbar"));
+/// assert!(html.contains("toggleTheme"));
+/// assert!(html.contains("window.print"));
+/// ```
+pub fn generate_report_toolbar() -> String {
+    r#"<div class="report-toolbar">
+  <button class="toolbar-btn" onclick="toggleTheme()" id="themeBtn">🌙 深色模式</button>
+  <button class="toolbar-btn" onclick="window.print()">📄 导出 PDF</button>
+</div>
+<script>
+  function toggleTheme() {
+    const body = document.body;
+    const isDark = body.classList.toggle('dark-mode');
+    localStorage.setItem('forge-theme', isDark ? 'dark' : 'light');
+    document.getElementById('themeBtn').textContent = isDark ? '☀️ 浅色模式' : '🌙 深色模式';
+  }
+  (function() {
+    const saved = localStorage.getItem('forge-theme');
+    if (saved === 'dark') {
+      document.body.classList.add('dark-mode');
+      const btn = document.getElementById('themeBtn');
+      if (btn) btn.textContent = '☀️ 浅色模式';
+    }
+  })();
+</script>"#
+        .to_string()
+}
 
 // ============================================================================
 //  纯函数 — HTML 片段生成
@@ -426,24 +793,45 @@ pub fn generate_chart_js_line_colored(
 /// 生成 HTML 报告的 CSS 样式
 ///
 /// 返回完整的 `<style>` 标签内容。
+/// 包含浅色/深色模式 CSS 变量、打印样式和响应式布局 (Session 97 增强)。
 pub fn generate_css_styles() -> &'static str {
     r#"<style>
+  :root {
+    --bg: #f5f5f5; --text: #333; --card-bg: #fff; --border: #e0e0e0;
+    --heading: #1a1a2e; --muted: #666; --faint: #999; --hover: #f9f9f9;
+    --shadow: rgba(0,0,0,0.08);
+  }
+  body.dark-mode {
+    --bg: #1a1a2e; --text: #e0e0e0; --card-bg: #2a2a3e; --border: #3a3a4e;
+    --heading: #f0f0f0; --muted: #aaa; --faint: #888; --hover: #33334a;
+    --shadow: rgba(0,0,0,0.3);
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #f5f5f5; color: #333; padding: 20px;
+    background: var(--bg); color: var(--text); padding: 20px;
+    transition: background 0.3s, color 0.3s;
   }
   .container { max-width: 1200px; margin: 0 auto; }
-  h1 { color: #1a1a2e; margin-bottom: 8px; }
-  h2 { color: #1a1a2e; margin: 24px 0 12px; border-bottom: 2px solid #e0e0e0; padding-bottom: 8px; }
-  .meta { color: #666; font-size: 14px; margin-bottom: 20px; }
+  h1 { color: var(--heading); margin-bottom: 8px; }
+  h2 { color: var(--heading); margin: 24px 0 12px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
+  .meta { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  .report-toolbar {
+    display: flex; gap: 12px; margin-bottom: 20px;
+  }
+  .toolbar-btn {
+    padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card-bg); color: var(--text); cursor: pointer;
+    font-size: 14px; transition: opacity 0.2s;
+  }
+  .toolbar-btn:hover { opacity: 0.85; }
   .stats-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: 16px; margin-bottom: 24px;
   }
   .stat-card {
-    background: white; border-radius: 8px; padding: 16px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+    background: var(--card-bg); border-radius: 8px; padding: 16px;
+    box-shadow: 0 2px 4px var(--shadow);
     border-left: 4px solid #4a90d9;
   }
   .stat-blue { border-left-color: #4a90d9; }
@@ -451,27 +839,34 @@ pub fn generate_css_styles() -> &'static str {
   .stat-orange { border-left-color: #e67e22; }
   .stat-red { border-left-color: #e74c3c; }
   .stat-purple { border-left-color: #9b59b6; }
-  .stat-title { font-size: 13px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
-  .stat-value { font-size: 28px; font-weight: 700; color: #1a1a2e; margin: 4px 0; }
-  .stat-desc { font-size: 12px; color: #999; }
+  .stat-title { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-value { font-size: 28px; font-weight: 700; color: var(--heading); margin: 4px 0; }
+  .stat-desc { font-size: 12px; color: var(--faint); }
   .charts-grid {
     display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
     gap: 20px; margin-bottom: 24px;
   }
   .chart-container {
-    background: white; border-radius: 8px; padding: 20px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+    background: var(--card-bg); border-radius: 8px; padding: 20px;
+    box-shadow: 0 2px 4px var(--shadow);
   }
-  .chart-title { font-size: 16px; color: #1a1a2e; margin-bottom: 12px; }
-  table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
-  th { background: #1a1a2e; color: white; padding: 12px; text-align: left; font-size: 14px; }
-  td { padding: 10px 12px; border-bottom: 1px solid #eee; font-size: 14px; }
+  .chart-title { font-size: 16px; color: var(--heading); margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px var(--shadow); }
+  th { background: var(--heading); color: var(--card-bg); padding: 12px; text-align: left; font-size: 14px; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
   tr:last-child td { border-bottom: none; }
-  tr:hover td { background: #f9f9f9; }
+  tr:hover td { background: var(--hover); }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
   .badge-green { background: #e8f5e9; color: #27ae60; }
   .badge-red { background: #ffebee; color: #e74c3c; }
-  .footer { text-align: center; color: #999; font-size: 12px; margin-top: 40px; padding-top: 20px; border-top: 1px solid #e0e0e0; }
+  .footer { text-align: center; color: var(--faint); font-size: 12px; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); }
+  @media print {
+    body { background: white !important; color: black !important; padding: 0; }
+    .report-toolbar { display: none !important; }
+    .stat-card, .chart-container, table { box-shadow: none !important; border: 1px solid #ccc !important; break-inside: avoid; }
+    .chart-container { page-break-inside: avoid; }
+    h2 { break-after: avoid; }
+  }
 </style>"#
 }
 
@@ -505,6 +900,10 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
         HTML_REPORT_FORMAT_VERSION,
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
     ));
+
+    // === 报告工具栏 (Session 97) ===
+    html.push_str(&generate_report_toolbar());
+    html.push('\n');
 
     // === 概览统计卡片 ===
     html.push_str("<h2>📋 概览</h2>\n<div class=\"stats-grid\">\n");
@@ -588,6 +987,14 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             &action_data,
             "rgba(75, 144, 217, 0.7)",
             "次数",
+        ));
+        // 操作类型 Doughnut 图 (Session 97)
+        html.push_str(&generate_chart_js_doughnut(
+            "actionDoughnut",
+            "操作类型占比",
+            &action_labels,
+            &action_data,
+            &[],
         ));
         html.push_str("</div>\n");
     }
@@ -926,6 +1333,42 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             &cs.search_failures.to_string(),
             None,
             "red",
+        ));
+        html.push_str("</div>\n");
+
+        // === 缓存命中率 Doughnut 图 (Session 97) ===
+        let cache_labels = vec!["命中".to_string(), "未命中".to_string(), "失败".to_string()];
+        let cache_data = vec![
+            cs.cache_hits as f64,
+            cs.cache_misses as f64,
+            cs.search_failures as f64,
+        ];
+        let cache_colors = vec![
+            "rgba(75, 192, 192, 0.8)".to_string(),
+            "rgba(255, 205, 86, 0.8)".to_string(),
+            "rgba(255, 99, 132, 0.8)".to_string(),
+        ];
+        html.push_str("<div class=\"charts-grid\">\n");
+        html.push_str(&generate_chart_js_doughnut(
+            "cacheDoughnut",
+            "缓存命中率分布",
+            &cache_labels,
+            &cache_data,
+            &cache_colors,
+        ));
+        html.push_str("</div>\n");
+    }
+
+    // === 时间线甘特图 (Session 97) ===
+    if !summary.timeline.is_empty() {
+        let (gantt_labels, gantt_data, gantt_colors) = extract_gantt_data(&summary.timeline);
+        html.push_str("<h2>📊 时间线甘特图</h2>\n<div class=\"charts-grid\">\n");
+        html.push_str(&generate_chart_js_gantt(
+            "ganttChart",
+            "任务执行时间线",
+            &gantt_labels,
+            &gantt_data,
+            &gantt_colors,
         ));
         html.push_str("</div>\n");
     }
@@ -1763,5 +2206,509 @@ mod tests {
 
         assert!(html.contains("memoryDiffTrendChart"));
         assert!(html.contains("255, 99, 132")); // 红色
+    }
+
+    // ======================================================================
+    //  Session 97 测试 — Doughnut/Pie 图 + 甘特图 + 深色模式 + 工具栏
+    // ======================================================================
+
+    // --- generate_doughnut_colors 测试 ---
+
+    #[test]
+    fn test_generate_doughnut_colors_basic() {
+        let colors = generate_doughnut_colors(3);
+        assert_eq!(colors.len(), 3);
+        assert!(colors[0].contains("75, 192, 192"));
+        assert!(colors[1].contains("255, 99, 132"));
+        assert!(colors[2].contains("255, 205, 86"));
+    }
+
+    #[test]
+    fn test_generate_doughnut_colors_zero() {
+        let colors = generate_doughnut_colors(0);
+        assert!(colors.is_empty());
+    }
+
+    #[test]
+    fn test_generate_doughnut_colors_wraps_around() {
+        // 超过调色板长度 (10) 应循环
+        let colors = generate_doughnut_colors(12);
+        assert_eq!(colors.len(), 12);
+        // 第 10 个应该与第 0 个相同 (循环)
+        assert_eq!(colors[0], colors[10]);
+        assert_eq!(colors[1], colors[11]);
+    }
+
+    #[test]
+    fn test_default_doughnut_colors_has_10_entries() {
+        assert_eq!(DEFAULT_DOUGHNUT_COLORS.len(), 10);
+    }
+
+    // --- generate_chart_js_doughnut 测试 ---
+
+    #[test]
+    fn test_chart_js_doughnut_basic() {
+        let labels = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let data = vec![10.0, 20.0, 30.0];
+        let html = generate_chart_js_doughnut("testDoughnut", "测试饼图", &labels, &data, &[]);
+        assert!(html.contains("doughnut"));
+        assert!(html.contains("testDoughnut"));
+        assert!(html.contains("测试饼图"));
+        assert!(html.contains("\"A\""));
+        assert!(html.contains("10"));
+    }
+
+    #[test]
+    fn test_chart_js_doughnut_custom_colors() {
+        let labels = vec!["X".to_string(), "Y".to_string()];
+        let data = vec![5.0, 10.0];
+        let colors = vec!["rgba(1,2,3,0.5)".to_string(), "rgba(4,5,6,0.5)".to_string()];
+        let html =
+            generate_chart_js_doughnut("customColorPie", "自定义颜色", &labels, &data, &colors);
+        assert!(html.contains("rgba(1,2,3,0.5)"));
+        assert!(html.contains("rgba(4,5,6,0.5)"));
+    }
+
+    #[test]
+    fn test_chart_js_doughnut_empty_data() {
+        let html = generate_chart_js_doughnut("emptyPie", "空", &[], &[], &[]);
+        assert!(html.contains("[]"));
+        assert!(html.contains("doughnut"));
+    }
+
+    #[test]
+    fn test_chart_js_doughnut_escape_title() {
+        let html = generate_chart_js_doughnut("id_esc_d", "A < B & C", &[], &[], &[]);
+        assert!(html.contains("A &lt; B &amp; C"));
+    }
+
+    #[test]
+    fn test_chart_js_doughnut_has_tooltip_percentage() {
+        let labels = vec!["A".to_string()];
+        let data = vec![50.0];
+        let html = generate_chart_js_doughnut("tooltipPie", "百分比提示", &labels, &data, &[]);
+        assert!(html.contains("toFixed(1) + '%'"));
+    }
+
+    // --- generate_chart_js_gantt 测试 ---
+
+    #[test]
+    fn test_chart_js_gantt_basic() {
+        let labels = vec!["Task 0".to_string(), "Task 1".to_string()];
+        let data = vec![vec![0.0, 5000.0], vec![5000.0, 8000.0]];
+        let colors = vec![
+            "rgba(75,192,192,0.6)".to_string(),
+            "rgba(255,99,132,0.6)".to_string(),
+        ];
+        let html = generate_chart_js_gantt("ganttTest", "甘特图测试", &labels, &data, &colors);
+        assert!(html.contains("bar"));
+        assert!(html.contains("indexAxis: 'y'"));
+        assert!(html.contains("ganttTest"));
+        assert!(html.contains("Task 0"));
+        assert!(html.contains("5000"));
+    }
+
+    #[test]
+    fn test_chart_js_gantt_empty_data() {
+        let html = generate_chart_js_gantt("emptyGantt", "空甘特", &[], &[], &[]);
+        assert!(html.contains("[]"));
+        assert!(html.contains("indexAxis: 'y'"));
+    }
+
+    #[test]
+    fn test_chart_js_gantt_default_colors() {
+        let labels = vec!["T1".to_string()];
+        let data = vec![vec![0.0, 100.0]];
+        let html = generate_chart_js_gantt("defaultColorGantt", "默认颜色", &labels, &data, &[]);
+        // 空颜色列表时使用默认绿色
+        assert!(html.contains("75, 192, 192"));
+    }
+
+    #[test]
+    fn test_chart_js_gantt_escape_title() {
+        let html = generate_chart_js_gantt("id_esc_g", "A < B & C", &[], &[], &[]);
+        assert!(html.contains("A &lt; B &amp; C"));
+    }
+
+    #[test]
+    fn test_chart_js_gantt_has_time_axis_label() {
+        let labels = vec!["T1".to_string()];
+        let data = vec![vec![0.0, 1000.0]];
+        let html = generate_chart_js_gantt("axisGantt", "时间轴", &labels, &data, &[]);
+        assert!(html.contains("时间 (ms)"));
+    }
+
+    // --- extract_gantt_data 测试 ---
+
+    #[test]
+    fn test_extract_gantt_data_basic() {
+        use crate::dev_trace::{TimelineEntry, TraceAction};
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task A".to_string()),
+                success: true,
+                duration_ms: 1000,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::FixAttempt,
+                task_name: Some("Fix B".to_string()),
+                success: false,
+                duration_ms: 500,
+            },
+        ];
+        let (labels, data, colors) = extract_gantt_data(&timeline);
+        assert_eq!(labels.len(), 2);
+        assert_eq!(data.len(), 2);
+        assert_eq!(colors.len(), 2);
+
+        // 第一个条目: 0 ~ 1000
+        assert_eq!(data[0], vec![0.0, 1000.0]);
+        // 第二个条目: 1000 ~ 1500
+        assert_eq!(data[1], vec![1000.0, 1500.0]);
+
+        // 成功→绿, 失败→红
+        assert!(colors[0].contains("75, 192, 192"));
+        assert!(colors[1].contains("255, 99, 132"));
+
+        // 标签包含任务名
+        assert!(labels[0].contains("Task A"));
+        assert!(labels[1].contains("Fix B"));
+    }
+
+    #[test]
+    fn test_extract_gantt_data_empty() {
+        let (labels, data, colors) = extract_gantt_data(&[]);
+        assert!(labels.is_empty());
+        assert!(data.is_empty());
+        assert!(colors.is_empty());
+    }
+
+    #[test]
+    fn test_extract_gantt_data_no_task_name() {
+        use crate::dev_trace::{TimelineEntry, TraceAction};
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::CompileCheck,
+            task_name: None,
+            success: true,
+            duration_ms: 200,
+        }];
+        let (labels, data, _) = extract_gantt_data(&timeline);
+        assert_eq!(labels.len(), 1);
+        // 无任务名时使用 action 名称
+        assert!(labels[0].contains("CompileCheck"));
+        assert_eq!(data[0], vec![0.0, 200.0]);
+    }
+
+    #[test]
+    fn test_extract_gantt_data_all_success_green() {
+        use crate::dev_trace::{TimelineEntry, TraceAction};
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T1".to_string()),
+                success: true,
+                duration_ms: 100,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T2".to_string()),
+                success: true,
+                duration_ms: 200,
+            },
+        ];
+        let (_, _, colors) = extract_gantt_data(&timeline);
+        assert!(colors.iter().all(|c| c.contains("75, 192, 192")));
+    }
+
+    #[test]
+    fn test_extract_gantt_data_all_failure_red() {
+        use crate::dev_trace::{TimelineEntry, TraceAction};
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::FixAttempt,
+                task_name: Some("F1".to_string()),
+                success: false,
+                duration_ms: 100,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::FixAttempt,
+                task_name: Some("F2".to_string()),
+                success: false,
+                duration_ms: 200,
+            },
+        ];
+        let (_, _, colors) = extract_gantt_data(&timeline);
+        assert!(colors.iter().all(|c| c.contains("255, 99, 132")));
+    }
+
+    #[test]
+    fn test_extract_gantt_data_cumulative_time() {
+        use crate::dev_trace::{TimelineEntry, TraceAction};
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T1".to_string()),
+                success: true,
+                duration_ms: 3000,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T2".to_string()),
+                success: true,
+                duration_ms: 2000,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T3".to_string()),
+                success: true,
+                duration_ms: 1000,
+            },
+        ];
+        let (_, data, _) = extract_gantt_data(&timeline);
+        // 累积时间: 0→3000, 3000→5000, 5000→6000
+        assert_eq!(data[0], vec![0.0, 3000.0]);
+        assert_eq!(data[1], vec![3000.0, 5000.0]);
+        assert_eq!(data[2], vec![5000.0, 6000.0]);
+    }
+
+    // --- generate_report_toolbar 测试 ---
+
+    #[test]
+    fn test_report_toolbar_contains_theme_button() {
+        let html = generate_report_toolbar();
+        assert!(html.contains("toolbar"));
+        assert!(html.contains("themeBtn"));
+        assert!(html.contains("toggleTheme"));
+        assert!(html.contains("深色模式"));
+    }
+
+    #[test]
+    fn test_report_toolbar_contains_pdf_button() {
+        let html = generate_report_toolbar();
+        assert!(html.contains("window.print"));
+        assert!(html.contains("导出 PDF"));
+    }
+
+    #[test]
+    fn test_report_toolbar_contains_localstorage() {
+        let html = generate_report_toolbar();
+        assert!(html.contains("localStorage"));
+        assert!(html.contains("forge-theme"));
+    }
+
+    // --- generate_css_styles 增强测试 (Session 97) ---
+
+    #[test]
+    fn test_css_styles_has_dark_mode_variables() {
+        let css = generate_css_styles();
+        assert!(css.contains(":root"));
+        assert!(css.contains("--bg"));
+        assert!(css.contains("--text"));
+        assert!(css.contains("--card-bg"));
+        assert!(css.contains("dark-mode"));
+    }
+
+    #[test]
+    fn test_css_styles_has_print_media() {
+        let css = generate_css_styles();
+        assert!(css.contains("@media print"));
+        assert!(css.contains("report-toolbar"));
+        assert!(css.contains("break-inside: avoid"));
+    }
+
+    #[test]
+    fn test_css_styles_has_toolbar_styles() {
+        let css = generate_css_styles();
+        assert!(css.contains(".report-toolbar"));
+        assert!(css.contains(".toolbar-btn"));
+    }
+
+    #[test]
+    fn test_css_styles_uses_css_variables() {
+        let css = generate_css_styles();
+        assert!(css.contains("var(--bg)"));
+        assert!(css.contains("var(--text)"));
+        assert!(css.contains("var(--card-bg)"));
+        assert!(css.contains("var(--heading)"));
+    }
+
+    // --- HTML 报告集成测试 (Session 97) ---
+
+    #[test]
+    fn test_html_report_contains_toolbar() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("report-toolbar"));
+        assert!(html.contains("toggleTheme"));
+        assert!(html.contains("导出 PDF"));
+    }
+
+    #[test]
+    fn test_html_report_version_1_1() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("1.1"));
+    }
+
+    #[test]
+    fn test_html_report_with_action_doughnut() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 5,
+                success_count: 4,
+                total_duration_ms: 1000,
+            },
+        );
+        by_action.insert(
+            TraceAction::TaskExecution,
+            ActionStats {
+                count: 3,
+                success_count: 3,
+                total_duration_ms: 500,
+            },
+        );
+        let summary = DevTraceSummary {
+            total_entries: 8,
+            total_duration_ms: 1500,
+            by_action,
+            success_rate: 0.875,
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("actionDoughnut"));
+        assert!(html.contains("操作类型占比"));
+        assert!(html.contains("doughnut"));
+    }
+
+    #[test]
+    fn test_html_report_with_cache_doughnut() {
+        use crate::dev_trace::CacheStatsSummary;
+        let summary = DevTraceSummary {
+            cache_summary: Some(CacheStatsSummary {
+                cache_hits: 6,
+                cache_misses: 3,
+                search_failures: 1,
+                time_saved_ms: 5000,
+            }),
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("cacheDoughnut"));
+        assert!(html.contains("缓存命中率分布"));
+        assert!(html.contains("命中"));
+        assert!(html.contains("未命中"));
+    }
+
+    #[test]
+    fn test_html_report_with_gantt_chart() {
+        let summary = DevTraceSummary {
+            timeline: vec![
+                TimelineEntry {
+                    timestamp: chrono::Utc::now(),
+                    action: TraceAction::TaskExecution,
+                    task_name: Some("Task 0".to_string()),
+                    success: true,
+                    duration_ms: 500,
+                },
+                TimelineEntry {
+                    timestamp: chrono::Utc::now(),
+                    action: TraceAction::FixAttempt,
+                    task_name: Some("Fix 1".to_string()),
+                    success: false,
+                    duration_ms: 300,
+                },
+            ],
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("ganttChart"));
+        assert!(html.contains("时间线甘特图"));
+        assert!(html.contains("indexAxis: 'y'"));
+    }
+
+    #[test]
+    fn test_html_report_no_gantt_without_timeline() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(!html.contains("ganttChart"));
+        assert!(!html.contains("时间线甘特图"));
+    }
+
+    #[test]
+    fn test_html_report_dark_mode_class_in_css() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("dark-mode"));
+        assert!(html.contains("localStorage"));
+    }
+
+    #[test]
+    fn test_html_report_print_css_present() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("@media print"));
+    }
+
+    #[test]
+    fn test_html_report_full_with_all_session97_features() {
+        use crate::dev_trace::CacheStatsSummary;
+
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 10,
+                success_count: 8,
+                total_duration_ms: 5000,
+            },
+        );
+
+        let summary = DevTraceSummary {
+            total_entries: 50,
+            total_duration_ms: 60000,
+            by_action,
+            success_rate: 0.8,
+            cache_summary: Some(CacheStatsSummary {
+                cache_hits: 6,
+                cache_misses: 3,
+                search_failures: 1,
+                time_saved_ms: 5000,
+            }),
+            timeline: vec![TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task 0".to_string()),
+                success: true,
+                duration_ms: 1000,
+            }],
+            ..DevTraceSummary::empty()
+        };
+
+        let html = generate_html_report(&summary);
+        // 工具栏
+        assert!(html.contains("report-toolbar"));
+        assert!(html.contains("toggleTheme"));
+        // Doughnut 图
+        assert!(html.contains("actionDoughnut"));
+        assert!(html.contains("cacheDoughnut"));
+        // 甘特图
+        assert!(html.contains("ganttChart"));
+        assert!(html.contains("时间线甘特图"));
+        // 深色模式 CSS
+        assert!(html.contains("dark-mode"));
+        assert!(html.contains("@media print"));
     }
 }
