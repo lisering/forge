@@ -79,6 +79,26 @@ harness = false
 name = "radix_tree_performance"
 harness = false
 
+[[bench]]
+name = "loop_detector_performance"
+harness = false
+
+[[bench]]
+name = "error_diagnosis_performance"
+harness = false
+
+[[bench]]
+name = "connection_monitor_performance"
+harness = false
+
+[[bench]]
+name = "auto_recovery_performance"
+harness = false
+
+[[bench]]
+name = "site_health_performance"
+harness = false
+
 # ── docs.rs 官方文档配置 ──────────────────────────────────
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]
