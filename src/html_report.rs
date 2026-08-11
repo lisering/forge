@@ -31,9 +31,10 @@
 //! let html = generate_html_report_file(&summary, Path::new("report.html"));
 //! ```
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use crate::dev_trace::DevTraceSummary;
+use crate::dev_trace::{ActionStats, DevTraceSummary, TimelineEntry, TraceAction};
 use crate::sparkline::escape_html;
 
 // ============================================================================
@@ -44,7 +45,7 @@ use crate::sparkline::escape_html;
 const CHART_JS_CDN: &str = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
 
 /// HTML 报告格式版本
-pub const HTML_REPORT_FORMAT_VERSION: &str = "1.1";
+pub const HTML_REPORT_FORMAT_VERSION: &str = "1.2";
 
 /// 默认 Doughnut 图表颜色调色板 (Session 97)
 ///
@@ -794,6 +795,7 @@ pub fn generate_chart_js_line_colored(
 ///
 /// 返回完整的 `<style>` 标签内容。
 /// 包含浅色/深色模式 CSS 变量、打印样式和响应式布局 (Session 97 增强)。
+/// Session 98 新增: 搜索框样式、模态框样式、可排序表头样式。
 pub fn generate_css_styles() -> &'static str {
     r#"<style>
   :root {
@@ -817,7 +819,7 @@ pub fn generate_css_styles() -> &'static str {
   h2 { color: var(--heading); margin: 24px 0 12px; border-bottom: 2px solid var(--border); padding-bottom: 8px; }
   .meta { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
   .report-toolbar {
-    display: flex; gap: 12px; margin-bottom: 20px;
+    display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
   }
   .toolbar-btn {
     padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px;
@@ -849,25 +851,524 @@ pub fn generate_css_styles() -> &'static str {
   .chart-container {
     background: var(--card-bg); border-radius: 8px; padding: 20px;
     box-shadow: 0 2px 4px var(--shadow);
+    position: relative;
   }
-  .chart-title { font-size: 16px; color: var(--heading); margin-bottom: 12px; }
+  .chart-title { font-size: 16px; color: var(--heading); margin-bottom: 12px; cursor: pointer; }
+  .chart-title:hover { text-decoration: underline; }
+  .chart-fullscreen-btn {
+    position: absolute; top: 16px; right: 16px;
+    background: var(--hover); border: 1px solid var(--border); border-radius: 4px;
+    padding: 2px 8px; cursor: pointer; font-size: 16px; color: var(--text);
+    opacity: 0.6; transition: opacity 0.2s;
+  }
+  .chart-fullscreen-btn:hover { opacity: 1; }
   table { width: 100%; border-collapse: collapse; background: var(--card-bg); border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px var(--shadow); }
-  th { background: var(--heading); color: var(--card-bg); padding: 12px; text-align: left; font-size: 14px; }
+  th { background: var(--heading); color: var(--card-bg); padding: 12px; text-align: left; font-size: 14px; cursor: pointer; user-select: none; }
+  th:hover { opacity: 0.85; }
+  th::after { content: ' \21C5'; opacity: 0.5; font-size: 12px; }
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--hover); }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; }
   .badge-green { background: #e8f5e9; color: #27ae60; }
   .badge-red { background: #ffebee; color: #e74c3c; }
+  .timeline-search {
+    margin-bottom: 12px; display: flex; gap: 8px; align-items: center;
+  }
+  .timeline-search input {
+    padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card-bg); color: var(--text); font-size: 14px; width: 300px;
+  }
+  .timeline-search .search-count { color: var(--faint); font-size: 13px; }
+  .chart-modal {
+    display: none; position: fixed; z-index: 9999; left: 0; top: 0;
+    width: 100%; height: 100%; background: rgba(0,0,0,0.7);
+    justify-content: center; align-items: center;
+  }
+  .chart-modal.active { display: flex; }
+  .chart-modal-content {
+    background: var(--card-bg); border-radius: 12px; padding: 30px;
+    width: 90%; max-width: 1000px; max-height: 80vh; overflow: auto;
+    position: relative;
+  }
+  .chart-modal-close {
+    position: absolute; top: 12px; right: 16px;
+    font-size: 28px; font-weight: bold; cursor: pointer;
+    color: var(--text); opacity: 0.6; transition: opacity 0.2s;
+  }
+  .chart-modal-close:hover { opacity: 1; }
   .footer { text-align: center; color: var(--faint); font-size: 12px; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); }
   @media print {
     body { background: white !important; color: black !important; padding: 0; }
     .report-toolbar { display: none !important; }
+    .timeline-search { display: none !important; }
+    .chart-fullscreen-btn { display: none !important; }
+    .chart-modal { display: none !important; }
     .stat-card, .chart-container, table { box-shadow: none !important; border: 1px solid #ccc !important; break-inside: avoid; }
     .chart-container { page-break-inside: avoid; }
     h2 { break-after: avoid; }
+    th { cursor: default; }
+    th::after { content: ''; }
   }
 </style>"#
+}
+
+// ============================================================================
+//  Session 98 — 数据导出 CSV/JSON + 交互增强
+// ============================================================================
+
+/// 转义 CSV 字段 — 如果字段包含逗号、引号或换行, 则用双引号包裹 (Session 98)
+///
+/// 遵循 RFC 4180 规范:
+/// - 字段包含逗号 (`,`)、双引号 (`"`) 或换行符时, 用双引号包裹
+/// - 字段内的双引号用两个双引号转义 (`""` → `"`)
+///
+/// # 参数
+///
+/// - `field`: 原始字段值
+///
+/// # 返回
+///
+/// 转义后的 CSV 安全字段
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::csv_escape_field;
+/// assert_eq!(csv_escape_field("hello"), "hello");
+/// assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+/// assert_eq!(csv_escape_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+/// assert_eq!(csv_escape_field("line1\nline2"), "\"line1\nline2\"");
+/// ```
+pub fn csv_escape_field(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// 将时间线数据导出为 CSV 格式 (Session 98)
+///
+/// 生成包含表头和数据行的 CSV 字符串, 列: 时间戳,操作类型,任务名称,耗时(ms),结果。
+///
+/// # 参数
+///
+/// - `timeline`: 时间线条目列表
+///
+/// # 返回
+///
+/// CSV 格式字符串 (UTF-8, LF 换行)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_timeline_csv;
+/// # use forge::dev_trace::{TimelineEntry, TraceAction};
+/// # use chrono::Utc;
+/// let timeline = vec![
+///     TimelineEntry {
+///         timestamp: chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z").unwrap().with_timezone(&Utc),
+///         action: TraceAction::TaskExecution,
+///         task_name: Some("Task 0".to_string()),
+///         success: true,
+///         duration_ms: 500,
+///     },
+/// ];
+/// let csv = generate_timeline_csv(&timeline);
+/// assert!(csv.contains("时间戳"));
+/// assert!(csv.contains("操作类型"));
+/// assert!(csv.contains("Task 0"));
+/// assert!(csv.contains("成功"));
+/// ```
+pub fn generate_timeline_csv(timeline: &[TimelineEntry]) -> String {
+    let mut csv = String::from("时间戳,操作类型,任务名称,耗时(ms),结果\n");
+    for entry in timeline {
+        let task = entry.task_name.as_deref().unwrap_or("");
+        let result = if entry.success { "成功" } else { "失败" };
+        csv.push_str(&format!(
+            "{},{},{},{},{}\n",
+            csv_escape_field(&entry.timestamp.to_rfc3339()),
+            csv_escape_field(&format!("{:?}", entry.action)),
+            csv_escape_field(task),
+            entry.duration_ms,
+            result,
+        ));
+    }
+    csv
+}
+
+/// 将操作类型统计导出为 CSV 格式 (Session 98)
+///
+/// 生成包含表头和数据行的 CSV 字符串, 列: 操作类型,总次数,成功次数,成功率,总耗时(ms),平均耗时(ms)。
+///
+/// # 参数
+///
+/// - `by_action`: 按操作类型分组的统计映射
+///
+/// # 返回
+///
+/// CSV 格式字符串
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_action_stats_csv;
+/// # use forge::dev_trace::{ActionStats, TraceAction};
+/// # use std::collections::HashMap;
+/// let mut by_action = HashMap::new();
+/// by_action.insert(TraceAction::CompileCheck, ActionStats { count: 10, success_count: 8, total_duration_ms: 5000 });
+/// let csv = generate_action_stats_csv(&by_action);
+/// assert!(csv.contains("操作类型"));
+/// assert!(csv.contains("CompileCheck"));
+/// assert!(csv.contains("10"));
+/// assert!(csv.contains("80.0%"));
+/// ```
+pub fn generate_action_stats_csv(by_action: &HashMap<TraceAction, ActionStats>) -> String {
+    let mut csv = String::from("操作类型,总次数,成功次数,成功率,总耗时(ms),平均耗时(ms)\n");
+    let mut entries: Vec<_> = by_action.iter().collect();
+    entries.sort_by_key(|(action, _)| format!("{:?}", action));
+    for (action, stats) in &entries {
+        let rate = if stats.count > 0 {
+            stats.success_count as f64 / stats.count as f64 * 100.0
+        } else {
+            0.0
+        };
+        let avg = stats.avg_duration_ms();
+        csv.push_str(&format!(
+            "{},{},{},{:.1}%,{},{}\n",
+            csv_escape_field(&format!("{:?}", action)),
+            stats.count,
+            stats.success_count,
+            rate,
+            stats.total_duration_ms,
+            avg,
+        ));
+    }
+    csv
+}
+
+/// 将时间线数据导出为 JSON 格式 (Session 98)
+///
+/// 生成包含时间线条目的 JSON 数组字符串。
+///
+/// # 参数
+///
+/// - `timeline`: 时间线条目列表
+///
+/// # 返回
+///
+/// JSON 格式字符串 (pretty print)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_timeline_json;
+/// # use forge::dev_trace::{TimelineEntry, TraceAction};
+/// # use chrono::Utc;
+/// let timeline = vec![
+///     TimelineEntry {
+///         timestamp: Utc::now(),
+///         action: TraceAction::TaskExecution,
+///         task_name: Some("Task A".to_string()),
+///         success: true,
+///         duration_ms: 300,
+///     },
+/// ];
+/// let json = generate_timeline_json(&timeline);
+/// assert!(json.contains("Task A"));
+/// assert!(json.contains("\"duration_ms\""));
+/// ```
+pub fn generate_timeline_json(timeline: &[TimelineEntry]) -> String {
+    #[derive(serde::Serialize)]
+    struct TimelineExport<'a> {
+        timestamp: String,
+        action: String,
+        task_name: &'a str,
+        duration_ms: u64,
+        success: bool,
+    }
+
+    let export: Vec<TimelineExport> = timeline
+        .iter()
+        .map(|e| TimelineExport {
+            timestamp: e.timestamp.to_rfc3339(),
+            action: format!("{:?}", e.action),
+            task_name: e.task_name.as_deref().unwrap_or(""),
+            duration_ms: e.duration_ms,
+            success: e.success,
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&export).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 将操作类型统计导出为 JSON 格式 (Session 98)
+///
+/// 生成包含操作类型统计的 JSON 数组字符串。
+///
+/// # 参数
+///
+/// - `by_action`: 按操作类型分组的统计映射
+///
+/// # 返回
+///
+/// JSON 格式字符串 (pretty print)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_action_stats_json;
+/// # use forge::dev_trace::{ActionStats, TraceAction};
+/// # use std::collections::HashMap;
+/// let mut by_action = HashMap::new();
+/// by_action.insert(TraceAction::CompileCheck, ActionStats { count: 5, success_count: 4, total_duration_ms: 2000 });
+/// let json = generate_action_stats_json(&by_action);
+/// assert!(json.contains("CompileCheck"));
+/// assert!(json.contains("\"count\": 5"));
+/// ```
+pub fn generate_action_stats_json(by_action: &HashMap<TraceAction, ActionStats>) -> String {
+    #[derive(serde::Serialize)]
+    struct ActionExport {
+        action: String,
+        count: usize,
+        success_count: usize,
+        success_rate: f64,
+        total_duration_ms: u64,
+        avg_duration_ms: u64,
+    }
+
+    let mut entries: Vec<ActionExport> = by_action
+        .iter()
+        .map(|(action, stats)| ActionExport {
+            action: format!("{:?}", action),
+            count: stats.count,
+            success_count: stats.success_count,
+            success_rate: if stats.count > 0 {
+                stats.success_count as f64 / stats.count as f64
+            } else {
+                0.0
+            },
+            total_duration_ms: stats.total_duration_ms,
+            avg_duration_ms: stats.avg_duration_ms(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.action.cmp(&b.action));
+
+    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// 生成导出按钮 HTML (Session 98)
+///
+/// 包含 CSV 和 JSON 导出按钮, 点击时通过 JavaScript 下载对应格式的数据。
+/// 按钮使用 `onclick` 调用 `downloadTimelineCSV()` 和 `downloadTimelineJSON()` 函数。
+///
+/// # 返回
+///
+/// HTML 字符串, 包含按钮和内联 script
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_export_buttons;
+/// let html = generate_export_buttons();
+/// assert!(html.contains("downloadTimelineCSV"));
+/// assert!(html.contains("downloadTimelineJSON"));
+/// assert!(html.contains("CSV"));
+/// assert!(html.contains("JSON"));
+/// ```
+pub fn generate_export_buttons() -> String {
+    r#"<div class="export-buttons" style="margin-bottom: 12px; display: flex; gap: 8px;">
+  <button class="toolbar-btn" onclick="downloadTimelineCSV()">📋 导出时间线 CSV</button>
+  <button class="toolbar-btn" onclick="downloadTimelineJSON()">📦 导出时间线 JSON</button>
+  <button class="toolbar-btn" onclick="downloadActionStatsCSV()">📋 导出操作统计 CSV</button>
+  <button class="toolbar-btn" onclick="downloadActionStatsJSON()">📦 导出操作统计 JSON</button>
+</div>
+<script>
+  function downloadFile(filename, content, mimeType) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+  function downloadTimelineCSV() {
+    const csv = document.getElementById('timeline-csv-data')?.textContent || '';
+    downloadFile('forge-timeline.csv', csv, 'text/csv;charset=utf-8');
+  }
+  function downloadTimelineJSON() {
+    const json = document.getElementById('timeline-json-data')?.textContent || '';
+    downloadFile('forge-timeline.json', json, 'application/json');
+  }
+  function downloadActionStatsCSV() {
+    const csv = document.getElementById('action-stats-csv-data')?.textContent || '';
+    downloadFile('forge-action-stats.csv', csv, 'text/csv;charset=utf-8');
+  }
+  function downloadActionStatsJSON() {
+    const json = document.getElementById('action-stats-json-data')?.textContent || '';
+    downloadFile('forge-action-stats.json', json, 'application/json');
+  }
+</script>"#
+        .to_string()
+}
+
+/// 生成时间线搜索过滤框 HTML + JavaScript (Session 98)
+///
+/// 提供一个文本输入框, 实时过滤时间线表格行。
+/// 支持按操作类型、任务名称、结果进行搜索。
+///
+/// # 返回
+///
+/// HTML 字符串, 包含搜索框和过滤脚本
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_timeline_search;
+/// let html = generate_timeline_search();
+/// assert!(html.contains("timeline-search"));
+/// assert!(html.contains("filterTimeline"));
+/// ```
+pub fn generate_timeline_search() -> String {
+    r#"<div class="timeline-search">
+  <input type="text" id="timelineSearch" placeholder="🔍 搜索时间线 (操作类型/任务名称/结果)..." oninput="filterTimeline()">
+  <span class="search-count" id="timelineSearchCount"></span>
+</div>
+<script>
+  function filterTimeline() {
+    const query = document.getElementById('timelineSearch')?.value.toLowerCase().trim() || '';
+    const tbody = document.querySelector('#timelineTable tbody');
+    if (!tbody) return;
+    const rows = tbody.querySelectorAll('tr');
+    let visible = 0;
+    rows.forEach(function(row) {
+      const text = row.textContent.toLowerCase();
+      if (query === '' || text.includes(query)) {
+        row.style.display = '';
+        visible++;
+      } else {
+        row.style.display = 'none';
+      }
+    });
+    const countEl = document.getElementById('timelineSearchCount');
+    if (countEl) {
+      countEl.textContent = query ? visible + ' / ' + rows.length + ' 条匹配' : '';
+    }
+  }
+</script>"#
+        .to_string()
+}
+
+/// 生成图表全屏放大模态框 JavaScript (Session 98)
+///
+/// 点击图表标题或全屏按钮时, 将图表内容复制到模态框中放大显示。
+/// 支持点击背景或关闭按钮关闭模态框, 按 ESC 键也可关闭。
+///
+/// # 返回
+///
+/// HTML 字符串, 包含模态框 div 和 JavaScript 脚本
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_chart_fullscreen_script;
+/// let html = generate_chart_fullscreen_script();
+/// assert!(html.contains("chart-modal"));
+/// assert!(html.contains("openChartFullscreen"));
+/// assert!(html.contains("closeChartFullscreen"));
+/// ```
+pub fn generate_chart_fullscreen_script() -> String {
+    r#"<div class="chart-modal" id="chartModal" onclick="if(event.target===this)closeChartFullscreen()">
+  <div class="chart-modal-content">
+    <span class="chart-modal-close" onclick="closeChartFullscreen()">&times;</span>
+    <div id="chartModalBody"></div>
+  </div>
+</div>
+<script>
+  function openChartFullscreen(canvasId) {
+    const source = document.getElementById(canvasId);
+    if (!source) return;
+    const container = source.closest('.chart-container');
+    if (!container) return;
+    const title = container.querySelector('.chart-title')?.textContent || '';
+    const modalBody = document.getElementById('chartModalBody');
+    if (!modalBody) return;
+    modalBody.innerHTML = '<h3 style="margin-bottom:16px;">' + title + '</h3><canvas id="chartModalCanvas"></canvas>';
+    const modalCanvas = document.getElementById('chartModalCanvas');
+    if (!modalCanvas) return;
+    const ctx = modalCanvas.getContext('2d');
+    const chart = Chart.getChart(canvasId);
+    if (chart) {
+      new Chart(ctx, {
+        type: chart.config.type,
+        data: chart.data,
+        options: Object.assign({}, chart.options, { responsive: true, maintainAspectRatio: false })
+      });
+    }
+    const modal = document.getElementById('chartModal');
+    if (modal) modal.classList.add('active');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeChartFullscreen() {
+    const modal = document.getElementById('chartModal');
+    if (modal) modal.classList.remove('active');
+    const modalBody = document.getElementById('chartModalBody');
+    if (modalBody) modalBody.innerHTML = '';
+    document.body.style.overflow = '';
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeChartFullscreen();
+  });
+</script>"#
+        .to_string()
+}
+
+/// 生成表格排序 JavaScript (Session 98)
+///
+/// 点击表格表头时, 按该列进行升序/降序排序, 再次点击切换排序方向。
+/// 支持数值和文本列的自动类型检测。
+///
+/// # 返回
+///
+/// HTML 字符串, 包含排序 JavaScript 脚本
+///
+/// # 示例
+///
+/// ```
+/// # use forge::html_report::generate_table_sort_script;
+/// let html = generate_table_sort_script();
+/// assert!(html.contains("sortTable"));
+/// assert!(html.contains("sortDirection"));
+/// ```
+pub fn generate_table_sort_script() -> String {
+    r#"<script>
+  var sortDirection = {};
+  function sortTable(tableId, columnIndex) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const tbody = table.querySelector('tbody');
+    if (!tbody) return;
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+    const key = tableId + '-' + columnIndex;
+    const dir = sortDirection[key] = !sortDirection[key];
+    rows.sort(function(a, b) {
+      let aVal = a.cells[columnIndex]?.textContent.trim() || '';
+      let bVal = b.cells[columnIndex]?.textContent.trim() || '';
+      const aNum = parseFloat(aVal.replace(/[^0-9.-]/g, ''));
+      const bNum = parseFloat(bVal.replace(/[^0-9.-]/g, ''));
+      if (!isNaN(aNum) && !isNaN(bNum)) {
+        return dir ? aNum - bNum : bNum - aNum;
+      }
+      return dir ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+    });
+    rows.forEach(function(row) { tbody.appendChild(row); });
+  }
+</script>"#
+        .to_string()
 }
 
 /// 从 DevTraceSummary 生成完整 HTML 报告
@@ -903,6 +1404,10 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
 
     // === 报告工具栏 (Session 97) ===
     html.push_str(&generate_report_toolbar());
+    html.push('\n');
+
+    // === 导出按钮 (Session 98) ===
+    html.push_str(&generate_export_buttons());
     html.push('\n');
 
     // === 概览统计卡片 ===
@@ -1373,10 +1878,20 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
         html.push_str("</div>\n");
     }
 
-    // === 时间线表格 ===
+    // === 时间线表格 (Session 98: 搜索过滤 + 可排序表头) ===
     if !summary.timeline.is_empty() {
         html.push_str("<h2>📋 时间线 (最近 100 条)</h2>\n");
-        html.push_str("<table>\n<thead>\n<tr><th>时间</th><th>操作</th><th>任务</th><th>耗时</th><th>结果</th></tr>\n</thead>\n<tbody>\n");
+        // 搜索过滤框
+        html.push_str(&generate_timeline_search());
+        html.push('\n');
+        // 可排序表格
+        html.push_str("<table id=\"timelineTable\">\n<thead>\n<tr>");
+        html.push_str("<th onclick=\"sortTable('timelineTable', 0)\">时间</th>");
+        html.push_str("<th onclick=\"sortTable('timelineTable', 1)\">操作</th>");
+        html.push_str("<th onclick=\"sortTable('timelineTable', 2)\">任务</th>");
+        html.push_str("<th onclick=\"sortTable('timelineTable', 3)\">耗时</th>");
+        html.push_str("<th onclick=\"sortTable('timelineTable', 4)\">结果</th>");
+        html.push_str("</tr>\n</thead>\n<tbody>\n");
         for entry in &summary.timeline {
             let result_badge = if entry.success {
                 "<span class=\"badge badge-green\">成功</span>"
@@ -1394,7 +1909,39 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             ));
         }
         html.push_str("</tbody>\n</table>\n");
+
+        // 隐藏的 CSV/JSON 数据 (供导出按钮读取)
+        let timeline_csv = generate_timeline_csv(&summary.timeline);
+        let timeline_json = generate_timeline_json(&summary.timeline);
+        html.push_str(&format!(
+            "<script type=\"text/plain\" id=\"timeline-csv-data\">{}</script>\n",
+            escape_html(&timeline_csv)
+        ));
+        html.push_str(&format!(
+            "<script type=\"text/plain\" id=\"timeline-json-data\">{}</script>\n",
+            escape_html(&timeline_json)
+        ));
     }
+
+    // 隐藏的操作统计 CSV/JSON 数据
+    if !summary.by_action.is_empty() {
+        let action_csv = generate_action_stats_csv(&summary.by_action);
+        let action_json = generate_action_stats_json(&summary.by_action);
+        html.push_str(&format!(
+            "<script type=\"text/plain\" id=\"action-stats-csv-data\">{}</script>\n",
+            escape_html(&action_csv)
+        ));
+        html.push_str(&format!(
+            "<script type=\"text/plain\" id=\"action-stats-json-data\">{}</script>\n",
+            escape_html(&action_json)
+        ));
+    }
+
+    // === 交互脚本 (Session 98: 图表全屏 + 表格排序) ===
+    html.push_str(&generate_chart_fullscreen_script());
+    html.push('\n');
+    html.push_str(&generate_table_sort_script());
+    html.push('\n');
 
     // 页脚
     html.push_str(&format!(
@@ -2555,10 +3102,10 @@ mod tests {
     }
 
     #[test]
-    fn test_html_report_version_1_1() {
+    fn test_html_report_version_1_2() {
         let summary = DevTraceSummary::empty();
         let html = generate_html_report(&summary);
-        assert!(html.contains("1.1"));
+        assert!(html.contains("1.2"));
     }
 
     #[test]
@@ -2710,5 +3257,633 @@ mod tests {
         // 深色模式 CSS
         assert!(html.contains("dark-mode"));
         assert!(html.contains("@media print"));
+    }
+
+    // ======================================================================
+    //  Session 98 测试 — CSV/JSON 导出 + 搜索过滤 + 全屏放大 + 表格排序
+    // ======================================================================
+
+    // --- csv_escape_field 测试 ---
+
+    #[test]
+    fn test_csv_escape_plain() {
+        assert_eq!(csv_escape_field("hello"), "hello");
+    }
+
+    #[test]
+    fn test_csv_escape_comma() {
+        assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn test_csv_escape_quote() {
+        assert_eq!(csv_escape_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_escape_newline() {
+        assert_eq!(csv_escape_field("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn test_csv_escape_carriage_return() {
+        assert_eq!(csv_escape_field("a\rb"), "\"a\rb\"");
+    }
+
+    #[test]
+    fn test_csv_escape_empty() {
+        assert_eq!(csv_escape_field(""), "");
+    }
+
+    // --- generate_timeline_csv 测试 ---
+
+    #[test]
+    fn test_timeline_csv_basic() {
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::TaskExecution,
+            task_name: Some("Task A".to_string()),
+            success: true,
+            duration_ms: 500,
+        }];
+        let csv = generate_timeline_csv(&timeline);
+        assert!(csv.contains("时间戳"));
+        assert!(csv.contains("操作类型"));
+        assert!(csv.contains("任务名称"));
+        assert!(csv.contains("耗时(ms)"));
+        assert!(csv.contains("结果"));
+        assert!(csv.contains("Task A"));
+        assert!(csv.contains("TaskExecution"));
+        assert!(csv.contains("成功"));
+        assert!(csv.contains("500"));
+    }
+
+    #[test]
+    fn test_timeline_csv_empty() {
+        let csv = generate_timeline_csv(&[]);
+        // 空时间线仍应包含表头
+        assert!(csv.contains("时间戳"));
+        assert!(!csv.contains("TaskExecution"));
+    }
+
+    #[test]
+    fn test_timeline_csv_failure_entry() {
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::FixAttempt,
+            task_name: None,
+            success: false,
+            duration_ms: 200,
+        }];
+        let csv = generate_timeline_csv(&timeline);
+        assert!(csv.contains("失败"));
+        assert!(csv.contains("FixAttempt"));
+        assert!(csv.contains("200"));
+    }
+
+    #[test]
+    fn test_timeline_csv_comma_in_task_name() {
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::TaskExecution,
+            task_name: Some("hello, world".to_string()),
+            success: true,
+            duration_ms: 100,
+        }];
+        let csv = generate_timeline_csv(&timeline);
+        // 包含逗号的字段应被引号包裹
+        assert!(csv.contains("\"hello, world\""));
+    }
+
+    #[test]
+    fn test_timeline_csv_multiple_entries() {
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T1".to_string()),
+                success: true,
+                duration_ms: 100,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::CompileCheck,
+                task_name: Some("T2".to_string()),
+                success: false,
+                duration_ms: 200,
+            },
+        ];
+        let csv = generate_timeline_csv(&timeline);
+        assert!(csv.contains("T1"));
+        assert!(csv.contains("T2"));
+        assert!(csv.contains("成功"));
+        assert!(csv.contains("失败"));
+    }
+
+    // --- generate_action_stats_csv 测试 ---
+
+    #[test]
+    fn test_action_stats_csv_basic() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 10,
+                success_count: 8,
+                total_duration_ms: 5000,
+            },
+        );
+        let csv = generate_action_stats_csv(&by_action);
+        assert!(csv.contains("操作类型"));
+        assert!(csv.contains("总次数"));
+        assert!(csv.contains("成功次数"));
+        assert!(csv.contains("成功率"));
+        assert!(csv.contains("总耗时(ms)"));
+        assert!(csv.contains("平均耗时(ms)"));
+        assert!(csv.contains("CompileCheck"));
+        assert!(csv.contains("10"));
+        assert!(csv.contains("80.0%"));
+    }
+
+    #[test]
+    fn test_action_stats_csv_empty() {
+        let by_action: HashMap<TraceAction, ActionStats> = HashMap::new();
+        let csv = generate_action_stats_csv(&by_action);
+        assert!(csv.contains("操作类型"));
+        // 只有表头
+        assert_eq!(csv.lines().count(), 1);
+    }
+
+    #[test]
+    fn test_action_stats_csv_multiple_entries() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::TaskExecution,
+            ActionStats {
+                count: 5,
+                success_count: 5,
+                total_duration_ms: 1000,
+            },
+        );
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 10,
+                success_count: 7,
+                total_duration_ms: 3000,
+            },
+        );
+        let csv = generate_action_stats_csv(&by_action);
+        assert!(csv.contains("CompileCheck"));
+        assert!(csv.contains("TaskExecution"));
+        assert!(csv.contains("100.0%"));
+        assert!(csv.contains("70.0%"));
+    }
+
+    #[test]
+    fn test_action_stats_csv_zero_count() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::TestRun,
+            ActionStats {
+                count: 0,
+                success_count: 0,
+                total_duration_ms: 0,
+            },
+        );
+        let csv = generate_action_stats_csv(&by_action);
+        assert!(csv.contains("0.0%"));
+    }
+
+    // --- generate_timeline_json 测试 ---
+
+    #[test]
+    fn test_timeline_json_basic() {
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::TaskExecution,
+            task_name: Some("Task A".to_string()),
+            success: true,
+            duration_ms: 300,
+        }];
+        let json = generate_timeline_json(&timeline);
+        assert!(json.contains("Task A"));
+        assert!(json.contains("\"duration_ms\""));
+        assert!(json.contains("\"success\""));
+        assert!(json.contains("\"action\""));
+        assert!(json.contains("TaskExecution"));
+    }
+
+    #[test]
+    fn test_timeline_json_empty() {
+        let json = generate_timeline_json(&[]);
+        assert_eq!(json.trim(), "[]");
+    }
+
+    #[test]
+    fn test_timeline_json_multiple_entries() {
+        let timeline = vec![
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("T1".to_string()),
+                success: true,
+                duration_ms: 100,
+            },
+            TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::FixAttempt,
+                task_name: Some("T2".to_string()),
+                success: false,
+                duration_ms: 200,
+            },
+        ];
+        let json = generate_timeline_json(&timeline);
+        assert!(json.contains("T1"));
+        assert!(json.contains("T2"));
+        assert!(json.contains("true"));
+        assert!(json.contains("false"));
+    }
+
+    #[test]
+    fn test_timeline_json_no_task_name() {
+        let timeline = vec![TimelineEntry {
+            timestamp: chrono::Utc::now(),
+            action: TraceAction::CompileCheck,
+            task_name: None,
+            success: true,
+            duration_ms: 50,
+        }];
+        let json = generate_timeline_json(&timeline);
+        assert!(json.contains("\"task_name\": \"\""));
+    }
+
+    // --- generate_action_stats_json 测试 ---
+
+    #[test]
+    fn test_action_stats_json_basic() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 5,
+                success_count: 4,
+                total_duration_ms: 2000,
+            },
+        );
+        let json = generate_action_stats_json(&by_action);
+        assert!(json.contains("CompileCheck"));
+        assert!(json.contains("\"count\": 5"));
+        assert!(json.contains("\"success_count\": 4"));
+        assert!(json.contains("\"success_rate\""));
+    }
+
+    #[test]
+    fn test_action_stats_json_empty() {
+        let by_action: HashMap<TraceAction, ActionStats> = HashMap::new();
+        let json = generate_action_stats_json(&by_action);
+        assert_eq!(json.trim(), "[]");
+    }
+
+    #[test]
+    fn test_action_stats_json_multiple_entries() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::TaskExecution,
+            ActionStats {
+                count: 3,
+                success_count: 3,
+                total_duration_ms: 600,
+            },
+        );
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 10,
+                success_count: 7,
+                total_duration_ms: 3000,
+            },
+        );
+        let json = generate_action_stats_json(&by_action);
+        assert!(json.contains("CompileCheck"));
+        assert!(json.contains("TaskExecution"));
+        assert!(json.contains("1.0")); // 3/3 = 1.0
+        assert!(json.contains("0.7")); // 7/10 = 0.7
+    }
+
+    // --- generate_export_buttons 测试 ---
+
+    #[test]
+    fn test_export_buttons_contains_csv_button() {
+        let html = generate_export_buttons();
+        assert!(html.contains("downloadTimelineCSV"));
+        assert!(html.contains("CSV"));
+    }
+
+    #[test]
+    fn test_export_buttons_contains_json_button() {
+        let html = generate_export_buttons();
+        assert!(html.contains("downloadTimelineJSON"));
+        assert!(html.contains("JSON"));
+    }
+
+    #[test]
+    fn test_export_buttons_contains_action_stats_buttons() {
+        let html = generate_export_buttons();
+        assert!(html.contains("downloadActionStatsCSV"));
+        assert!(html.contains("downloadActionStatsJSON"));
+    }
+
+    #[test]
+    fn test_export_buttons_contains_download_function() {
+        let html = generate_export_buttons();
+        assert!(html.contains("downloadFile"));
+        assert!(html.contains("Blob"));
+        assert!(html.contains("createObjectURL"));
+    }
+
+    // --- generate_timeline_search 测试 ---
+
+    #[test]
+    fn test_timeline_search_contains_input() {
+        let html = generate_timeline_search();
+        assert!(html.contains("timelineSearch"));
+        assert!(html.contains("input"));
+        assert!(html.contains("搜索"));
+    }
+
+    #[test]
+    fn test_timeline_search_contains_filter_function() {
+        let html = generate_timeline_search();
+        assert!(html.contains("filterTimeline"));
+        assert!(html.contains("oninput"));
+    }
+
+    #[test]
+    fn test_timeline_search_contains_count_display() {
+        let html = generate_timeline_search();
+        assert!(html.contains("timelineSearchCount"));
+        assert!(html.contains("条匹配"));
+    }
+
+    // --- generate_chart_fullscreen_script 测试 ---
+
+    #[test]
+    fn test_chart_fullscreen_contains_modal() {
+        let html = generate_chart_fullscreen_script();
+        assert!(html.contains("chart-modal"));
+        assert!(html.contains("chartModal"));
+        assert!(html.contains("chartModalBody"));
+    }
+
+    #[test]
+    fn test_chart_fullscreen_contains_open_function() {
+        let html = generate_chart_fullscreen_script();
+        assert!(html.contains("openChartFullscreen"));
+        assert!(html.contains("closeChartFullscreen"));
+    }
+
+    #[test]
+    fn test_chart_fullscreen_contains_escape_key_handler() {
+        let html = generate_chart_fullscreen_script();
+        assert!(html.contains("Escape"));
+        assert!(html.contains("keydown"));
+    }
+
+    #[test]
+    fn test_chart_fullscreen_contains_chart_reference() {
+        let html = generate_chart_fullscreen_script();
+        assert!(html.contains("Chart.getChart"));
+        assert!(html.contains("new Chart"));
+    }
+
+    // --- generate_table_sort_script 测试 ---
+
+    #[test]
+    fn test_table_sort_contains_sort_function() {
+        let html = generate_table_sort_script();
+        assert!(html.contains("sortTable"));
+        assert!(html.contains("sortDirection"));
+    }
+
+    #[test]
+    fn test_table_sort_contains_numeric_detection() {
+        let html = generate_table_sort_script();
+        assert!(html.contains("parseFloat"));
+        assert!(html.contains("isNaN"));
+    }
+
+    #[test]
+    fn test_table_sort_contains_locale_compare() {
+        let html = generate_table_sort_script();
+        assert!(html.contains("localeCompare"));
+    }
+
+    // --- CSS 样式增强测试 (Session 98) ---
+
+    #[test]
+    fn test_css_styles_has_timeline_search_styles() {
+        let css = generate_css_styles();
+        assert!(css.contains(".timeline-search"));
+        assert!(css.contains(".timeline-search input"));
+    }
+
+    #[test]
+    fn test_css_styles_has_chart_modal_styles() {
+        let css = generate_css_styles();
+        assert!(css.contains(".chart-modal"));
+        assert!(css.contains(".chart-modal-content"));
+        assert!(css.contains(".chart-modal-close"));
+    }
+
+    #[test]
+    fn test_css_styles_has_sortable_header_styles() {
+        let css = generate_css_styles();
+        assert!(css.contains("cursor: pointer"));
+        assert!(css.contains("user-select: none"));
+        assert!(css.contains("th::after"));
+    }
+
+    #[test]
+    fn test_css_styles_has_fullscreen_button_styles() {
+        let css = generate_css_styles();
+        assert!(css.contains(".chart-fullscreen-btn"));
+        assert!(css.contains("position: absolute"));
+    }
+
+    #[test]
+    fn test_css_styles_print_hides_interactive_elements() {
+        let css = generate_css_styles();
+        assert!(css.contains(".timeline-search { display: none"));
+        assert!(css.contains(".chart-fullscreen-btn { display: none"));
+        assert!(css.contains(".chart-modal { display: none"));
+    }
+
+    // --- HTML 报告集成测试 (Session 98) ---
+
+    #[test]
+    fn test_html_report_contains_export_buttons() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("downloadTimelineCSV"));
+        assert!(html.contains("downloadTimelineJSON"));
+        assert!(html.contains("downloadActionStatsCSV"));
+        assert!(html.contains("downloadActionStatsJSON"));
+    }
+
+    #[test]
+    fn test_html_report_contains_timeline_search() {
+        let summary = DevTraceSummary {
+            timeline: vec![TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task 0".to_string()),
+                success: true,
+                duration_ms: 100,
+            }],
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("timelineSearch"));
+        assert!(html.contains("filterTimeline"));
+    }
+
+    #[test]
+    fn test_html_report_no_timeline_search_without_timeline() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(!html.contains("timelineSearch"));
+    }
+
+    #[test]
+    fn test_html_report_contains_chart_fullscreen_modal() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("chartModal"));
+        assert!(html.contains("openChartFullscreen"));
+        assert!(html.contains("closeChartFullscreen"));
+    }
+
+    #[test]
+    fn test_html_report_contains_table_sort_script() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        assert!(html.contains("sortTable"));
+        assert!(html.contains("sortDirection"));
+    }
+
+    #[test]
+    fn test_html_report_timeline_table_has_sortable_headers() {
+        let summary = DevTraceSummary {
+            timeline: vec![TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task 0".to_string()),
+                success: true,
+                duration_ms: 100,
+            }],
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("id=\"timelineTable\""));
+        assert!(html.contains("sortTable('timelineTable'"));
+    }
+
+    #[test]
+    fn test_html_report_contains_hidden_csv_data() {
+        let summary = DevTraceSummary {
+            timeline: vec![TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task 0".to_string()),
+                success: true,
+                duration_ms: 100,
+            }],
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("id=\"timeline-csv-data\""));
+        assert!(html.contains("id=\"timeline-json-data\""));
+    }
+
+    #[test]
+    fn test_html_report_contains_hidden_action_stats_data() {
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 5,
+                success_count: 4,
+                total_duration_ms: 1000,
+            },
+        );
+        let summary = DevTraceSummary {
+            by_action,
+            ..DevTraceSummary::empty()
+        };
+        let html = generate_html_report(&summary);
+        assert!(html.contains("id=\"action-stats-csv-data\""));
+        assert!(html.contains("id=\"action-stats-json-data\""));
+    }
+
+    #[test]
+    fn test_html_report_no_hidden_data_without_content() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+        // 空摘要不应包含隐藏的 script 数据块
+        // (JS 代码中引用了这些 ID, 但不应生成实际的 <script type="text/plain"> 数据块)
+        assert!(!html.contains("<script type=\"text/plain\" id=\"timeline-csv-data\""));
+        assert!(!html.contains("<script type=\"text/plain\" id=\"action-stats-csv-data\""));
+    }
+
+    #[test]
+    fn test_html_report_full_with_session98_features() {
+        use crate::dev_trace::CacheStatsSummary;
+
+        let mut by_action = HashMap::new();
+        by_action.insert(
+            TraceAction::CompileCheck,
+            ActionStats {
+                count: 10,
+                success_count: 8,
+                total_duration_ms: 5000,
+            },
+        );
+
+        let summary = DevTraceSummary {
+            total_entries: 50,
+            total_duration_ms: 60000,
+            by_action,
+            success_rate: 0.8,
+            cache_summary: Some(CacheStatsSummary {
+                cache_hits: 6,
+                cache_misses: 3,
+                search_failures: 1,
+                time_saved_ms: 5000,
+            }),
+            timeline: vec![TimelineEntry {
+                timestamp: chrono::Utc::now(),
+                action: TraceAction::TaskExecution,
+                task_name: Some("Task 0".to_string()),
+                success: true,
+                duration_ms: 1000,
+            }],
+            ..DevTraceSummary::empty()
+        };
+
+        let html = generate_html_report(&summary);
+        // Session 98 交互功能
+        assert!(html.contains("downloadTimelineCSV"));
+        assert!(html.contains("timelineSearch"));
+        assert!(html.contains("filterTimeline"));
+        assert!(html.contains("chartModal"));
+        assert!(html.contains("sortTable"));
+        // 隐藏数据
+        assert!(html.contains("timeline-csv-data"));
+        assert!(html.contains("timeline-json-data"));
+        assert!(html.contains("action-stats-csv-data"));
+        assert!(html.contains("action-stats-json-data"));
+        // 版本 1.2
+        assert!(html.contains("1.2"));
     }
 }
