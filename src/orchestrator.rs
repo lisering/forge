@@ -31,6 +31,7 @@ use crate::dev_trace::{
     build_memory_evaluation_history_summary, build_memory_evaluation_stats,
     build_search_quality_history_summary, build_search_quality_stats, DevTraceWriter, TraceAction,
 };
+use crate::dev_trace::{extract_memory_diff_history, extract_search_diff_history};
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
 use crate::error_search;
 use crate::interaction::AutoApprove;
@@ -3197,6 +3198,13 @@ where
                     h.saved_at.clone(),
                 );
                 summary = summary.with_search_quality_history(sq_summary);
+
+                // 附加搜索质量 sparkline 数据 (Session 95)
+                let entries = trace.read_all().unwrap_or_default();
+                let search_diffs = extract_search_diff_history(&entries);
+                if !search_diffs.is_empty() {
+                    summary = summary.with_search_quality_sparkline(search_diffs);
+                }
             }
 
             // 附加 Memory 评估历史摘要 (Session 90)
@@ -3210,6 +3218,13 @@ where
                     h.saved_at.clone(),
                 );
                 summary = summary.with_memory_evaluation_history(me_summary);
+
+                // 附加 Memory 评估 sparkline 数据 (Session 95)
+                let entries = trace.read_all().unwrap_or_default();
+                let memory_diffs = extract_memory_diff_history(&entries);
+                if !memory_diffs.is_empty() {
+                    summary = summary.with_memory_evaluation_sparkline(memory_diffs);
+                }
             }
 
             // 附加三评估器协同分析摘要 (Session 91) + 历史持久化 (Session 92)
@@ -9175,7 +9190,8 @@ mod tests {
         if let Some(ref mut tuner) = orch.cache_tuner {
             let d1 = crate::cache_tuning::CacheTuningDecision::adjust_ttl(1800, 900, -0.10, "缩短");
             tuner.apply_decision(&d1);
-            let d2 = crate::cache_tuning::CacheTuningDecision::disable_cache(900, -0.20, "缓存有害");
+            let d2 =
+                crate::cache_tuning::CacheTuningDecision::disable_cache(900, -0.20, "缓存有害");
             tuner.apply_decision(&d2);
         }
 
@@ -9188,6 +9204,218 @@ mod tests {
         assert!(
             json_content.contains("ttl_history_values"),
             "JSON 应包含 ttl_history_values 字段"
+        );
+    }
+
+    // ===== Session 95: 搜索质量/Memory 评估 sparkline 集成测试 =====
+
+    #[test]
+    fn test_final_report_extracts_search_quality_sparkline_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入 SearchQuality trace 条目 (含差值信息)
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::SearchQuality,
+                    Some(0),
+                    Some(0),
+                    Some("t1"),
+                    "with=2/3",
+                    "搜索质量: 保持搜索 (差值 +10.0%, 原因: 有效)",
+                    0,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::SearchQuality,
+                    Some(0),
+                    Some(1),
+                    Some("t2"),
+                    "with=1/3",
+                    "搜索质量: 禁用搜索 (差值 -15.0%, 原因: 有害)",
+                    0,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        orch.final_report().unwrap();
+
+        // 验证 JSON 包含搜索质量 sparkline 数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json_content.contains("search_diff_history"),
+            "JSON 应包含 search_diff_history 字段"
+        );
+    }
+
+    #[test]
+    fn test_final_report_extracts_memory_evaluation_sparkline_data() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_dev_trace(true)
+            .with_memory_evaluator(
+                crate::memory_evaluation::MemoryContextEvaluator::with_default_config(),
+            );
+        setup_test_phase(&mut orch);
+
+        // 写入 MemoryEvaluation trace 条目 (含差值信息)
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::MemoryEvaluation,
+                    Some(0),
+                    Some(0),
+                    Some("t1"),
+                    "with=2/3",
+                    "Memory 评估: KeepInjecting (差值 +10.0%, 有效)",
+                    0,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::MemoryEvaluation,
+                    Some(0),
+                    Some(1),
+                    Some("t2"),
+                    "with=1/3",
+                    "Memory 评估: DisableInjection (差值 -20.0%, 有害)",
+                    0,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        orch.final_report().unwrap();
+
+        // 验证 JSON 包含 Memory 评估 sparkline 数据
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json_content.contains("memory_diff_history"),
+            "JSON 应包含 memory_diff_history 字段"
+        );
+    }
+
+    #[test]
+    fn test_final_report_html_contains_search_diff_trend_chart() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator_with_quality(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        // 写入 SearchQuality trace 条目
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::SearchQuality,
+                    Some(0),
+                    Some(0),
+                    Some("t1"),
+                    "with=2/3",
+                    "搜索质量: 保持搜索 (差值 +10.0%, 原因: 有效)",
+                    0,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::SearchQuality,
+                    Some(0),
+                    Some(1),
+                    Some("t2"),
+                    "with=1/3",
+                    "搜索质量: 保持搜索 (差值 +5.0%, 原因: 中性)",
+                    0,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        orch.final_report().unwrap();
+
+        // 验证 HTML 包含搜索质量差值趋势图
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let html_content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            html_content.contains("searchDiffTrendChart"),
+            "HTML 应包含 searchDiffTrendChart"
+        );
+        assert!(
+            html_content.contains("搜索质量差值趋势"),
+            "HTML 应包含搜索质量差值趋势标题"
+        );
+    }
+
+    #[test]
+    fn test_final_report_html_contains_memory_diff_trend_chart() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_dev_trace(true)
+            .with_memory_evaluator(
+                crate::memory_evaluation::MemoryContextEvaluator::with_default_config(),
+            );
+        setup_test_phase(&mut orch);
+
+        // 写入 MemoryEvaluation trace 条目
+        write_trace_entries(
+            &orch,
+            &[
+                DevTraceEntry::new(
+                    TraceAction::MemoryEvaluation,
+                    Some(0),
+                    Some(0),
+                    Some("t1"),
+                    "with=2/3",
+                    "Memory 评估: KeepInjecting (差值 +10.0%, 有效)",
+                    0,
+                    true,
+                    None,
+                ),
+                DevTraceEntry::new(
+                    TraceAction::MemoryEvaluation,
+                    Some(0),
+                    Some(1),
+                    Some("t2"),
+                    "with=2/3",
+                    "Memory 评估: KeepInjecting (差值 +5.0%, 中性)",
+                    0,
+                    true,
+                    None,
+                ),
+            ],
+        );
+
+        orch.final_report().unwrap();
+
+        // 验证 HTML 包含 Memory 评估差值趋势图
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let html_content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            html_content.contains("memoryDiffTrendChart"),
+            "HTML 应包含 memoryDiffTrendChart"
+        );
+        assert!(
+            html_content.contains("Memory 评估差值趋势"),
+            "HTML 应包含 Memory 评估差值趋势标题"
         );
     }
 }

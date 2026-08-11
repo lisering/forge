@@ -1206,6 +1206,100 @@ pub fn build_memory_evaluation_stats(entries: &[DevTraceEntry]) -> MemoryEvaluat
 }
 
 // ============================================================================
+//  纯函数 — 提取搜索质量/Memory 评估差值历史 (Session 95)
+// ============================================================================
+
+/// 从 DevTrace 条目中提取搜索质量评估的差值历史
+///
+/// 遍历所有 `TraceAction::SearchQuality` 条目, 解析 `output_summary` 中的
+/// "差值 {:+.1}%" 格式, 返回差值列表 (如 0.1 表示 +10%)。
+///
+/// 用于在 DevTraceSummary 中渲染搜索质量差值趋势 sparkline。
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 返回
+///
+/// 差值列表, 按条目顺序排列。空列表表示无搜索质量评估记录。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceEntry, TraceAction, extract_search_diff_history};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::SearchQuality, Some(0), Some(0), Some("t1"),
+///         "with=2/3", "搜索质量: 保持搜索 (差值 +10.0%, 原因: 有效)",
+///         0, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::SearchQuality, Some(0), Some(1), Some("t2"),
+///         "with=1/3", "搜索质量: 禁用搜索 (差值 -15.0%, 原因: 有害)",
+///         0, true, None,
+///     ),
+/// ];
+/// let diffs = extract_search_diff_history(&entries);
+/// assert_eq!(diffs.len(), 2);
+/// assert!((diffs[0] - 0.1).abs() < 0.001);
+/// assert!((diffs[1] - (-0.15)).abs() < 0.001);
+/// ```
+pub fn extract_search_diff_history(entries: &[DevTraceEntry]) -> Vec<f64> {
+    use crate::evaluator_synergy::parse_diff_value;
+    entries
+        .iter()
+        .filter(|e| e.action == TraceAction::SearchQuality)
+        .map(|e| parse_diff_value(&e.output_summary))
+        .collect()
+}
+
+/// 从 DevTrace 条目中提取 Memory 评估的差值历史
+///
+/// 遍历所有 `TraceAction::MemoryEvaluation` 条目, 解析 `output_summary` 中的
+/// "差值 {:+.1}%" 格式, 返回差值列表 (如 -0.2 表示 -20%)。
+///
+/// 用于在 DevTraceSummary 中渲染 Memory 评估差值趋势 sparkline。
+///
+/// # 参数
+///
+/// - `entries`: DevTrace 条目列表
+///
+/// # 返回
+///
+/// 差值列表, 按条目顺序排列。空列表表示无 Memory 评估记录。
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::{DevTraceEntry, TraceAction, extract_memory_diff_history};
+/// let entries = vec![
+///     DevTraceEntry::new(
+///         TraceAction::MemoryEvaluation, Some(0), Some(0), Some("t1"),
+///         "with=2/3", "Memory 评估: KeepInjecting (差值 +10.0%, 有效)",
+///         0, true, None,
+///     ),
+///     DevTraceEntry::new(
+///         TraceAction::MemoryEvaluation, Some(0), Some(1), Some("t2"),
+///         "with=1/3", "Memory 评估: DisableInjection (差值 -20.0%, 有害)",
+///         0, true, None,
+///     ),
+/// ];
+/// let diffs = extract_memory_diff_history(&entries);
+/// assert_eq!(diffs.len(), 2);
+/// assert!((diffs[0] - 0.1).abs() < 0.001);
+/// assert!((diffs[1] - (-0.2)).abs() < 0.001);
+/// ```
+pub fn extract_memory_diff_history(entries: &[DevTraceEntry]) -> Vec<f64> {
+    use crate::evaluator_synergy::parse_diff_value;
+    entries
+        .iter()
+        .filter(|e| e.action == TraceAction::MemoryEvaluation)
+        .map(|e| parse_diff_value(&e.output_summary))
+        .collect()
+}
+
+// ============================================================================
 //  CacheEntryInfo — 缓存条目类型 (Session 79)
 // ============================================================================
 
@@ -2644,6 +2738,22 @@ pub struct DevTraceSummary {
     /// `None` 表示没有调优历史或未启用 sparkline 可视化。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_diff_history: Option<Vec<f64>>,
+
+    /// 搜索质量差值历史 (Session 95) — 用于 sparkline 可视化
+    ///
+    /// 存储每次搜索质量评估的差值 (有搜索修复率 - 无搜索修复率, -1.0~1.0),
+    /// 用于在报告中渲染 ASCII sparkline 趋势图。
+    /// `None` 表示没有搜索质量评估记录或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_diff_history: Option<Vec<f64>>,
+
+    /// Memory 评估差值历史 (Session 95) — 用于 sparkline 可视化
+    ///
+    /// 存储每次 Memory 评估的差值 (有注入修复率 - 无注入修复率, -1.0~1.0),
+    /// 用于在报告中渲染 ASCII sparkline 趋势图。
+    /// `None` 表示没有 Memory 评估记录或未启用 sparkline 可视化。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_diff_history: Option<Vec<f64>>,
 }
 
 impl DevTraceSummary {
@@ -2670,6 +2780,8 @@ impl DevTraceSummary {
             fix_rate_history: None,
             ttl_history_values: None,
             correlation_diff_history: None,
+            search_diff_history: None,
+            memory_diff_history: None,
         }
     }
 
@@ -2768,6 +2880,8 @@ impl DevTraceSummary {
             fix_rate_history: None,
             ttl_history_values: None,
             correlation_diff_history: None,
+            search_diff_history: None,
+            memory_diff_history: None,
         }
     }
 
@@ -2869,6 +2983,30 @@ impl DevTraceSummary {
     ) -> Self {
         self.ttl_history_values = Some(ttl_values);
         self.correlation_diff_history = Some(diff_values);
+        self
+    }
+
+    /// 附加搜索质量差值历史列表 (Session 95)
+    ///
+    /// 用于在 `to_report()` 中渲染 ASCII sparkline 趋势图。
+    ///
+    /// # 参数
+    ///
+    /// - `diffs`: 每次搜索质量评估的差值列表 (-1.0~1.0)
+    pub fn with_search_quality_sparkline(mut self, diffs: Vec<f64>) -> Self {
+        self.search_diff_history = Some(diffs);
+        self
+    }
+
+    /// 附加 Memory 评估差值历史列表 (Session 95)
+    ///
+    /// 用于在 `to_report()` 中渲染 ASCII sparkline 趋势图。
+    ///
+    /// # 参数
+    ///
+    /// - `diffs`: 每次 Memory 评估的差值列表 (-1.0~1.0)
+    pub fn with_memory_evaluation_sparkline(mut self, diffs: Vec<f64>) -> Self {
+        self.memory_diff_history = Some(diffs);
         self
     }
 
@@ -3131,6 +3269,20 @@ impl DevTraceSummary {
                     }
                 ));
             }
+
+            // === Sparkline 可视化 (Session 95) ===
+            if let Some(ref diffs) = self.search_diff_history {
+                if diffs.len() >= 2 {
+                    let config = crate::sparkline::SparklineConfig::new(40);
+                    report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                        "  搜索差值趋势图",
+                        diffs,
+                        &config,
+                        |v| format!("{:+.1}%", v * 100.0),
+                    ));
+                    report.push('\n');
+                }
+            }
         }
 
         // === 搜索质量历史 (Session 87) ===
@@ -3251,6 +3403,20 @@ impl DevTraceSummary {
                         "注入效果不足"
                     }
                 ));
+            }
+
+            // === Sparkline 可视化 (Session 95) ===
+            if let Some(ref diffs) = self.memory_diff_history {
+                if diffs.len() >= 2 {
+                    let config = crate::sparkline::SparklineConfig::new(40);
+                    report.push_str(&crate::sparkline::format_trend_sparkline_with(
+                        "  Memory 差值趋势图",
+                        diffs,
+                        &config,
+                        |v| format!("{:+.1}%", v * 100.0),
+                    ));
+                    report.push('\n');
+                }
             }
         }
 
@@ -10352,6 +10518,457 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("ttl_history_values"));
         assert!(!json.contains("correlation_diff_history"));
+    }
+
+    // --- extract_search_diff_history 纯函数测试 (Session 95) ---
+
+    #[test]
+    fn test_extract_search_diff_history_empty() {
+        let diffs = extract_search_diff_history(&[]);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_search_diff_history_no_search_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+        ];
+        let diffs = extract_search_diff_history(&entries);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_search_diff_history_with_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::SearchQuality,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "with=2/3",
+                "搜索质量: 保持搜索 (差值 +10.0%, 原因: 有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::SearchQuality,
+                Some(0),
+                Some(1),
+                Some("t2"),
+                "with=1/3",
+                "搜索质量: 禁用搜索 (差值 -15.0%, 原因: 有害)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::SearchQuality,
+                Some(0),
+                Some(2),
+                Some("t3"),
+                "with=1/1",
+                "搜索质量: 数据不足 (差值 +0.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let diffs = extract_search_diff_history(&entries);
+        assert_eq!(diffs.len(), 3);
+        assert!((diffs[0] - 0.1).abs() < 0.001);
+        assert!((diffs[1] - (-0.15)).abs() < 0.001);
+        assert!((diffs[2] - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_extract_search_diff_history_mixed_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::SearchQuality,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "with=2/3",
+                "搜索质量: 保持搜索 (差值 +20.0%, 原因: 有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CacheTuning,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "hit=2/3",
+                "缓存调优: 保持当前配置 (差值 +5.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let diffs = extract_search_diff_history(&entries);
+        assert_eq!(diffs.len(), 1);
+        assert!((diffs[0] - 0.2).abs() < 0.001);
+    }
+
+    // --- extract_memory_diff_history 纯函数测试 (Session 95) ---
+
+    #[test]
+    fn test_extract_memory_diff_history_empty() {
+        let diffs = extract_memory_diff_history(&[]);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_memory_diff_history_no_memory_entries() {
+        let entries = vec![DevTraceEntry::new(
+            TraceAction::CompileCheck,
+            Some(0),
+            Some(0),
+            Some("t1"),
+            "check",
+            "passed",
+            50,
+            true,
+            None,
+        )];
+        let diffs = extract_memory_diff_history(&entries);
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_memory_diff_history_with_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryEvaluation,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "with=2/3",
+                "Memory 评估: KeepInjecting (差值 +10.0%, 有效)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::MemoryEvaluation,
+                Some(0),
+                Some(1),
+                Some("t2"),
+                "with=1/3",
+                "Memory 评估: DisableInjection (差值 -20.0%, 有害)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let diffs = extract_memory_diff_history(&entries);
+        assert_eq!(diffs.len(), 2);
+        assert!((diffs[0] - 0.1).abs() < 0.001);
+        assert!((diffs[1] - (-0.2)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_extract_memory_diff_history_mixed_entries() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::SearchQuality,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "with=2/3",
+                "搜索质量: 保持搜索 (差值 +15.0%, 原因: ...)",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::MemoryEvaluation,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "with=2/3",
+                "Memory 评估: KeepInjecting (差值 +5.0%, 有效)",
+                0,
+                true,
+                None,
+            ),
+        ];
+        let diffs = extract_memory_diff_history(&entries);
+        assert_eq!(diffs.len(), 1);
+        assert!((diffs[0] - 0.05).abs() < 0.001);
+    }
+
+    // --- with_search_quality_sparkline builder 测试 (Session 95) ---
+
+    #[test]
+    fn test_with_search_quality_sparkline_builder() {
+        let summary = DevTraceSummary::empty().with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        assert_eq!(summary.search_diff_history, Some(vec![0.1, -0.05, 0.2]));
+    }
+
+    #[test]
+    fn test_with_memory_evaluation_sparkline_builder() {
+        let summary =
+            DevTraceSummary::empty().with_memory_evaluation_sparkline(vec![-0.1, 0.05, -0.2]);
+        assert_eq!(summary.memory_diff_history, Some(vec![-0.1, 0.05, -0.2]));
+    }
+
+    #[test]
+    fn test_search_memory_sparkline_serde_roundtrip() {
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_sparkline(vec![0.1, 0.2])
+            .with_memory_evaluation_sparkline(vec![-0.1, -0.2]);
+        let json = serde_json::to_string(&summary).unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.search_diff_history, Some(vec![0.1, 0.2]));
+        assert_eq!(loaded.memory_diff_history, Some(vec![-0.1, -0.2]));
+    }
+
+    #[test]
+    fn test_search_memory_sparkline_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("search_diff_history"));
+        assert!(!json.contains("memory_diff_history"));
+    }
+
+    // --- to_report: 搜索质量 sparkline 测试 (Session 95) ---
+
+    #[test]
+    fn test_to_report_search_quality_sparkline() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        let report = summary.to_report();
+
+        assert!(report.contains("搜索差值趋势图"));
+        // sparkline 字符应出现
+        assert!(report.contains('▁') || report.contains('▃') || report.contains('▅'));
+    }
+
+    #[test]
+    fn test_to_report_search_quality_sparkline_single_value() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary =
+            DevTraceSummary::from_entries(&entries).with_search_quality_sparkline(vec![0.1]);
+        let report = summary.to_report();
+
+        // 单值不渲染 sparkline
+        assert!(!report.contains("搜索差值趋势图"));
+    }
+
+    #[test]
+    fn test_to_report_search_quality_no_sparkline_without_data() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "q",
+                "r",
+                100,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("搜索差值趋势图"));
+    }
+
+    // --- to_report: Memory 评估 sparkline 测试 (Session 95) ---
+
+    #[test]
+    fn test_to_report_memory_evaluation_sparkline() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries)
+            .with_memory_evaluation_sparkline(vec![0.1, -0.05, 0.2]);
+        let report = summary.to_report();
+
+        assert!(report.contains("Memory 差值趋势图"));
+        // sparkline 字符应出现
+        assert!(report.contains('▁') || report.contains('▃') || report.contains('▅'));
+    }
+
+    #[test]
+    fn test_to_report_memory_evaluation_sparkline_single_value() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary =
+            DevTraceSummary::from_entries(&entries).with_memory_evaluation_sparkline(vec![0.1]);
+        let report = summary.to_report();
+
+        assert!(!report.contains("Memory 差值趋势图"));
+    }
+
+    #[test]
+    fn test_to_report_memory_evaluation_no_sparkline_without_data() {
+        let entries = vec![
+            DevTraceEntry::new(
+                TraceAction::MemoryInjection,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "3 messages",
+                "injected",
+                0,
+                true,
+                None,
+            ),
+            DevTraceEntry::new(
+                TraceAction::CompileCheck,
+                Some(0),
+                Some(0),
+                Some("t1"),
+                "check",
+                "passed",
+                50,
+                true,
+                None,
+            ),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        let report = summary.to_report();
+
+        assert!(!report.contains("Memory 差值趋势图"));
     }
 
     // --- serde 测试: DevTraceSummary 中的新字段 ---

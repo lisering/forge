@@ -668,6 +668,24 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             "orange",
         ));
         html.push_str("</div>\n");
+
+        // === 搜索质量差值趋势图 (Session 95) ===
+        if let Some(ref diffs) = summary.search_diff_history {
+            if diffs.len() >= 2 {
+                let labels: Vec<String> =
+                    (1..=diffs.len()).map(|i| format!("评估 {}", i)).collect();
+                html.push_str("<div class=\"charts-grid\">\n");
+                html.push_str(&generate_chart_js_line_raw(
+                    "searchDiffTrendChart",
+                    "搜索质量差值趋势",
+                    &labels,
+                    diffs,
+                    "rgba(75, 192, 192, 1)",
+                    "差值",
+                ));
+                html.push_str("</div>\n");
+            }
+        }
     }
 
     // === Memory 评估历史 ===
@@ -706,6 +724,24 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
             "orange",
         ));
         html.push_str("</div>\n");
+
+        // === Memory 评估差值趋势图 (Session 95) ===
+        if let Some(ref diffs) = summary.memory_diff_history {
+            if diffs.len() >= 2 {
+                let labels: Vec<String> =
+                    (1..=diffs.len()).map(|i| format!("评估 {}", i)).collect();
+                html.push_str("<div class=\"charts-grid\">\n");
+                html.push_str(&generate_chart_js_line_raw(
+                    "memoryDiffTrendChart",
+                    "Memory 评估差值趋势",
+                    &labels,
+                    diffs,
+                    "rgba(153, 102, 255, 1)",
+                    "差值",
+                ));
+                html.push_str("</div>\n");
+            }
+        }
     }
 
     // === 增量发送统计 ===
@@ -1332,5 +1368,80 @@ mod tests {
 
         assert!(!html.contains("ttlTrendChart"));
         assert!(!html.contains("diffTrendChart"));
+    }
+
+    // ======================================================================
+    //  HTML 报告: 搜索质量/Memory 评估 sparkline 测试 (Session 95)
+    // ======================================================================
+
+    #[test]
+    fn test_html_report_with_search_diff_trend_chart() {
+        use crate::dev_trace::SearchQualityHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 3, 0, None))
+            .with_search_quality_sparkline(vec![0.1, -0.05, 0.2]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("searchDiffTrendChart"));
+        assert!(html.contains("搜索质量差值趋势"));
+    }
+
+    #[test]
+    fn test_html_report_with_memory_diff_trend_chart() {
+        use crate::dev_trace::MemoryEvaluationHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_memory_evaluation_history(MemoryEvaluationHistorySummary::new(
+                true, true, 3, 0, None,
+            ))
+            .with_memory_evaluation_sparkline(vec![0.1, -0.05, 0.2]);
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("memoryDiffTrendChart"));
+        assert!(html.contains("Memory 评估差值趋势"));
+    }
+
+    #[test]
+    fn test_html_report_no_search_diff_chart_without_data() {
+        use crate::dev_trace::SearchQualityHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 3, 0, None));
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("searchDiffTrendChart"));
+    }
+
+    #[test]
+    fn test_html_report_no_memory_diff_chart_without_data() {
+        use crate::dev_trace::MemoryEvaluationHistorySummary;
+        let summary = DevTraceSummary::empty().with_memory_evaluation_history(
+            MemoryEvaluationHistorySummary::new(true, true, 3, 0, None),
+        );
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("memoryDiffTrendChart"));
+    }
+
+    #[test]
+    fn test_html_report_no_search_diff_chart_single_value() {
+        use crate::dev_trace::SearchQualityHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_search_quality_history(SearchQualityHistorySummary::new(true, true, 1, 0, None))
+            .with_search_quality_sparkline(vec![0.1]);
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("searchDiffTrendChart"));
+    }
+
+    #[test]
+    fn test_html_report_no_memory_diff_chart_single_value() {
+        use crate::dev_trace::MemoryEvaluationHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_memory_evaluation_history(MemoryEvaluationHistorySummary::new(
+                true, true, 1, 0, None,
+            ))
+            .with_memory_evaluation_sparkline(vec![0.1]);
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("memoryDiffTrendChart"));
     }
 }
