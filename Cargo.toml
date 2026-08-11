@@ -41,6 +41,27 @@ tempfile = "3"
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread"] }
 proptest = "1"
 mockall = "0.12"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sparkline_performance"
+harness = false
+
+[[bench]]
+name = "dev_trace_analyzer_performance"
+harness = false
+
+[[bench]]
+name = "cache_tuning_performance"
+harness = false
+
+[[bench]]
+name = "error_search_performance"
+harness = false
+
+[[bench]]
+name = "search_cache_performance"
+harness = false
 
 # ── docs.rs 官方文档配置 ──────────────────────────────────
 # https://docs.rs/about/metadata
