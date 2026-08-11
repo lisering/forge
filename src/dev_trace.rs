@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::evaluator_synergy::{EvaluatorSynergyHistorySummary, EvaluatorSynergySummary};
+use crate::joint_decision::JointDecisionHistorySummary;
 use crate::trace_store::{StorageBackend, StorageConfig as TraceStorageConfig};
 
 // ============================================================================
@@ -90,6 +91,8 @@ pub enum TraceAction {
     MemoryInjection,
     /// Memory 评估 — MemoryContextEvaluator 评估注入效果并自动禁用 (Session 90)
     MemoryEvaluation,
+    /// 联合决策 — 三评估器协同决策, 升级警告或进入保守模式 (Session 99)
+    JointDecision,
 }
 
 impl std::fmt::Display for TraceAction {
@@ -117,6 +120,7 @@ impl std::fmt::Display for TraceAction {
             TraceAction::SearchQuality => write!(f, "SearchQuality"),
             TraceAction::MemoryInjection => write!(f, "MemoryInjection"),
             TraceAction::MemoryEvaluation => write!(f, "MemoryEvaluation"),
+            TraceAction::JointDecision => write!(f, "JointDecision"),
         }
     }
 }
@@ -147,6 +151,7 @@ impl TraceAction {
             TraceAction::SearchQuality => "搜索质量评估",
             TraceAction::MemoryInjection => "Memory 注入",
             TraceAction::MemoryEvaluation => "Memory 评估",
+            TraceAction::JointDecision => "联合决策",
         }
     }
 
@@ -175,6 +180,7 @@ impl TraceAction {
             TraceAction::SearchQuality,
             TraceAction::MemoryInjection,
             TraceAction::MemoryEvaluation,
+            TraceAction::JointDecision,
         ]
     }
 }
@@ -2754,6 +2760,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有 Memory 评估记录或未启用 sparkline 可视化。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_diff_history: Option<Vec<f64>>,
+
+    /// 联合决策历史摘要 (Session 99)
+    ///
+    /// 从 `JointDecisionHistory` (`.forge/joint_decision_history.json`) 提取的
+    /// 跨 session 联合决策趋势数据, 展示升级警告和保守模式的变化趋势。
+    /// `None` 表示没有历史数据 (首次运行或未启用联合决策引擎)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint_decision_history_summary: Option<JointDecisionHistorySummary>,
 }
 
 impl DevTraceSummary {
@@ -2782,6 +2796,7 @@ impl DevTraceSummary {
             correlation_diff_history: None,
             search_diff_history: None,
             memory_diff_history: None,
+            joint_decision_history_summary: None,
         }
     }
 
@@ -2882,6 +2897,7 @@ impl DevTraceSummary {
             correlation_diff_history: None,
             search_diff_history: None,
             memory_diff_history: None,
+            joint_decision_history_summary: None,
         }
     }
 
@@ -3007,6 +3023,19 @@ impl DevTraceSummary {
     /// - `diffs`: 每次 Memory 评估的差值列表 (-1.0~1.0)
     pub fn with_memory_evaluation_sparkline(mut self, diffs: Vec<f64>) -> Self {
         self.memory_diff_history = Some(diffs);
+        self
+    }
+
+    /// 附加联合决策历史摘要 (Session 99)
+    ///
+    /// 从 `JointDecisionHistory` 提取的跨 session 联合决策趋势数据,
+    /// 由 Orchestrator 在 `final_report` 时调用。
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 联合决策历史摘要
+    pub fn with_joint_decision_history(mut self, summary: JointDecisionHistorySummary) -> Self {
+        self.joint_decision_history_summary = Some(summary);
         self
     }
 
@@ -3576,6 +3605,34 @@ impl DevTraceSummary {
                 }
 
                 if let Some(ref saved_at) = syh.saved_at {
+                    report.push_str(&format!("  保存时间: {}\n", saved_at));
+                }
+            }
+        }
+
+        // === 三评估器协同决策 (Session 99) ===
+        if let Some(ref jd) = self.joint_decision_history_summary {
+            if !jd.is_empty() {
+                report.push_str("\n  ── 三评估器协同决策 (跨 Session 历史) ──\n");
+                report.push_str(&format!("  Session 数: {}\n", jd.session_count));
+                report.push_str(&format!("  最新决策: {}\n", jd.latest_action.label()));
+                report.push_str(&format!("  累计决策: {} 次\n", jd.total_decisions));
+                report.push_str(&format!("  累计升级警告: {} 次\n", jd.total_escalations));
+                report.push_str(&format!(
+                    "  累计保守模式: {} 次\n",
+                    jd.total_conservative_modes
+                ));
+                report.push_str(&format!(
+                    "  保守模式占比: {:.1}%\n",
+                    jd.conservative_mode_rate * 100.0
+                ));
+                report.push_str(&format!("  升级率: {:.1}%\n", jd.escalation_rate * 100.0));
+                if jd.current_conservative_mode {
+                    report.push_str("  当前模式: 🔒 保守模式\n");
+                } else {
+                    report.push_str("  当前模式: ✅ 正常模式\n");
+                }
+                if let Some(ref saved_at) = jd.saved_at {
                     report.push_str(&format!("  保存时间: {}\n", saved_at));
                 }
             }
@@ -4302,7 +4359,7 @@ mod tests {
     #[test]
     fn test_trace_action_all() {
         let all = TraceAction::all();
-        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), 23);
         assert!(all.contains(&TraceAction::Planning));
         assert!(all.contains(&TraceAction::TaskExecution));
         assert!(all.contains(&TraceAction::FixAttempt));
@@ -5031,7 +5088,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 22); // 所有 22 种操作类型
+        assert_eq!(entries.len(), 23); // 所有 23 种操作类型
 
         let summary = writer.summary();
         for action in TraceAction::all() {
@@ -5460,7 +5517,7 @@ mod tests {
     fn test_trace_action_performance_stats_in_all() {
         let all = TraceAction::all();
         assert!(all.contains(&TraceAction::PerformanceStats));
-        assert_eq!(all.len(), 22);
+        assert_eq!(all.len(), 23);
     }
 
     #[test]
@@ -5573,7 +5630,7 @@ mod tests {
         }
 
         let entries = writer.read_all().unwrap();
-        assert_eq!(entries.len(), 22); // 所有 22 种操作类型
+        assert_eq!(entries.len(), 23); // 所有 23 种操作类型
 
         // 确保 PerformanceStats 被包含
         let has_performance_stats = entries
@@ -6182,7 +6239,7 @@ mod tests {
             })
             .collect();
         let grouped = group_entries_by_action(&entries);
-        assert_eq!(grouped.len(), 22);
+        assert_eq!(grouped.len(), 23);
         for action in TraceAction::all() {
             assert!(grouped.contains_key(&action));
         }
@@ -11327,6 +11384,83 @@ mod tests {
         // from_entries 不应从 trace 条目解析历史摘要
         assert!(summary.search_quality_history_summary.is_none());
         assert!(summary.cache_tuning_history_summary.is_none());
+    }
+
+    // --- 联合决策历史摘要 (Session 99) ---
+
+    #[test]
+    fn test_summary_jd_history_serde_roundtrip() {
+        let summary =
+            DevTraceSummary::empty().with_joint_decision_history(JointDecisionHistorySummary::new(
+                3,
+                crate::joint_decision::JointDecisionAction::EscalateWarning,
+                15,
+                5,
+                2,
+                0.33,
+                0.67,
+                false,
+                Some("2024-01-01T00:00:00Z".to_string()),
+            ));
+        let json = serde_json::to_string(&summary).unwrap();
+        let loaded: DevTraceSummary = serde_json::from_str(&json).unwrap();
+        let jdh = loaded
+            .joint_decision_history_summary
+            .expect("should be Some");
+        assert_eq!(jdh.session_count, 3);
+        assert_eq!(jdh.total_decisions, 15);
+        assert_eq!(jdh.total_escalations, 5);
+        assert_eq!(jdh.total_conservative_modes, 2);
+    }
+
+    #[test]
+    fn test_summary_jd_history_serde_skip_none() {
+        let summary = DevTraceSummary::empty();
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("joint_decision_history_summary"));
+    }
+
+    #[test]
+    fn test_summary_jd_history_report_section() {
+        let summary =
+            DevTraceSummary::empty().with_joint_decision_history(JointDecisionHistorySummary::new(
+                2,
+                crate::joint_decision::JointDecisionAction::EnterConservativeMode,
+                10,
+                3,
+                2,
+                0.5,
+                0.75,
+                true,
+                None,
+            ));
+        let report = summary.to_report();
+        assert!(report.contains("协同决策"));
+        assert!(report.contains("Session 数: 2"));
+        assert!(report.contains("进入保守模式"));
+        assert!(report.contains("累计决策: 10 次"));
+        assert!(report.contains("累计升级警告: 3 次"));
+        assert!(report.contains("累计保守模式: 2 次"));
+        assert!(report.contains("50.0%"));
+        assert!(report.contains("🔒"));
+    }
+
+    #[test]
+    fn test_summary_jd_history_report_section_empty() {
+        let summary = DevTraceSummary::empty();
+        let report = summary.to_report();
+        // 空摘要不应包含联合决策面板
+        assert!(!report.contains("协同决策"));
+    }
+
+    #[test]
+    fn test_from_entries_jd_history_is_none() {
+        let entries = vec![
+            make_entry(TraceAction::TaskExecution, true),
+            make_entry(TraceAction::CompileCheck, true),
+        ];
+        let summary = DevTraceSummary::from_entries(&entries);
+        assert!(summary.joint_decision_history_summary.is_none());
     }
 
     // ===== JSON 导出测试 (Session 88) =====

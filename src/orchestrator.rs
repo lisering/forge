@@ -35,6 +35,7 @@ use crate::dev_trace::{extract_memory_diff_history, extract_search_diff_history}
 use crate::error_diagnosis::{DiagnosisContext, DiagnosisResult, ErrorDiagnoser, ErrorHistory};
 use crate::error_search;
 use crate::interaction::AutoApprove;
+use crate::joint_decision::{build_joint_decision_history_summary, JointDecisionEngine};
 use crate::loop_detector::LoopDetector;
 use crate::memory::{Memory, Phase, PhaseStatus, Task, TaskStatus};
 use crate::memory_evaluation::MemoryContextEvaluator;
@@ -704,6 +705,17 @@ where
     /// 当注入有害时自动禁用 Memory 上下文注入。
     /// None 表示禁用 (默认, 向后兼容)。
     pub memory_evaluator: Option<MemoryContextEvaluator>,
+
+    /// 联合决策引擎 — 三评估器协同决策 (Session 99)
+    ///
+    /// 启用后, 在每次编译检查后综合 CacheTuner, SearchQualityEvaluator,
+    /// MemoryContextEvaluator 的状态, 做出联合决策:
+    /// - 2+ 评估器禁用 → 升级警告
+    /// - 全部评估器禁用 → 进入保守模式
+    /// - 保守模式 N 轮后 → 尝试重新启用功能
+    ///
+    /// `None` 表示禁用 (默认, 向后兼容)。
+    pub joint_decision_engine: Option<JointDecisionEngine>,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -755,6 +767,7 @@ where
             memory_context_count: 0,
             memory_context_stats: MemoryContextStats::new(),
             memory_evaluator: None,
+            joint_decision_engine: None,
         }
     }
 }
@@ -822,6 +835,7 @@ where
             memory_context_count: self.memory_context_count,
             memory_context_stats: self.memory_context_stats,
             memory_evaluator: self.memory_evaluator,
+            joint_decision_engine: self.joint_decision_engine,
         }
     }
 
@@ -1091,6 +1105,23 @@ where
     /// 当注入有害时自动禁用 Memory 上下文注入。
     pub fn with_memory_evaluator(mut self, evaluator: MemoryContextEvaluator) -> Self {
         self.memory_evaluator = Some(evaluator);
+        self
+    }
+
+    /// 启用联合决策引擎 — 三评估器协同决策 (Session 99)
+    ///
+    /// 启用后, 在每次编译检查后综合三个评估器的状态, 做出联合决策:
+    /// - 2+ 评估器禁用 → 升级警告
+    /// - 全部评估器禁用 → 进入保守模式 (跳过所有自动增强)
+    /// - 保守模式 N 轮后 → 尝试重新启用功能
+    ///
+    /// 需要同时启用 DevTrace (`with_dev_trace(true)`) 才能工作。
+    ///
+    /// # 参数
+    ///
+    /// - `engine`: 已配置的 JointDecisionEngine
+    pub fn with_joint_decision_engine(mut self, engine: JointDecisionEngine) -> Self {
+        self.joint_decision_engine = Some(engine);
         self
     }
 
@@ -1921,6 +1952,159 @@ where
             true,
             Some(&decision.reason),
         );
+    }
+
+    /// 联合决策评估 — 综合三评估器状态做出联合决策 (Session 99)
+    ///
+    /// 在每次编译检查后 (三个评估器各自评估之后) 调用,
+    /// 从 CacheTuner, SearchQualityEvaluator, MemoryContextEvaluator
+    /// 构建评估器快照, 由联合决策引擎计算联合决策。
+    ///
+    /// ## 条件
+    ///
+    /// - `joint_decision_engine` 必须已启用 (否则跳过)
+    ///
+    /// ## 决策应用
+    ///
+    /// - `EnterConservativeMode` → 打印保守模式警告
+    /// - `EscalateWarning` → 打印升级警告
+    /// - `ReEnableFeature` → 打印重新启用建议
+    /// - `NoAction` → 无操作
+    ///
+    /// # 参数
+    ///
+    /// - `phase_idx`: 阶段索引 (DevTrace)
+    /// - `task_idx`: 任务索引 (DevTrace)
+    fn evaluate_joint_decision(&mut self, phase_idx: usize, task_idx: usize) {
+        use crate::evaluator_synergy::{EvaluatorSnapshot, EvaluatorType};
+        use crate::joint_decision::JointDecisionAction;
+
+        let engine = match &mut self.joint_decision_engine {
+            Some(e) => e,
+            None => return, // 未启用, 跳过
+        };
+
+        // 构建评估器快照列表
+        let mut snapshots = Vec::new();
+        let entries = self
+            .dev_trace
+            .as_ref()
+            .and_then(|w| w.read_all().ok())
+            .unwrap_or_default();
+
+        // CacheTuner 快照
+        if let Some(ref tuner) = self.cache_tuner {
+            let corr = build_cache_fix_correlation(&entries);
+            let with_rate = corr.hit_fix_rate();
+            let without_rate = corr.miss_fix_rate();
+            let diff = corr.hit_vs_miss_diff();
+            snapshots.push(EvaluatorSnapshot {
+                evaluator_type: EvaluatorType::CacheTuner,
+                enabled: tuner.is_enabled(),
+                with_fix_rate: with_rate,
+                without_fix_rate: without_rate,
+                diff,
+                is_beneficial: corr.is_cache_effective(),
+                total_checks: corr.checks_after_hit + corr.checks_after_miss,
+                evaluation_count: tuner.decisions().len(),
+                disable_count: tuner.to_history().disable_count as usize,
+                contribution_score: diff,
+            });
+        }
+
+        // SearchQualityEvaluator 快照
+        if let Some(ref evaluator) = self.search_quality_evaluator {
+            let stats = build_search_quality_stats(&entries);
+            let with_rate = stats.with_search_fix_rate();
+            let without_rate = stats.without_search_fix_rate();
+            let diff = stats.search_vs_no_search_diff();
+            snapshots.push(EvaluatorSnapshot {
+                evaluator_type: EvaluatorType::SearchQuality,
+                enabled: evaluator.is_enabled(),
+                with_fix_rate: with_rate,
+                without_fix_rate: without_rate,
+                diff,
+                is_beneficial: stats.is_search_beneficial(),
+                total_checks: stats.checks_with_search + stats.checks_without_search,
+                evaluation_count: evaluator.evaluation_count() as usize,
+                disable_count: evaluator.to_history().disable_count as usize,
+                contribution_score: diff,
+            });
+        }
+
+        // MemoryContextEvaluator 快照
+        if let Some(ref evaluator) = self.memory_evaluator {
+            let stats = build_memory_evaluation_stats(&entries);
+            let with_rate = stats.with_memory_fix_rate();
+            let without_rate = stats.without_memory_fix_rate();
+            let diff = stats.memory_vs_no_memory_diff();
+            snapshots.push(EvaluatorSnapshot {
+                evaluator_type: EvaluatorType::MemoryContext,
+                enabled: evaluator.is_enabled(),
+                with_fix_rate: with_rate,
+                without_fix_rate: without_rate,
+                diff,
+                is_beneficial: stats.is_memory_beneficial(),
+                total_checks: stats.total_checks(),
+                evaluation_count: evaluator.evaluation_count() as usize,
+                disable_count: evaluator.to_history().disable_count as usize,
+                contribution_score: diff,
+            });
+        }
+
+        // 如果没有评估器快照, 跳过
+        if snapshots.is_empty() {
+            return;
+        }
+
+        // 评估并获取联合决策
+        let decision = engine.evaluate(&snapshots);
+
+        // DevTrace: 记录联合决策
+        let jd_task_name = self.memory.phases[phase_idx].tasks[task_idx].name.clone();
+        self.trace_dev(
+            TraceAction::JointDecision,
+            Some(phase_idx),
+            Some(task_idx),
+            Some(&jd_task_name),
+            &format!(
+                "snapshots={}, disabled={}",
+                snapshots.len(),
+                decision.disabled_count,
+            ),
+            &decision.to_trace_summary(),
+            0,
+            true,
+            Some(&decision.reason),
+        );
+
+        // 保守模式日志
+        match &decision.action {
+            JointDecisionAction::EnterConservativeMode => {
+                println!(
+                    "    🔒 联合决策: 进入保守模式 ({}/{} 评估器已禁用)",
+                    decision.disabled_count, decision.total_evaluators,
+                );
+            }
+            JointDecisionAction::EscalateWarning => {
+                println!(
+                    "    ⚠️ 联合决策: 升级警告 ({}/{} 评估器已禁用)",
+                    decision.disabled_count, decision.total_evaluators,
+                );
+            }
+            JointDecisionAction::ReEnableFeature { evaluator_type } => {
+                println!(
+                    "    🔄 联合决策: 尝试重新启用 {} (保守模式后恢复)",
+                    evaluator_type.label(),
+                );
+            }
+            JointDecisionAction::NoAction => {
+                debug!(
+                    "    联合决策: 无需行动 ({}/{} 评估器已禁用)",
+                    decision.disabled_count, decision.total_evaluators,
+                );
+            }
+        }
     }
 
     /// 构建三评估器协同分析摘要 (Session 91)
@@ -2963,6 +3147,20 @@ where
             }
         }
 
+        // === 加载联合决策历史 (Session 99) ===
+        // 如果启用了 joint_decision_engine, 尝试从 .forge/joint_decision_history.json 恢复
+        if let Some(ref mut engine) = self.joint_decision_engine {
+            engine.load_history_from_workspace(&self.workspace.root);
+            let h = &engine.history;
+            if !h.is_empty() {
+                println!(
+                    "  🔗 联合决策: 从历史恢复 ({} session, {} 决策)",
+                    h.session_count(),
+                    h.total_decisions(),
+                );
+            }
+        }
+
         let memory_path = self.memory_path();
 
         // ========== 断点恢复检查 ==========
@@ -3098,7 +3296,7 @@ where
     }
 
     /// 输出最终报告并保存
-    fn final_report(&self) -> Result<()> {
+    fn final_report(&mut self) -> Result<()> {
         println!("\n{}", "═".repeat(60));
         println!("{}", self.memory.execution_report());
         println!("{}", "═".repeat(60));
@@ -3158,6 +3356,21 @@ where
                 Err(e) => {
                     warn!("保存 Memory 评估历史失败: {}", e);
                 }
+            }
+        }
+
+        // === 保存联合决策历史 (Session 99) ===
+        if let Some(ref mut engine) = self.joint_decision_engine {
+            // 加载已有历史 (确保跨 session 累积, 即使 run() 未调用)
+            engine.load_history_from_workspace(&self.workspace.root);
+            let timestamp = chrono::Utc::now();
+            engine.finalize_session(timestamp);
+            let history = std::mem::take(&mut engine.history);
+            engine.history = history.with_timestamp(timestamp);
+            engine.save_history_to_workspace(&self.workspace.root)?;
+            let h = &engine.history;
+            if !h.is_empty() {
+                println!("\n  🔗 联合决策历史已保存: {}", h.to_summary());
             }
         }
 
@@ -3269,6 +3482,14 @@ where
                 summary = summary.with_evaluator_synergy(s);
             }
 
+            // 附加联合决策历史摘要 (Session 99)
+            if let Some(ref engine) = self.joint_decision_engine {
+                let jd_summary = build_joint_decision_history_summary(&engine.history);
+                if !jd_summary.is_empty() {
+                    summary = summary.with_joint_decision_history(jd_summary);
+                }
+            }
+
             println!("\n{}", summary.to_report());
 
             // === 保存 DevTraceSummary JSON 导出 (Session 88) ===
@@ -3291,6 +3512,47 @@ where
                 }
                 Err(e) => {
                     warn!("保存 DevTrace HTML 失败: {}", e);
+                }
+            }
+
+            // === 保存 DevTrace 智能分析报告 (Session 99) ===
+            let analysis = crate::dev_trace_analyzer::analyze_dev_trace_summary(&summary);
+            let report = crate::dev_trace_analyzer::generate_analysis_report(&analysis);
+            match crate::dev_trace_analyzer::save_analysis_to_workspace(
+                &report,
+                &self.workspace.root,
+            ) {
+                Ok(()) => {
+                    let hs = &analysis.health_score;
+                    println!(
+                        "📊 DevTrace 分析报告已保存: {}/.forge/devtrace_analysis.md",
+                        self.workspace.root.display()
+                    );
+                    println!(
+                        "  {} 健康度评分: {:.1}/100 ({}) — {} 条建议 ({} 严重, {} 警告, {} 信息)",
+                        hs.grade_icon(),
+                        hs.score,
+                        hs.grade(),
+                        analysis.recommendations.len(),
+                        analysis
+                            .recommendations
+                            .iter()
+                            .filter(|r| r.is_critical())
+                            .count(),
+                        analysis
+                            .recommendations
+                            .iter()
+                            .filter(|r| r.is_warning())
+                            .count(),
+                        analysis
+                            .recommendations
+                            .iter()
+                            .filter(|r| !r.is_critical() && !r.is_warning())
+                            .count(),
+                    );
+                }
+                Err(e) => {
+                    warn!("保存 DevTrace 分析报告失败: {}", e);
                 }
             }
         }
@@ -4202,6 +4464,10 @@ where
             // === Memory 评估 (Session 90) ===
             // 在每次编译检查后评估 Memory 注入效果, 当注入有害时自动禁用
             self.evaluate_memory_context(phase_idx, task_idx);
+
+            // === 联合决策评估 (Session 99) ===
+            // 在三个评估器各自评估后, 综合状态做出联合决策
+            self.evaluate_joint_decision(phase_idx, task_idx);
 
             if check_result.success {
                 println!("    ✅ 编译成功");
@@ -8904,6 +9170,90 @@ mod tests {
     }
 
     #[test]
+    fn test_devtrace_analysis_report_generated() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 分析报告应存在
+        let analysis_path = dir.path().join(".forge").join("devtrace_analysis.md");
+        assert!(analysis_path.exists(), "DevTrace 分析报告文件应存在");
+
+        let content = std::fs::read_to_string(&analysis_path).unwrap();
+        assert!(content.contains("# DevTrace 智能分析报告"));
+        assert!(content.contains("健康度评分"));
+        assert!(content.contains("可操作建议"));
+    }
+
+    #[test]
+    fn test_devtrace_analysis_report_with_cache_data() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 手动写入 DevTrace 条目以提供缓存数据
+        if let Some(ref trace) = orch.dev_trace {
+            use crate::dev_trace::{DevTraceEntry, TraceAction};
+            let entry = DevTraceEntry::new(
+                TraceAction::WebSearch,
+                Some(0),
+                Some(0),
+                Some("test"),
+                "query=test",
+                "搜索成功, 耗时=2000ms",
+                2000,
+                true,
+                None,
+            );
+            let _ = trace.write_entry(&entry);
+        }
+
+        orch.final_report().unwrap();
+
+        let analysis_path = dir.path().join(".forge").join("devtrace_analysis.md");
+        assert!(analysis_path.exists());
+    }
+
+    #[test]
+    fn test_devtrace_analysis_report_no_devtrace() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 没有 DevTrace 时, 不应生成分析报告
+        let analysis_path = dir.path().join(".forge").join("devtrace_analysis.md");
+        assert!(!analysis_path.exists());
+    }
+
+    #[test]
+    fn test_devtrace_analysis_report_contains_recommendations() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        let analysis_path = dir.path().join(".forge").join("devtrace_analysis.md");
+        assert!(analysis_path.exists());
+        let content = std::fs::read_to_string(&analysis_path).unwrap();
+        // 空摘要: 成功率=0 → 应有 Critical 建议
+        assert!(content.contains("可操作建议"));
+        assert!(content.contains("成功率"));
+    }
+
+    #[test]
     fn test_sparkline_data_in_devtrace_json() {
         let dir = tempdir().unwrap();
 
@@ -9417,6 +9767,194 @@ mod tests {
             html_content.contains("Memory 评估差值趋势"),
             "HTML 应包含 Memory 评估差值趋势标题"
         );
+    }
+
+    // ===== Session 99: 联合决策引擎集成测试 =====
+
+    #[test]
+    fn test_final_report_saves_joint_decision_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        // 启用联合决策引擎
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_dev_trace(true)
+            .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 验证联合决策历史文件已创建
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("joint_decision_history.json");
+        assert!(history_path.exists(), "联合决策历史文件应存在");
+
+        // 验证可以加载
+        let loaded = crate::joint_decision::JointDecisionHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!(loaded.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_final_report_no_joint_decision_history_without_engine() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        // 不启用联合决策引擎
+        orch.final_report().unwrap();
+
+        // 不应创建联合决策历史文件
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("joint_decision_history.json");
+        assert!(!history_path.exists(), "无引擎时不应创建联合决策历史文件");
+    }
+
+    #[test]
+    fn test_joint_decision_history_cross_session_accumulation() {
+        let dir = tempdir().unwrap();
+
+        // Session 1: 保存联合决策历史
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+                .with_cache_tuner(CacheTuner::with_default_config(1800))
+                .with_dev_trace(true)
+                .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+            setup_test_phase(&mut orch);
+
+            orch.final_report().unwrap();
+        }
+
+        // 验证 Session 1 的历史
+        let history_path = dir
+            .path()
+            .join(".forge")
+            .join("joint_decision_history.json");
+        let history1 = crate::joint_decision::JointDecisionHistory::load(&history_path).unwrap();
+        assert_eq!(history1.session_count(), 1);
+
+        // Session 2: 加载历史并追加
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+                .with_cache_tuner(CacheTuner::with_default_config(1800))
+                .with_dev_trace(true)
+                .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+            setup_test_phase(&mut orch);
+
+            orch.final_report().unwrap();
+        }
+
+        // 验证历史累积为 2 个 session
+        let history2 = crate::joint_decision::JointDecisionHistory::load(&history_path).unwrap();
+        assert_eq!(history2.session_count(), 2);
+    }
+
+    #[test]
+    fn test_joint_decision_history_in_devtrace_json() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true)
+            .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 验证 DevTrace JSON 包含联合决策历史
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+        let json_content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            json_content.contains("joint_decision_history_summary"),
+            "DevTrace JSON 应包含 joint_decision_history_summary 字段"
+        );
+    }
+
+    #[test]
+    fn test_joint_decision_html_contains_panel() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        // 手动预存联合决策历史
+        use crate::evaluator_synergy::EvaluatorType;
+        use crate::joint_decision::{
+            JointDecisionAction, JointDecisionHistory, JointDecisionHistoryEntry,
+        };
+        use chrono::Utc;
+
+        {
+            let mut history = JointDecisionHistory::new();
+            history.add_entry(JointDecisionHistoryEntry::new(
+                1,
+                Utc::now(),
+                JointDecisionAction::EscalateWarning,
+                3,
+                2,
+                0,
+                false,
+                vec![EvaluatorType::CacheTuner, EvaluatorType::SearchQuality],
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_dev_trace(true)
+            .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 验证 HTML 包含联合决策面板
+        let html_path = dir.path().join(".forge").join("devtrace_report.html");
+        assert!(html_path.exists());
+        let html_content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(
+            html_content.contains("联合决策历史"),
+            "HTML 应包含联合决策历史面板"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_joint_decision_with_engine() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+        let chat = MockChatClient::new(vec![]);
+
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_cache_tuner(CacheTuner::with_default_config(1800))
+            .with_search_quality_evaluator(SearchQualityEvaluator::with_default_config())
+            .with_memory_evaluator(
+                crate::memory_evaluation::MemoryContextEvaluator::with_default_config(),
+            )
+            .with_dev_trace(true)
+            .with_joint_decision_engine(crate::joint_decision::JointDecisionEngine::default());
+        setup_test_phase(&mut orch);
+
+        // 调用 evaluate_joint_decision (模拟编译检查后调用)
+        orch.evaluate_joint_decision(0, 0);
+
+        // 验证 DevTrace 记录了联合决策
+        if let Some(ref trace) = orch.dev_trace {
+            let entries = trace.read_all().unwrap_or_default();
+            let jd_entries: Vec<_> = entries
+                .iter()
+                .filter(|e| e.action == TraceAction::JointDecision)
+                .collect();
+            assert!(!jd_entries.is_empty(), "DevTrace 应记录联合决策条目");
+        }
     }
 }
 

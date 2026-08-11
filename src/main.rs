@@ -1213,6 +1213,16 @@ where
         );
     }
 
+    // Session 99: 启用联合决策引擎 (需要 DevTrace 数据)
+    // 当 DevTrace 启用时自动启用 JointDecisionEngine, 综合三评估器状态做出联合决策:
+    // - 2+ 评估器禁用 → 升级警告
+    // - 全部评估器禁用 → 进入保守模式
+    // - 保守模式 N 轮后 → 尝试重新启用功能
+    if dev_trace {
+        orch =
+            orch.with_joint_decision_engine(forge::joint_decision::JointDecisionEngine::default());
+    }
+
     // Session 69: 集成 HandlerChain 回调处理器链
     if let Some(chain) = handler_chain {
         orch = orch.with_response_handlers(chain);

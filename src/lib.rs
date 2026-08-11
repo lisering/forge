@@ -72,6 +72,7 @@ pub mod connection_monitor;
 pub mod context_handoff;
 pub mod deadline;
 pub mod dev_trace;
+pub mod dev_trace_analyzer;
 pub mod error_diagnosis;
 pub mod error_search;
 pub mod evaluator_synergy;
@@ -79,6 +80,7 @@ pub mod extract;
 pub mod failover_chat;
 pub mod html_report;
 pub mod interaction;
+pub mod joint_decision;
 pub mod language;
 pub mod live_continuation;
 pub mod llm_clarify;
@@ -166,6 +168,17 @@ pub use dev_trace::{
     CacheTuningSummary, DevTraceEntry, DevTraceExportMeta, DevTraceJsonExport, DevTraceSummary,
     DevTraceWriter, IncrementalStats, MemoryEvaluationHistorySummary, MemoryEvaluationStats,
     SearchQualityHistorySummary, SearchQualityStats, TimelineEntry, TraceAction,
+};
+pub use dev_trace_analyzer::{
+    analyze_cache_effectiveness, analyze_dev_trace_summary, analyze_evaluator_synergy,
+    analyze_incremental_sending, analyze_memory_evaluation, analyze_search_quality,
+    compute_health_score, generate_analysis_report, generate_recommendations, save_analysis_report,
+    save_analysis_to_workspace, AnalysisCategory, AnalysisInsight, AnalysisRecommendation,
+    DevTraceAnalysis, HealthScore, RecommendationSeverity, SummaryOverview,
+    ANALYSIS_REPORT_FILENAME, ANALYSIS_REPORT_VERSION, THRESHOLD_CACHE_HIT_RATE_LOW,
+    THRESHOLD_INCREMENTAL_SAVED_LOW, THRESHOLD_MEMORY_DIFF_HARMFUL, THRESHOLD_SEARCH_DIFF_HARMFUL,
+    THRESHOLD_SUCCESS_RATE_LOW, THRESHOLD_SUCCESS_RATE_MEDIUM, THRESHOLD_SYNERGY_LOW, WEIGHT_CACHE,
+    WEIGHT_INCREMENTAL, WEIGHT_MEMORY, WEIGHT_SEARCH, WEIGHT_SUCCESS_RATE, WEIGHT_SYNERGY,
 };
 pub use error_diagnosis::{
     DiagnosisContext, DiagnosisResult, ErrorCategory, ErrorDiagnoser, ErrorHistory, ErrorPattern,

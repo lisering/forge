@@ -1783,6 +1783,66 @@ pub fn generate_html_report(summary: &DevTraceSummary) -> String {
         }
     }
 
+    // === 联合决策历史 (Session 99) ===
+    if let Some(ref jdh) = summary.joint_decision_history_summary {
+        if !jdh.is_empty() {
+            html.push_str("<h2>🔗 联合决策历史</h2>\n<div class=\"stats-grid\">\n");
+            html.push_str(&generate_stat_card(
+                "Session 数",
+                &jdh.session_count.to_string(),
+                None,
+                "blue",
+            ));
+            html.push_str(&generate_stat_card(
+                "累计决策",
+                &jdh.total_decisions.to_string(),
+                None,
+                "purple",
+            ));
+            html.push_str(&generate_stat_card(
+                "升级警告",
+                &jdh.total_escalations.to_string(),
+                Some(&format!("升级率 {:.1}%", jdh.escalation_rate * 100.0)),
+                "orange",
+            ));
+            html.push_str(&generate_stat_card(
+                "保守模式",
+                &jdh.total_conservative_modes.to_string(),
+                Some(&format!("占比 {:.1}%", jdh.conservative_mode_rate * 100.0)),
+                if jdh.current_conservative_mode {
+                    "red"
+                } else {
+                    "green"
+                },
+            ));
+            html.push_str("</div>\n");
+
+            // 历史统计表格
+            html.push_str(
+                "<table>\n<thead>\n<tr><th>指标</th><th>值</th></tr>\n</thead>\n<tbody>\n",
+            );
+            html.push_str(&format!(
+                "<tr><td>最新决策</td><td>{}</td></tr>\n",
+                jdh.latest_action.label()
+            ));
+            html.push_str(&format!(
+                "<tr><td>当前模式</td><td>{}</td></tr>\n",
+                if jdh.current_conservative_mode {
+                    "保守模式"
+                } else {
+                    "正常模式"
+                }
+            ));
+            if let Some(ref saved_at) = jdh.saved_at {
+                html.push_str(&format!(
+                    "<tr><td>保存时间</td><td>{}</td></tr>\n",
+                    escape_html(saved_at)
+                ));
+            }
+            html.push_str("</tbody>\n</table>\n");
+        }
+    }
+
     // === 增量发送统计 ===
     if let Some(ref inc) = summary.incremental_summary {
         let skip_rate = if inc.total_messages > 0 {
@@ -3885,5 +3945,76 @@ mod tests {
         assert!(html.contains("action-stats-json-data"));
         // 版本 1.2
         assert!(html.contains("1.2"));
+    }
+
+    // ======================================================================
+    //  HTML 报告: 联合决策历史测试 (Session 99)
+    // ======================================================================
+
+    #[test]
+    fn test_html_report_with_joint_decision_history() {
+        use crate::joint_decision::{JointDecisionAction, JointDecisionHistorySummary};
+        let summary =
+            DevTraceSummary::empty().with_joint_decision_history(JointDecisionHistorySummary::new(
+                3,
+                JointDecisionAction::EscalateWarning,
+                15,
+                5,
+                2,
+                0.133,
+                0.333,
+                false,
+                Some("2024-01-01T00:00:00Z".to_string()),
+            ));
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("联合决策历史"));
+        assert!(html.contains("Session 数"));
+        assert!(html.contains("升级警告"));
+        assert!(html.contains("保守模式"));
+        assert!(html.contains("累计决策"));
+        assert!(html.contains("15"));
+        assert!(html.contains("5"));
+        assert!(html.contains("2"));
+    }
+
+    #[test]
+    fn test_html_report_joint_decision_conservative_mode() {
+        use crate::joint_decision::{JointDecisionAction, JointDecisionHistorySummary};
+        let summary =
+            DevTraceSummary::empty().with_joint_decision_history(JointDecisionHistorySummary::new(
+                2,
+                JointDecisionAction::EnterConservativeMode,
+                10,
+                3,
+                4,
+                0.4,
+                0.3,
+                true, // 当前处于保守模式
+                None,
+            ));
+        let html = generate_html_report(&summary);
+
+        assert!(html.contains("保守模式"));
+        assert!(html.contains("当前模式"));
+        assert!(html.contains("保守模式"));
+    }
+
+    #[test]
+    fn test_html_report_no_joint_decision_section_without_data() {
+        let summary = DevTraceSummary::empty();
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("联合决策历史"));
+    }
+
+    #[test]
+    fn test_html_report_joint_decision_empty_summary_skipped() {
+        use crate::joint_decision::JointDecisionHistorySummary;
+        let summary = DevTraceSummary::empty()
+            .with_joint_decision_history(JointDecisionHistorySummary::empty());
+        let html = generate_html_report(&summary);
+
+        assert!(!html.contains("联合决策历史"));
     }
 }

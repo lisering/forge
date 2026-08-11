@@ -541,7 +541,7 @@ fn test_trace_action_all_includes_recovery() {
     assert!(all.contains(&TraceAction::HealthCheck));
     assert!(all.contains(&TraceAction::SiteFailover));
     assert!(all.contains(&TraceAction::PerformanceStats));
-    assert_eq!(all.len(), 22); // 22 种操作类型
+    assert_eq!(all.len(), 23); // 23 种操作类型
 }
 
 /// 测试 22: Recovery 事件与其他 trace 事件共存
