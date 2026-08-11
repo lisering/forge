@@ -3490,6 +3490,42 @@ where
                 }
             }
 
+            // === 保存 DevTrace 智能分析 (Session 99 + 100 增强) ===
+            // 加载自定义阈值配置 (如果存在)
+            let config = crate::dev_trace_analyzer::AnalysisConfig::load_from_workspace(
+                &self.workspace.root,
+            );
+            let analysis =
+                crate::dev_trace_analyzer::analyze_dev_trace_summary_with_config(&summary, &config);
+
+            // === 健康度评分历史持久化 (Session 100) ===
+            use crate::dev_trace_analyzer::{
+                build_health_score_history_summary, HealthScoreHistory,
+            };
+            let mut hs_history =
+                HealthScoreHistory::load_from_workspace(&self.workspace.root).unwrap_or_default();
+            let now = chrono::Utc::now();
+            hs_history.add_from_analysis(&analysis, now);
+            hs_history = hs_history.with_timestamp(now);
+
+            // 构建历史摘要并附加到 DevTraceSummary (在 JSON/HTML 保存之前)
+            let hs_history_summary = build_health_score_history_summary(&hs_history);
+            if !hs_history_summary.is_empty() {
+                summary = summary.with_health_score_history(hs_history_summary);
+            }
+
+            // 保存历史到工作区
+            match hs_history.save_to_workspace(&self.workspace.root) {
+                Ok(()) => {
+                    if !hs_history.is_empty() {
+                        println!("\n  📊 健康度评分历史已保存: {}", hs_history.to_summary());
+                    }
+                }
+                Err(e) => {
+                    warn!("保存健康度评分历史失败: {}", e);
+                }
+            }
+
             println!("\n{}", summary.to_report());
 
             // === 保存 DevTraceSummary JSON 导出 (Session 88) ===
@@ -3515,8 +3551,7 @@ where
                 }
             }
 
-            // === 保存 DevTrace 智能分析报告 (Session 99) ===
-            let analysis = crate::dev_trace_analyzer::analyze_dev_trace_summary(&summary);
+            // 生成并保存 Markdown 分析报告
             let report = crate::dev_trace_analyzer::generate_analysis_report(&analysis);
             match crate::dev_trace_analyzer::save_analysis_to_workspace(
                 &report,
@@ -3553,6 +3588,23 @@ where
                 }
                 Err(e) => {
                     warn!("保存 DevTrace 分析报告失败: {}", e);
+                }
+            }
+
+            // === 保存 DevTrace 智能分析 HTML 报告 (Session 100) ===
+            let html_report = crate::dev_trace_analyzer::generate_analysis_html_report(&analysis);
+            match crate::dev_trace_analyzer::save_analysis_html_to_workspace(
+                &html_report,
+                &self.workspace.root,
+            ) {
+                Ok(()) => {
+                    println!(
+                        "📊 DevTrace 分析 HTML 已保存: {}/.forge/devtrace_analysis.html",
+                        self.workspace.root.display()
+                    );
+                }
+                Err(e) => {
+                    warn!("保存 DevTrace 分析 HTML 失败: {}", e);
                 }
             }
         }
@@ -9166,7 +9218,7 @@ mod tests {
         let content = std::fs::read_to_string(&html_path).unwrap();
         assert!(content.contains("<!DOCTYPE html>"));
         assert!(content.contains("Forge DevTrace"));
-        assert!(content.contains("Chart.js"));
+        assert!(content.contains("chart.js"));
     }
 
     #[test]
@@ -9251,6 +9303,229 @@ mod tests {
         // 空摘要: 成功率=0 → 应有 Critical 建议
         assert!(content.contains("可操作建议"));
         assert!(content.contains("成功率"));
+    }
+
+    // ===== Session 100: 健康度评分历史 + HTML 分析报告集成测试 =====
+
+    #[test]
+    fn test_final_report_saves_health_score_history() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 健康度评分历史文件应存在
+        let history_path = dir.path().join(".forge").join("health_score_history.json");
+        assert!(history_path.exists(), "健康度评分历史文件应存在");
+
+        // 验证内容可反序列化
+        let loaded = crate::dev_trace_analyzer::HealthScoreHistory::load(&history_path).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!(loaded.latest_score() >= 0.0);
+    }
+
+    #[test]
+    fn test_health_score_history_cross_session_accumulation() {
+        let dir = tempdir().unwrap();
+
+        // Session 1: 运行并保存历史
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch =
+                make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+            setup_test_phase(&mut orch);
+            orch.final_report().unwrap();
+        }
+
+        // Session 2: 再次运行, 应加载历史并追加
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch =
+                make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+            setup_test_phase(&mut orch);
+            orch.final_report().unwrap();
+        }
+
+        // 验证历史累积为 2 个 session
+        let history_path = dir.path().join(".forge").join("health_score_history.json");
+        let history = crate::dev_trace_analyzer::HealthScoreHistory::load(&history_path).unwrap();
+        assert_eq!(history.session_count(), 2);
+        assert_eq!(history.sessions[0].session_index, 1);
+        assert_eq!(history.sessions[1].session_index, 2);
+    }
+
+    #[test]
+    fn test_final_report_generates_analysis_html() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // HTML 分析报告应存在
+        let html_path = dir.path().join(".forge").join("devtrace_analysis.html");
+        assert!(html_path.exists(), "DevTrace 分析 HTML 报告应存在");
+
+        let content = std::fs::read_to_string(&html_path).unwrap();
+        assert!(content.contains("<!DOCTYPE html>"));
+        assert!(content.contains("chart.js"));
+        assert!(content.contains("健康度评分"));
+    }
+
+    #[test]
+    fn test_health_score_history_in_devtrace_json() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // DevTrace JSON 应包含健康度评分历史摘要
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        assert!(json_path.exists());
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            content.contains("health_score_history_summary"),
+            "JSON 应包含 health_score_history_summary 字段"
+        );
+    }
+
+    #[test]
+    fn test_final_report_health_score_history_trend_after_multiple_sessions() {
+        let dir = tempdir().unwrap();
+
+        // 手动创建一个已有 2 个 session 的历史
+        use chrono::Utc;
+        {
+            let mut history = crate::dev_trace_analyzer::HealthScoreHistory::new();
+            history.add_entry(crate::dev_trace_analyzer::HealthScoreHistoryEntry::new(
+                1,
+                Utc::now(),
+                50.0,
+                "一般".to_string(),
+                0.3,
+                1,
+                2,
+                0,
+                50,
+                1000,
+            ));
+            history.add_entry(crate::dev_trace_analyzer::HealthScoreHistoryEntry::new(
+                2,
+                Utc::now(),
+                75.0,
+                "良好".to_string(),
+                0.8,
+                0,
+                1,
+                2,
+                100,
+                3600000,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        // Session 3: final_report 应加载历史并追加
+        {
+            let chat = MockChatClient::new(vec![]);
+            let mut orch =
+                make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+            setup_test_phase(&mut orch);
+            orch.final_report().unwrap();
+        }
+
+        // 验证历史累积为 3 个 session
+        let history_path = dir.path().join(".forge").join("health_score_history.json");
+        let history = crate::dev_trace_analyzer::HealthScoreHistory::load(&history_path).unwrap();
+        assert_eq!(history.session_count(), 3);
+        assert_eq!(history.sessions[2].session_index, 3);
+        // 前两个 session 的评分保留
+        assert!((history.sessions[0].score - 50.0).abs() < 0.001);
+        assert!((history.sessions[1].score - 75.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_final_report_analysis_config_loaded() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".forge")).unwrap();
+
+        // 先保存一个自定义配置文件
+        let config = crate::dev_trace_analyzer::AnalysisConfig::default();
+        config.save_to_workspace(dir.path()).unwrap();
+
+        let config_path = dir.path().join(".forge").join("analysis_config.json");
+        assert!(config_path.exists());
+
+        // 运行 final_report, 应自动加载配置 (不崩溃)
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // 分析报告应正常生成
+        let analysis_path = dir.path().join(".forge").join("devtrace_analysis.md");
+        assert!(analysis_path.exists());
+    }
+
+    #[test]
+    fn test_health_score_history_report_panel() {
+        let dir = tempdir().unwrap();
+
+        // 手动创建 2 个 session 的历史
+        use chrono::Utc;
+        {
+            let mut history = crate::dev_trace_analyzer::HealthScoreHistory::new();
+            history.add_entry(crate::dev_trace_analyzer::HealthScoreHistoryEntry::new(
+                1,
+                Utc::now(),
+                50.0,
+                "一般".to_string(),
+                0.3,
+                1,
+                2,
+                0,
+                50,
+                1000,
+            ));
+            history.add_entry(crate::dev_trace_analyzer::HealthScoreHistoryEntry::new(
+                2,
+                Utc::now(),
+                75.0,
+                "良好".to_string(),
+                0.8,
+                0,
+                1,
+                2,
+                100,
+                3600000,
+            ));
+            history.save_to_workspace(dir.path()).unwrap();
+        }
+
+        let chat = MockChatClient::new(vec![]);
+        let mut orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_dev_trace(true);
+        setup_test_phase(&mut orch);
+
+        orch.final_report().unwrap();
+
+        // DevTrace JSON 应包含健康度评分历史摘要
+        let json_path = dir.path().join(".forge").join("devtrace_summary.json");
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let export: crate::dev_trace::DevTraceJsonExport = serde_json::from_str(&content).unwrap();
+
+        // 健康度评分历史摘要应存在
+        let hsh = export
+            .summary
+            .health_score_history_summary
+            .expect("JSON 应包含健康度评分历史摘要");
+        assert_eq!(hsh.session_count, 3); // 2 个预设 + 1 个当前
+        assert!(hsh.latest_score >= 0.0);
     }
 
     #[test]

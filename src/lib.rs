@@ -170,12 +170,18 @@ pub use dev_trace::{
     SearchQualityHistorySummary, SearchQualityStats, TimelineEntry, TraceAction,
 };
 pub use dev_trace_analyzer::{
-    analyze_cache_effectiveness, analyze_dev_trace_summary, analyze_evaluator_synergy,
-    analyze_incremental_sending, analyze_memory_evaluation, analyze_search_quality,
-    compute_health_score, generate_analysis_report, generate_recommendations, save_analysis_report,
-    save_analysis_to_workspace, AnalysisCategory, AnalysisInsight, AnalysisRecommendation,
-    DevTraceAnalysis, HealthScore, RecommendationSeverity, SummaryOverview,
-    ANALYSIS_REPORT_FILENAME, ANALYSIS_REPORT_VERSION, THRESHOLD_CACHE_HIT_RATE_LOW,
+    analyze_cache_effectiveness, analyze_dev_trace_summary, analyze_dev_trace_summary_with_config,
+    analyze_evaluator_synergy, analyze_incremental_sending, analyze_memory_evaluation,
+    analyze_search_quality, build_health_score_history_entry, build_health_score_history_summary,
+    compute_health_score, compute_health_score_trend, compute_health_score_with_config,
+    generate_analysis_html_report, generate_analysis_report, generate_recommendations,
+    generate_recommendations_with_config, save_analysis_html_to_workspace, save_analysis_report,
+    save_analysis_to_workspace, AnalysisCategory, AnalysisConfig, AnalysisInsight,
+    AnalysisRecommendation, AnalysisThresholds, AnalysisWeights, DevTraceAnalysis, HealthScore,
+    HealthScoreHistory, HealthScoreHistoryEntry, HealthScoreHistorySummary, RecommendationSeverity,
+    SummaryOverview, ANALYSIS_CONFIG_FILENAME, ANALYSIS_HTML_REPORT_FILENAME,
+    ANALYSIS_HTML_REPORT_VERSION, ANALYSIS_REPORT_FILENAME, ANALYSIS_REPORT_VERSION,
+    HEALTH_SCORE_HISTORY_FILENAME, MAX_HEALTH_SCORE_HISTORY_SESSIONS, THRESHOLD_CACHE_HIT_RATE_LOW,
     THRESHOLD_INCREMENTAL_SAVED_LOW, THRESHOLD_MEMORY_DIFF_HARMFUL, THRESHOLD_SEARCH_DIFF_HARMFUL,
     THRESHOLD_SUCCESS_RATE_LOW, THRESHOLD_SUCCESS_RATE_MEDIUM, THRESHOLD_SYNERGY_LOW, WEIGHT_CACHE,
     WEIGHT_INCREMENTAL, WEIGHT_MEMORY, WEIGHT_SEARCH, WEIGHT_SUCCESS_RATE, WEIGHT_SYNERGY,
@@ -207,7 +213,7 @@ pub use html_report::{
     generate_chart_js_line_raw, generate_css_styles, generate_doughnut_colors,
     generate_export_buttons, generate_html_report, generate_html_report_file,
     generate_point_colors, generate_report_toolbar, generate_stat_card, generate_table_sort_script,
-    generate_timeline_csv, generate_timeline_json, generate_timeline_search,
+    generate_timeline_csv, generate_timeline_json, generate_timeline_search, CHART_JS_CDN,
     DEFAULT_DOUGHNUT_COLORS, HTML_REPORT_FORMAT_VERSION,
 };
 pub use interaction::{AutoApprove, CliInteraction, MockCallCounts, MockInteraction};

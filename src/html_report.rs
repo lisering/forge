@@ -42,7 +42,7 @@ use crate::sparkline::escape_html;
 // ============================================================================
 
 /// Chart.js CDN 地址
-const CHART_JS_CDN: &str = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
+pub const CHART_JS_CDN: &str = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js";
 
 /// HTML 报告格式版本
 pub const HTML_REPORT_FORMAT_VERSION: &str = "1.2";

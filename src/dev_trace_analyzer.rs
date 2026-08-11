@@ -46,10 +46,12 @@
 //! ```
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::dev_trace::DevTraceSummary;
+use crate::evaluator_synergy::ScoreTrend;
 
 // ============================================================================
 //  常量
@@ -90,6 +92,20 @@ pub const THRESHOLD_INCREMENTAL_SAVED_LOW: f64 = 0.10;
 pub const THRESHOLD_SUCCESS_RATE_LOW: f64 = 0.30;
 /// 成功率中等阈值
 pub const THRESHOLD_SUCCESS_RATE_MEDIUM: f64 = 0.50;
+
+// 健康度评分历史持久化
+/// 健康度评分历史文件名
+pub const HEALTH_SCORE_HISTORY_FILENAME: &str = "health_score_history.json";
+/// 最大历史 session 数 (超过后自动淘汰最旧的)
+pub const MAX_HEALTH_SCORE_HISTORY_SESSIONS: usize = 50;
+
+// 自定义阈值配置
+/// 分析配置文件名
+pub const ANALYSIS_CONFIG_FILENAME: &str = "analysis_config.json";
+/// 分析 HTML 报告文件名
+pub const ANALYSIS_HTML_REPORT_FILENAME: &str = "devtrace_analysis.html";
+/// 分析 HTML 报告格式版本
+pub const ANALYSIS_HTML_REPORT_VERSION: &str = "1.0";
 
 // ============================================================================
 //  RecommendationSeverity — 建议严重级别
@@ -1546,6 +1562,1512 @@ fn format_duration_human(ms: u64) -> String {
 }
 
 // ============================================================================
+//  HealthScoreHistoryEntry — 跨 session 健康度评分历史条目
+// ============================================================================
+
+/// 单个 session 的健康度评分历史条目
+///
+/// 每次 session 结束时, 从 [`DevTraceAnalysis`] 提取关键指标
+/// 追加到历史记录中, 持久化到 `.forge/health_score_history.json`。
+///
+/// # 字段
+///
+/// - `session_index`: session 序号 (从 1 开始)
+/// - `timestamp`: session 结束时间 (UTC)
+/// - `score`: 健康度评分 (0.0~100.0)
+/// - `grade`: 评级标签 (优秀/良好/一般/差)
+/// - `success_rate`: 成功率 (0.0~1.0)
+/// - `critical_count`: 严重建议数
+/// - `warning_count`: 警告建议数
+/// - `info_count`: 信息建议数
+/// - `total_entries`: DevTrace 总条目数
+/// - `total_duration_ms`: 总耗时 (毫秒)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace_analyzer::HealthScoreHistoryEntry;
+/// # use chrono::Utc;
+/// let entry = HealthScoreHistoryEntry::new(
+///     1, Utc::now(), 75.0, "良好".to_string(),
+///     0.8, 0, 2, 3, 100, 3600000,
+/// );
+/// assert_eq!(entry.session_index, 1);
+/// assert!((entry.score - 75.0).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthScoreHistoryEntry {
+    /// session 序号 (从 1 开始)
+    pub session_index: usize,
+    /// session 结束时间 (UTC)
+    pub timestamp: DateTime<Utc>,
+    /// 健康度评分 (0.0~100.0)
+    pub score: f64,
+    /// 评级标签 (优秀/良好/一般/差)
+    pub grade: String,
+    /// 成功率 (0.0~1.0)
+    pub success_rate: f64,
+    /// 严重建议数
+    pub critical_count: usize,
+    /// 警告建议数
+    pub warning_count: usize,
+    /// 信息建议数
+    pub info_count: usize,
+    /// DevTrace 总条目数
+    pub total_entries: usize,
+    /// 总耗时 (毫秒)
+    pub total_duration_ms: u64,
+}
+
+impl HealthScoreHistoryEntry {
+    /// 创建新的健康度评分历史条目
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_index: usize,
+        timestamp: DateTime<Utc>,
+        score: f64,
+        grade: String,
+        success_rate: f64,
+        critical_count: usize,
+        warning_count: usize,
+        info_count: usize,
+        total_entries: usize,
+        total_duration_ms: u64,
+    ) -> Self {
+        Self {
+            session_index,
+            timestamp,
+            score,
+            grade,
+            success_rate,
+            critical_count,
+            warning_count,
+            info_count,
+            total_entries,
+            total_duration_ms,
+        }
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        format!(
+            "Session {}: {} {:.1}/100, 成功率 {:.1}%, {}严重/{}警告/{}信息",
+            self.session_index,
+            self.grade,
+            self.score,
+            self.success_rate * 100.0,
+            self.critical_count,
+            self.warning_count,
+            self.info_count,
+        )
+    }
+}
+
+// ============================================================================
+//  HealthScoreHistory — 跨 session 健康度评分历史
+// ============================================================================
+
+/// 跨 session 健康度评分历史 — 追踪评分变化趋势
+///
+/// 每次 session 结束时将 [`DevTraceAnalysis`] 的关键指标
+/// 追加到历史记录中, 持久化到 `.forge/health_score_history.json`。
+///
+/// # 字段
+///
+/// - `sessions`: 各 session 的评分快照列表 (按时间顺序)
+/// - `saved_at`: 最后保存时间
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace_analyzer::{HealthScoreHistory, HealthScoreHistoryEntry};
+/// # use chrono::Utc;
+/// let mut history = HealthScoreHistory::new();
+/// assert!(history.is_empty());
+///
+/// let entry = HealthScoreHistoryEntry::new(
+///     1, Utc::now(), 75.0, "良好".to_string(),
+///     0.8, 0, 2, 3, 100, 3600000,
+/// );
+/// history.add_entry(entry);
+/// assert_eq!(history.session_count(), 1);
+/// assert!((history.latest_score() - 75.0).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthScoreHistory {
+    /// 各 session 的评分快照列表 (按时间顺序)
+    pub sessions: Vec<HealthScoreHistoryEntry>,
+    /// 最后保存时间 (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl Default for HealthScoreHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HealthScoreHistory {
+    /// 创建空的健康度评分历史
+    pub fn new() -> Self {
+        Self {
+            sessions: vec![],
+            saved_at: None,
+        }
+    }
+
+    /// 是否为空 (无 session 记录)
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// session 记录数
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 获取最新的历史条目
+    pub fn latest(&self) -> Option<&HealthScoreHistoryEntry> {
+        self.sessions.last()
+    }
+
+    /// 获取最新的健康度评分
+    pub fn latest_score(&self) -> f64 {
+        self.latest().map(|e| e.score).unwrap_or(0.0)
+    }
+
+    /// 获取所有评分列表
+    pub fn scores(&self) -> Vec<f64> {
+        self.sessions.iter().map(|e| e.score).collect()
+    }
+
+    /// 计算平均评分
+    pub fn avg_score(&self) -> f64 {
+        if self.sessions.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.sessions.iter().map(|e| e.score).sum();
+        sum / self.sessions.len() as f64
+    }
+
+    /// 获取下一个 session 序号
+    pub fn next_session_index(&self) -> usize {
+        self.sessions
+            .last()
+            .map(|e| e.session_index + 1)
+            .unwrap_or(1)
+    }
+
+    /// 添加一条 session 记录
+    ///
+    /// 超过 `MAX_HEALTH_SCORE_HISTORY_SESSIONS` 时移除最旧的记录。
+    pub fn add_entry(&mut self, entry: HealthScoreHistoryEntry) {
+        self.sessions.push(entry);
+        if self.sessions.len() > MAX_HEALTH_SCORE_HISTORY_SESSIONS {
+            self.sessions.remove(0);
+        }
+    }
+
+    /// 从 [`DevTraceAnalysis`] 添加当前 session 的记录
+    ///
+    /// # 参数
+    ///
+    /// - `analysis`: 当前 session 的分析结果
+    /// - `timestamp`: session 结束时间
+    pub fn add_from_analysis(&mut self, analysis: &DevTraceAnalysis, timestamp: DateTime<Utc>) {
+        let entry =
+            build_health_score_history_entry(analysis, self.next_session_index(), timestamp);
+        self.add_entry(entry);
+    }
+
+    /// 评分趋势
+    pub fn score_trend(&self) -> ScoreTrend {
+        compute_health_score_trend(&self.scores())
+    }
+
+    /// 评分变化量 (最新 - 最早)
+    pub fn score_delta(&self) -> f64 {
+        if self.sessions.len() < 2 {
+            return 0.0;
+        }
+        let first = self.sessions.first().unwrap().score;
+        let last = self.sessions.last().unwrap().score;
+        last - first
+    }
+
+    /// 累计严重建议数 (所有 session)
+    pub fn total_critical_across_sessions(&self) -> usize {
+        self.sessions.iter().map(|e| e.critical_count).sum()
+    }
+
+    /// 累计警告建议数 (所有 session)
+    pub fn total_warning_across_sessions(&self) -> usize {
+        self.sessions.iter().map(|e| e.warning_count).sum()
+    }
+
+    /// 设置保存时间戳
+    pub fn with_timestamp(mut self, timestamp: DateTime<Utc>) -> Self {
+        self.saved_at = Some(timestamp.to_rfc3339());
+        self
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        if self.is_empty() {
+            return "健康度评分历史: 无记录".to_string();
+        }
+        let trend = self.score_trend();
+        format!(
+            "健康度评分历史: {} 个 session, 平均 {:.1}/100, 最新 {:.1}/100, 趋势 {}",
+            self.session_count(),
+            self.avg_score(),
+            self.latest_score(),
+            trend.label(),
+        )
+    }
+
+    // --- 持久化方法 ---
+
+    /// 从 JSON 文件加载历史
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(Self::new());
+        }
+        let history: Self = serde_json::from_str(&content)?;
+        Ok(history)
+    }
+
+    /// 保存历史到 JSON 文件
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// 从工作区加载历史
+    pub fn load_from_workspace(workspace_root: &Path) -> Option<Self> {
+        let path = workspace_root
+            .join(".forge")
+            .join(HEALTH_SCORE_HISTORY_FILENAME);
+        match Self::load(&path) {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => None,
+            Err(_) => None,
+        }
+    }
+
+    /// 保存历史到工作区
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let path = workspace_root
+            .join(".forge")
+            .join(HEALTH_SCORE_HISTORY_FILENAME);
+        self.save(&path)
+    }
+}
+
+// ============================================================================
+//  HealthScoreHistorySummary — 健康度评分历史摘要
+// ============================================================================
+
+/// 健康度评分历史摘要 — 用于 DevTraceSummary 报告
+///
+/// # 字段
+///
+/// - `session_count`: session 记录数
+/// - `latest_score`: 最新评分 (0.0~100.0)
+/// - `avg_score`: 平均评分 (0.0~100.0)
+/// - `score_trend`: 评分趋势
+/// - `score_delta`: 评分变化量 (最新 - 最早)
+/// - `latest_grade`: 最新评级标签
+/// - `total_critical`: 累计严重建议数
+/// - `total_warnings`: 累计警告建议数
+/// - `saved_at`: 保存时间
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace_analyzer::HealthScoreHistorySummary;
+/// # use forge::evaluator_synergy::ScoreTrend;
+/// let summary = HealthScoreHistorySummary::new(
+///     3, 75.0, 70.0, ScoreTrend::Improving,
+///     15.0, "良好".to_string(), 2, 5, None,
+/// );
+/// assert_eq!(summary.session_count, 3);
+/// assert!(!summary.is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthScoreHistorySummary {
+    /// session 记录数
+    pub session_count: usize,
+    /// 最新评分 (0.0~100.0)
+    pub latest_score: f64,
+    /// 平均评分 (0.0~100.0)
+    pub avg_score: f64,
+    /// 评分趋势
+    pub score_trend: ScoreTrend,
+    /// 评分变化量 (最新 - 最早)
+    pub score_delta: f64,
+    /// 最新评级标签
+    pub latest_grade: String,
+    /// 累计严重建议数
+    pub total_critical: usize,
+    /// 累计警告建议数
+    pub total_warnings: usize,
+    /// 保存时间 (ISO 8601, 可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<String>,
+}
+
+impl HealthScoreHistorySummary {
+    /// 创建健康度评分历史摘要
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_count: usize,
+        latest_score: f64,
+        avg_score: f64,
+        score_trend: ScoreTrend,
+        score_delta: f64,
+        latest_grade: String,
+        total_critical: usize,
+        total_warnings: usize,
+        saved_at: Option<String>,
+    ) -> Self {
+        Self {
+            session_count,
+            latest_score,
+            avg_score,
+            score_trend,
+            score_delta,
+            latest_grade,
+            total_critical,
+            total_warnings,
+            saved_at,
+        }
+    }
+
+    /// 是否为空 (无 session 记录)
+    pub fn is_empty(&self) -> bool {
+        self.session_count == 0
+    }
+
+    /// 格式化为简要摘要
+    pub fn to_summary(&self) -> String {
+        if self.is_empty() {
+            return "健康度评分历史: 无记录".to_string();
+        }
+        format!(
+            "健康度评分历史: {} session, 最新 {:.1}/100 ({}), 均 {:.1}/100, 趋势 {} (Δ{:+.1})",
+            self.session_count,
+            self.latest_score,
+            self.latest_grade,
+            self.avg_score,
+            self.score_trend.label(),
+            self.score_delta,
+        )
+    }
+}
+
+// ============================================================================
+//  纯函数 — 健康度评分历史
+// ============================================================================
+
+/// 从分析结果构建健康度评分历史条目
+///
+/// # 参数
+///
+/// - `analysis`: 当前 session 的分析结果
+/// - `session_index`: session 序号
+/// - `timestamp`: session 结束时间
+///
+/// # 返回
+///
+/// 可追加到历史记录的条目
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::DevTraceSummary;
+/// # use forge::dev_trace_analyzer::{analyze_dev_trace_summary, build_health_score_history_entry};
+/// # use chrono::Utc;
+/// let summary = DevTraceSummary::empty();
+/// let analysis = analyze_dev_trace_summary(&summary);
+/// let entry = build_health_score_history_entry(&analysis, 1, Utc::now());
+/// assert_eq!(entry.session_index, 1);
+/// assert!(entry.score >= 0.0);
+/// ```
+pub fn build_health_score_history_entry(
+    analysis: &DevTraceAnalysis,
+    session_index: usize,
+    timestamp: DateTime<Utc>,
+) -> HealthScoreHistoryEntry {
+    let critical_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| r.is_critical())
+        .count();
+    let warning_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| r.is_warning())
+        .count();
+    let info_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| !r.is_critical() && !r.is_warning())
+        .count();
+
+    HealthScoreHistoryEntry::new(
+        session_index,
+        timestamp,
+        analysis.health_score.score,
+        analysis.health_score.grade().to_string(),
+        analysis.summary_overview.success_rate,
+        critical_count,
+        warning_count,
+        info_count,
+        analysis.summary_overview.total_entries,
+        analysis.summary_overview.total_duration_ms,
+    )
+}
+
+/// 从历史记录构建摘要
+///
+/// # 参数
+///
+/// - `history`: 健康度评分历史
+///
+/// # 返回
+///
+/// 可附加到 DevTraceSummary 的摘要
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace_analyzer::{HealthScoreHistory, HealthScoreHistoryEntry, build_health_score_history_summary};
+/// # use chrono::Utc;
+/// let mut history = HealthScoreHistory::new();
+/// history.add_entry(HealthScoreHistoryEntry::new(
+///     1, Utc::now(), 75.0, "良好".to_string(),
+///     0.8, 0, 2, 3, 100, 3600000,
+/// ));
+/// let summary = build_health_score_history_summary(&history);
+/// assert_eq!(summary.session_count, 1);
+/// assert!((summary.latest_score - 75.0).abs() < 0.001);
+/// ```
+pub fn build_health_score_history_summary(
+    history: &HealthScoreHistory,
+) -> HealthScoreHistorySummary {
+    if history.is_empty() {
+        return HealthScoreHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            String::new(),
+            0,
+            0,
+            None,
+        );
+    }
+
+    HealthScoreHistorySummary::new(
+        history.session_count(),
+        history.latest_score(),
+        history.avg_score(),
+        history.score_trend(),
+        history.score_delta(),
+        history
+            .latest()
+            .map(|e| e.grade.clone())
+            .unwrap_or_default(),
+        history.total_critical_across_sessions(),
+        history.total_warning_across_sessions(),
+        history.saved_at.clone(),
+    )
+}
+
+/// 计算健康度评分趋势
+///
+/// 根据 3 个最近 session 的评分变化判断趋势。
+///
+/// # 参数
+///
+/// - `scores`: 评分列表 (按时间顺序, 0.0~100.0)
+///
+/// # 返回
+///
+/// - `Improving`: 最近 3 个评分呈上升趋势
+/// - `Declining`: 最近 3 个评分呈下降趋势
+/// - `Stable`: 变化幅度小于阈值
+/// - `Insufficient`: 数据不足 (少于 2 个)
+pub fn compute_health_score_trend(scores: &[f64]) -> ScoreTrend {
+    if scores.len() < 2 {
+        return ScoreTrend::Insufficient;
+    }
+
+    let threshold = 5.0; // 评分变化阈值 (5 分)
+    let recent: Vec<f64> = scores.iter().rev().take(3).cloned().collect();
+    let recent_rev: Vec<f64> = recent.into_iter().rev().collect();
+
+    if recent_rev.len() < 2 {
+        return ScoreTrend::Insufficient;
+    }
+
+    let delta = recent_rev.last().unwrap() - recent_rev.first().unwrap();
+    if delta > threshold {
+        ScoreTrend::Improving
+    } else if delta < -threshold {
+        ScoreTrend::Declining
+    } else {
+        ScoreTrend::Stable
+    }
+}
+
+// ============================================================================
+//  AnalysisConfig — 自定义阈值配置
+// ============================================================================
+
+/// 分析引擎配置 — 自定义权重和阈值
+///
+/// 允许用户通过 `.forge/analysis_config.json` 文件自定义分析引擎的
+/// 权重和阈值, 无需修改代码。
+///
+/// # 字段
+///
+/// - `weights`: 评分权重配置
+/// - `thresholds`: 建议阈值配置
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace_analyzer::AnalysisConfig;
+/// let config = AnalysisConfig::default();
+/// assert!((config.weights.success_rate - 0.30).abs() < 0.001);
+/// assert!((config.thresholds.success_rate_low - 0.30).abs() < 0.001);
+/// ```
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    /// 评分权重配置
+    pub weights: AnalysisWeights,
+    /// 建议阈值配置
+    pub thresholds: AnalysisThresholds,
+}
+
+impl AnalysisConfig {
+    /// 创建默认配置
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从 JSON 文件加载配置
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let config: Self = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// 保存配置到 JSON 文件
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// 从工作区加载配置
+    pub fn load_from_workspace(workspace_root: &Path) -> Self {
+        let path = workspace_root.join(".forge").join(ANALYSIS_CONFIG_FILENAME);
+        Self::load(&path).unwrap_or_default()
+    }
+
+    /// 保存配置到工作区
+    pub fn save_to_workspace(&self, workspace_root: &Path) -> Result<()> {
+        let path = workspace_root.join(".forge").join(ANALYSIS_CONFIG_FILENAME);
+        self.save(&path)
+    }
+}
+
+/// 评分权重配置
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisWeights {
+    /// 成功率权重 (默认 0.30)
+    pub success_rate: f64,
+    /// 缓存有效性权重 (默认 0.15)
+    pub cache: f64,
+    /// 搜索质量权重 (默认 0.15)
+    pub search: f64,
+    /// Memory 评估权重 (默认 0.10)
+    pub memory: f64,
+    /// 评估器协同权重 (默认 0.15)
+    pub synergy: f64,
+    /// 增量发送权重 (默认 0.15)
+    pub incremental: f64,
+}
+
+impl Default for AnalysisWeights {
+    fn default() -> Self {
+        Self {
+            success_rate: WEIGHT_SUCCESS_RATE,
+            cache: WEIGHT_CACHE,
+            search: WEIGHT_SEARCH,
+            memory: WEIGHT_MEMORY,
+            synergy: WEIGHT_SYNERGY,
+            incremental: WEIGHT_INCREMENTAL,
+        }
+    }
+}
+
+/// 建议阈值配置
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnalysisThresholds {
+    /// 缓存命中率低阈值 (默认 0.30)
+    pub cache_hit_rate_low: f64,
+    /// 搜索差值有害阈值 (默认 -0.10)
+    pub search_diff_harmful: f64,
+    /// Memory 差值有害阈值 (默认 -0.10)
+    pub memory_diff_harmful: f64,
+    /// 协同评分低阈值 (默认 0.30)
+    pub synergy_low: f64,
+    /// 增量发送节省比例低阈值 (默认 0.10)
+    pub incremental_saved_low: f64,
+    /// 成功率低阈值 (默认 0.30)
+    pub success_rate_low: f64,
+    /// 成功率中等阈值 (默认 0.50)
+    pub success_rate_medium: f64,
+}
+
+impl Default for AnalysisThresholds {
+    fn default() -> Self {
+        Self {
+            cache_hit_rate_low: THRESHOLD_CACHE_HIT_RATE_LOW,
+            search_diff_harmful: THRESHOLD_SEARCH_DIFF_HARMFUL,
+            memory_diff_harmful: THRESHOLD_MEMORY_DIFF_HARMFUL,
+            synergy_low: THRESHOLD_SYNERGY_LOW,
+            incremental_saved_low: THRESHOLD_INCREMENTAL_SAVED_LOW,
+            success_rate_low: THRESHOLD_SUCCESS_RATE_LOW,
+            success_rate_medium: THRESHOLD_SUCCESS_RATE_MEDIUM,
+        }
+    }
+}
+
+// ============================================================================
+//  纯函数 — 带配置的分析
+// ============================================================================
+
+/// 使用自定义配置计算健康度评分
+///
+/// 与 [`compute_health_score`] 相同, 但使用配置中的权重。
+///
+/// # 参数
+///
+/// - `summary`: DevTraceSummary 引用
+/// - `config`: 分析配置
+///
+/// # 返回
+///
+/// 健康度评分 (含分项明细)
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::DevTraceSummary;
+/// # use forge::dev_trace_analyzer::{compute_health_score_with_config, AnalysisConfig};
+/// let summary = DevTraceSummary::empty();
+/// let config = AnalysisConfig::default();
+/// let hs = compute_health_score_with_config(&summary, &config);
+/// assert!(hs.score >= 0.0 && hs.score <= 100.0);
+/// ```
+pub fn compute_health_score_with_config(
+    summary: &DevTraceSummary,
+    config: &AnalysisConfig,
+) -> HealthScore {
+    let w = &config.weights;
+
+    // 成功率维度 (始终有数据)
+    let success_rate_score = summary.success_rate * 100.0;
+
+    // 缓存维度
+    let cache_score = summary.cache_fix_correlation.as_ref().map(|corr| {
+        let hit_rate = corr.hit_fix_rate();
+        let diff = corr.hit_vs_miss_diff();
+        let base = hit_rate * 50.0;
+        let contribution = if diff > 0.0 {
+            (diff * 100.0).min(50.0)
+        } else {
+            (hit_rate * 50.0 + diff * 100.0).max(0.0)
+        };
+        (base + contribution).clamp(0.0, 100.0).abs()
+    });
+
+    // 搜索维度
+    let search_score = summary.search_quality_summary.as_ref().map(|sq| {
+        let diff = sq.search_vs_no_search_diff();
+        let search_rate = sq.search_success_rate();
+        let base = search_rate * 50.0;
+        let contribution = if diff >= 0.0 {
+            (diff * 100.0).min(50.0)
+        } else {
+            (search_rate * 50.0 + diff * 100.0).max(0.0)
+        };
+        (base + contribution).clamp(0.0, 100.0).abs()
+    });
+
+    // Memory 维度
+    let memory_score = summary.memory_evaluation_summary.as_ref().map(|me| {
+        let diff = me.memory_vs_no_memory_diff();
+        let base = 50.0 + diff * 100.0;
+        base.clamp(0.0, 100.0)
+    });
+
+    // 协同维度
+    let synergy_score = summary
+        .evaluator_synergy_summary
+        .as_ref()
+        .map(|es| es.synergy_score * 100.0);
+
+    // 增量维度
+    let incremental_score = summary
+        .incremental_summary
+        .as_ref()
+        .map(|inc| inc.saved_ratio() * 100.0);
+
+    // 计算加权评分 (无数据的维度权重重新分配)
+    let mut weighted_sum = success_rate_score * w.success_rate;
+    let mut active_weight = w.success_rate;
+
+    if let Some(cs) = cache_score {
+        weighted_sum += cs * w.cache;
+        active_weight += w.cache;
+    }
+    if let Some(ss) = search_score {
+        weighted_sum += ss * w.search;
+        active_weight += w.search;
+    }
+    if let Some(ms) = memory_score {
+        weighted_sum += ms * w.memory;
+        active_weight += w.memory;
+    }
+    if let Some(sy) = synergy_score {
+        weighted_sum += sy * w.synergy;
+        active_weight += w.synergy;
+    }
+    if let Some(is) = incremental_score {
+        weighted_sum += is * w.incremental;
+        active_weight += w.incremental;
+    }
+
+    let score = if active_weight > 0.0 {
+        (weighted_sum / active_weight).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    HealthScore {
+        score,
+        success_rate_score,
+        cache_score,
+        search_score,
+        memory_score,
+        synergy_score,
+        incremental_score,
+    }
+}
+
+/// 使用自定义配置生成建议
+///
+/// 与 [`generate_recommendations`] 相同, 但使用配置中的阈值。
+///
+/// # 参数
+///
+/// - `summary`: DevTraceSummary 引用
+/// - `config`: 分析配置
+///
+/// # 返回
+///
+/// 建议列表, 按严重级别降序排列
+pub fn generate_recommendations_with_config(
+    summary: &DevTraceSummary,
+    config: &AnalysisConfig,
+) -> Vec<AnalysisRecommendation> {
+    let t = &config.thresholds;
+    let mut recs = vec![];
+
+    // === 整体成功率 ===
+    if summary.success_rate < t.success_rate_low {
+        recs.push(AnalysisRecommendation::new(
+            RecommendationSeverity::Critical,
+            AnalysisCategory::Overall,
+            "整体成功率很低",
+            format!(
+                "成功率为 {:.1}%, 低于 {}% 阈值。建议检查错误模式、网络连接和 AI 响应质量。",
+                summary.success_rate * 100.0,
+                (t.success_rate_low * 100.0) as u32,
+            ),
+        ));
+    } else if summary.success_rate < t.success_rate_medium {
+        recs.push(AnalysisRecommendation::new(
+            RecommendationSeverity::Warning,
+            AnalysisCategory::Overall,
+            "整体成功率偏低",
+            format!(
+                "成功率为 {:.1}%, 低于 {}% 中等阈值。建议关注高频失败的操作类型。",
+                summary.success_rate * 100.0,
+                (t.success_rate_medium * 100.0) as u32,
+            ),
+        ));
+    } else {
+        recs.push(AnalysisRecommendation::new(
+            RecommendationSeverity::Info,
+            AnalysisCategory::Overall,
+            "整体成功率良好",
+            format!(
+                "成功率为 {:.1}%, 在正常范围内。",
+                summary.success_rate * 100.0
+            ),
+        ));
+    }
+
+    // === 缓存 ===
+    if let Some(ref cache) = summary.cache_summary {
+        let hit_rate = cache.hit_rate();
+        if hit_rate < t.cache_hit_rate_low {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::Cache,
+                "缓存命中率偏低",
+                format!(
+                    "缓存命中率为 {:.1}%, 低于 {}% 阈值。建议调整 TTL 或考虑禁用缓存。",
+                    hit_rate * 100.0,
+                    (t.cache_hit_rate_low * 100.0) as u32,
+                ),
+            ));
+        } else {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::Cache,
+                "缓存命中率正常",
+                format!("缓存命中率为 {:.1}%, 缓存策略有效。", hit_rate * 100.0),
+            ));
+        }
+    }
+
+    if let Some(ref corr) = summary.cache_fix_correlation {
+        let diff = corr.hit_vs_miss_diff();
+        if diff < 0.0 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::Cache,
+                "缓存命中后修复率低于未命中",
+                format!(
+                    "缓存命中后修复率低 {:.1}%。缓存可能存储了过时的搜索结果, 建议缩短 TTL 或清理缓存。",
+                    diff.abs() * 100.0,
+                ),
+            ));
+        }
+    }
+
+    // === 搜索 ===
+    if let Some(ref sq) = summary.search_quality_summary {
+        let diff = sq.search_vs_no_search_diff();
+        if diff < t.search_diff_harmful {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Critical,
+                AnalysisCategory::Search,
+                "搜索降低了修复率",
+                format!(
+                    "搜索使修复率降低 {:.1}%, 建议禁用自动搜索功能或更换搜索源。",
+                    diff.abs() * 100.0,
+                ),
+            ));
+        } else if diff > 0.0 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::Search,
+                "搜索提升了修复率",
+                format!(
+                    "搜索使修复率提升 {:.1}%, 搜索功能有效, 建议保持启用。",
+                    diff * 100.0
+                ),
+            ));
+        }
+
+        let search_rate = sq.search_success_rate();
+        if search_rate < 0.5 && sq.total_searches > 0 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::Search,
+                "搜索成功率偏低",
+                format!(
+                    "搜索成功率为 {:.1}%。网络或目标网站可能不稳定, 建议检查代理或更换搜索引擎。",
+                    search_rate * 100.0,
+                ),
+            ));
+        }
+    }
+
+    // === Memory ===
+    if let Some(ref me) = summary.memory_evaluation_summary {
+        let diff = me.memory_vs_no_memory_diff();
+        if diff < t.memory_diff_harmful {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Critical,
+                AnalysisCategory::Memory,
+                "Memory 注入降低了修复率",
+                format!(
+                    "Memory 注入使修复率降低 {:.1}%, 建议禁用 Memory 上下文注入 (--memory-context 0)。",
+                    diff.abs() * 100.0,
+                ),
+            ));
+        } else if diff > 0.0 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::Memory,
+                "Memory 注入提升了修复率",
+                format!(
+                    "Memory 注入使修复率提升 {:.1}%, 注入有效, 建议保持启用。",
+                    diff * 100.0
+                ),
+            ));
+        }
+    }
+
+    // === 协同 ===
+    if let Some(ref es) = summary.evaluator_synergy_summary {
+        if es.synergy_score < t.synergy_low {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::Synergy,
+                "评估器协同评分偏低",
+                format!(
+                    "协同评分为 {:.1}%, 低于 {}% 阈值。评估器可能存在配置冲突, 建议检查各评估器参数。",
+                    es.synergy_score * 100.0,
+                    (t.synergy_low * 100.0) as u32,
+                ),
+            ));
+        }
+
+        if es.any_disabled {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::Synergy,
+                "有评估器禁用了功能",
+                "至少一个评估器自适应地禁用了某项功能。这是系统在低效数据下的自动调整, 无需干预。"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // === 增量发送 ===
+    if let Some(ref inc) = summary.incremental_summary {
+        let saved = inc.saved_ratio();
+        if saved < t.incremental_saved_low {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::Incremental,
+                "增量发送节省比例偏低",
+                format!(
+                    "节省比例为 {:.1}%, 低于 {}% 阈值。可能存在大量新内容, 增量发送效果有限。",
+                    saved * 100.0,
+                    (t.incremental_saved_low * 100.0) as u32,
+                ),
+            ));
+        } else if saved >= 0.5 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::Incremental,
+                "增量发送效果良好",
+                format!(
+                    "节省比例 {:.1}%, 大量消息被跳过, 增量发送有效。",
+                    saved * 100.0
+                ),
+            ));
+        }
+    }
+
+    // === 联合决策 ===
+    if let Some(ref jd) = summary.joint_decision_history_summary {
+        if jd.current_conservative_mode {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Warning,
+                AnalysisCategory::JointDecision,
+                "系统运行在保守模式",
+                "所有评估器已禁用自动增强功能。系统仅保留基础修复循环, 建议检查评估器配置或重置历史数据。".to_string(),
+            ));
+        } else if jd.escalation_rate > 0.5 {
+            recs.push(AnalysisRecommendation::new(
+                RecommendationSeverity::Info,
+                AnalysisCategory::JointDecision,
+                "多个评估器频繁升级警告",
+                format!(
+                    "升级率为 {:.1}%, 多个评估器经常一致判定功能有害。建议关注评估器的数据样本量。",
+                    jd.escalation_rate * 100.0,
+                ),
+            ));
+        }
+    }
+
+    // 按严重级别排序: Critical > Warning > Info
+    recs.sort_by(|a, b| {
+        let order = |sev: RecommendationSeverity| -> u8 {
+            match sev {
+                RecommendationSeverity::Critical => 0,
+                RecommendationSeverity::Warning => 1,
+                RecommendationSeverity::Info => 2,
+            }
+        };
+        order(a.severity).cmp(&order(b.severity))
+    });
+
+    recs
+}
+
+/// 使用自定义配置进行完整分析
+///
+/// 整合所有维度的洞察分析和建议生成, 使用配置中的权重和阈值。
+///
+/// # 参数
+///
+/// - `summary`: DevTraceSummary 引用
+/// - `config`: 分析配置
+///
+/// # 返回
+///
+/// 完整分析结果
+pub fn analyze_dev_trace_summary_with_config(
+    summary: &DevTraceSummary,
+    config: &AnalysisConfig,
+) -> DevTraceAnalysis {
+    let health_score = compute_health_score_with_config(summary, config);
+
+    let mut insights = vec![];
+    insights.extend(analyze_cache_effectiveness(summary));
+    insights.extend(analyze_search_quality(summary));
+    insights.extend(analyze_memory_evaluation(summary));
+    insights.extend(analyze_evaluator_synergy(summary));
+    insights.extend(analyze_incremental_sending(summary));
+
+    let recommendations = generate_recommendations_with_config(summary, config);
+
+    let summary_overview = SummaryOverview {
+        total_entries: summary.total_entries,
+        total_duration_ms: summary.total_duration_ms,
+        success_rate: summary.success_rate,
+    };
+
+    DevTraceAnalysis {
+        health_score,
+        insights,
+        recommendations,
+        summary_overview,
+    }
+}
+
+// ============================================================================
+//  纯函数 — HTML 分析报告
+// ============================================================================
+
+/// 生成 HTML 分析报告
+///
+/// 将 [`DevTraceAnalysis`] 转换为包含 Chart.js 交互式图表的自包含 HTML 页面,
+/// 包含健康度评分仪表盘、建议分布饼图、评分趋势折线图。
+///
+/// # 参数
+///
+/// - `analysis`: 完整分析结果
+///
+/// # 返回
+///
+/// 完整的 HTML 字符串
+///
+/// # 示例
+///
+/// ```
+/// # use forge::dev_trace::DevTraceSummary;
+/// # use forge::dev_trace_analyzer::{analyze_dev_trace_summary, generate_analysis_html_report};
+/// let summary = DevTraceSummary::empty();
+/// let analysis = analyze_dev_trace_summary(&summary);
+/// let html = generate_analysis_html_report(&analysis);
+/// assert!(html.contains("<!DOCTYPE html>"));
+/// assert!(html.contains("chart.js"));
+/// ```
+pub fn generate_analysis_html_report(analysis: &DevTraceAnalysis) -> String {
+    let mut html = String::with_capacity(16384);
+
+    let hs = &analysis.health_score;
+
+    // 统计建议数
+    let critical_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| r.is_critical())
+        .count();
+    let warning_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| r.is_warning())
+        .count();
+    let info_count = analysis
+        .recommendations
+        .iter()
+        .filter(|r| !r.is_critical() && !r.is_warning())
+        .count();
+
+    // HTML 头部
+    html.push_str("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n");
+    html.push_str("  <meta charset=\"UTF-8\">\n");
+    html.push_str("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+    html.push_str("  <title>Forge DevTrace 智能分析报告</title>\n");
+    html.push_str(&format!(
+        "  <script src=\"{}\"></script>\n",
+        crate::html_report::CHART_JS_CDN
+    ));
+    html.push_str("  <style>\n");
+    html.push_str(&generate_analysis_css());
+    html.push_str("  </style>\n");
+    html.push_str("</head>\n<body>\n");
+
+    // 标题
+    html.push_str("  <div class=\"container\">\n");
+    html.push_str("    <h1>Forge DevTrace 智能分析报告</h1>\n");
+    html.push_str(&format!(
+        "<p class=\"version\">格式版本: {}</p>\n",
+        ANALYSIS_HTML_REPORT_VERSION
+    ));
+
+    // === 概览卡片 ===
+    html.push_str("    <div class=\"cards-row\">\n");
+    html.push_str(&format!(
+        "      <div class=\"stat-card\">\n        <div class=\"stat-label\">健康度评分</div>\n        <div class=\"stat-value\" style=\"color: {}\">{} {:.1}/100</div>\n        <div class=\"stat-sub\">{}</div>\n      </div>\n",
+        hs_grade_color(hs.score),
+        hs.grade_icon(),
+        hs.score,
+        hs.grade(),
+    ));
+    html.push_str(&format!(
+        "      <div class=\"stat-card\">\n        <div class=\"stat-label\">总条目数</div>\n        <div class=\"stat-value\">{}</div>\n        <div class=\"stat-sub\">DevTrace 条目</div>\n      </div>\n",
+        analysis.summary_overview.total_entries,
+    ));
+    html.push_str(&format!(
+        "      <div class=\"stat-card\">\n        <div class=\"stat-label\">成功率</div>\n        <div class=\"stat-value\">{:.1}%</div>\n        <div class=\"stat-sub\">整体成功</div>\n      </div>\n",
+        analysis.summary_overview.success_rate * 100.0,
+    ));
+    html.push_str(&format!(
+        "      <div class=\"stat-card\">\n        <div class=\"stat-label\">总耗时</div>\n        <div class=\"stat-value\">{}</div>\n        <div class=\"stat-sub\">累计运行时间</div>\n      </div>\n",
+        format_duration_human(analysis.summary_overview.total_duration_ms),
+    ));
+    html.push_str("    </div>\n");
+
+    // === 健康度评分明细表 ===
+    html.push_str("    <h2>健康度评分明细</h2>\n");
+    html.push_str("    <table class=\"score-table\">\n");
+    html.push_str("      <thead><tr><th>维度</th><th>评分</th><th>权重</th></tr></thead>\n");
+    html.push_str("      <tbody>\n");
+    html.push_str(&format!(
+        "        <tr><td>成功率</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+        hs.success_rate_score,
+        WEIGHT_SUCCESS_RATE * 100.0,
+    ));
+    if let Some(cs) = hs.cache_score {
+        html.push_str(&format!(
+            "        <tr><td>缓存</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+            cs,
+            WEIGHT_CACHE * 100.0,
+        ));
+    }
+    if let Some(ss) = hs.search_score {
+        html.push_str(&format!(
+            "        <tr><td>搜索</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+            ss,
+            WEIGHT_SEARCH * 100.0,
+        ));
+    }
+    if let Some(ms) = hs.memory_score {
+        html.push_str(&format!(
+            "        <tr><td>Memory</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+            ms,
+            WEIGHT_MEMORY * 100.0,
+        ));
+    }
+    if let Some(sy) = hs.synergy_score {
+        html.push_str(&format!(
+            "        <tr><td>协同</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+            sy,
+            WEIGHT_SYNERGY * 100.0,
+        ));
+    }
+    if let Some(is) = hs.incremental_score {
+        html.push_str(&format!(
+            "        <tr><td>增量</td><td>{:.1}</td><td>{:.0}%</td></tr>\n",
+            is,
+            WEIGHT_INCREMENTAL * 100.0,
+        ));
+    }
+    html.push_str(&format!(
+        "        <tr class=\"total-row\"><td><strong>综合</strong></td><td><strong>{:.1}</strong></td><td>100%</td></tr>\n",
+        hs.score,
+    ));
+    html.push_str("      </tbody>\n    </table>\n");
+
+    // === 建议分布饼图 ===
+    if !analysis.recommendations.is_empty() {
+        html.push_str("    <div class=\"chart-container\">\n");
+        html.push_str("      <canvas id=\"recommendationChart\"></canvas>\n");
+        html.push_str("    </div>\n");
+        html.push_str("    <script>\n");
+        html.push_str("      new Chart(document.getElementById('recommendationChart'), {\n");
+        html.push_str("        type: 'doughnut',\n");
+        html.push_str("        data: {\n");
+        html.push_str("          labels: ['严重', '警告', '信息'],\n");
+        html.push_str(&format!(
+            "          datasets: [{{
+            data: [{}, {}, {}],
+            backgroundColor: ['rgba(255,99,132,0.8)', 'rgba(255,206,86,0.8)', 'rgba(54,162,235,0.8)'],
+            borderColor: ['rgba(255,99,132,1)', 'rgba(255,206,86,1)', 'rgba(54,162,235,1)'],
+            borderWidth: 1
+          }}]\n",
+            critical_count, warning_count, info_count,
+        ));
+        html.push_str("        },\n");
+        html.push_str("        options: {\n");
+        html.push_str("          responsive: true,\n");
+        html.push_str("          plugins: {\n");
+        html.push_str("            title: { display: true, text: '建议分布' },\n");
+        html.push_str("            legend: { position: 'right' }\n");
+        html.push_str("          }\n");
+        html.push_str("        }\n");
+        html.push_str("      });\n");
+        html.push_str("    </script>\n");
+    }
+
+    // === 洞察列表 ===
+    if !analysis.insights.is_empty() {
+        html.push_str("    <h2>洞察列表</h2>\n");
+        html.push_str("    <table class=\"insight-table\">\n");
+        html.push_str(
+            "      <thead><tr><th>维度</th><th>指标</th><th>值</th><th>解读</th></tr></thead>\n",
+        );
+        html.push_str("      <tbody>\n");
+        for insight in &analysis.insights {
+            html.push_str(&format!(
+                "        <tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>\n",
+                insight.category, insight.metric, insight.value, insight.interpretation,
+            ));
+        }
+        html.push_str("      </tbody>\n    </table>\n");
+    }
+
+    // === 建议列表 ===
+    if !analysis.recommendations.is_empty() {
+        html.push_str("    <h2>可操作建议</h2>\n");
+        for rec in &analysis.recommendations {
+            html.push_str(&format!(
+                "    <div class=\"recommendation {}\">\n      <span class=\"severity-badge {}\">{} {}</span>\n      <strong>[{}]</strong> {}\n      <p>{}</p>\n    </div>\n",
+                rec.severity.badge(),
+                rec.severity.badge(),
+                rec.severity.icon(),
+                rec.severity,
+                rec.category,
+                rec.title,
+                rec.message,
+            ));
+        }
+    }
+
+    html.push_str("  </div>\n");
+    html.push_str("</body>\n</html>\n");
+
+    html
+}
+
+/// 保存 HTML 分析报告到工作区
+///
+/// 将 HTML 报告写入 `{workspace}/.forge/devtrace_analysis.html`。
+///
+/// # 参数
+///
+/// - `report`: HTML 报告内容
+/// - `workspace`: 工作区路径
+///
+/// # 返回
+///
+/// 成功返回 `Ok(())`, 失败返回错误
+pub fn save_analysis_html_to_workspace(report: &str, workspace: &Path) -> Result<()> {
+    let path = workspace.join(".forge").join(ANALYSIS_HTML_REPORT_FILENAME);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, report)?;
+    Ok(())
+}
+
+/// 获取健康度评分对应的颜色 (CSS)
+fn hs_grade_color(score: f64) -> &'static str {
+    if score >= 80.0 {
+        "#28a745"
+    } else if score >= 60.0 {
+        "#ffc107"
+    } else if score >= 40.0 {
+        "#fd7e14"
+    } else {
+        "#dc3545"
+    }
+}
+
+/// 生成分析报告 CSS 样式
+fn generate_analysis_css() -> String {
+    String::from(
+        r#"      :root {
+        --bg: #f8f9fa;
+        --card-bg: #ffffff;
+        --text: #212529;
+        --border: #dee2e6;
+        --primary: #007bff;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        margin: 0;
+        padding: 20px;
+      }
+      .container {
+        max-width: 960px;
+        margin: 0 auto;
+      }
+      h1 {
+        color: var(--primary);
+        border-bottom: 3px solid var(--primary);
+        padding-bottom: 10px;
+      }
+      h2 {
+        margin-top: 30px;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 5px;
+      }
+      .version {
+        color: #6c757d;
+        font-size: 0.9em;
+      }
+      .cards-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 15px;
+        margin: 20px 0;
+      }
+      .stat-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 15px 20px;
+        min-width: 180px;
+        flex: 1;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      }
+      .stat-label {
+        font-size: 0.85em;
+        color: #6c757d;
+        margin-bottom: 5px;
+      }
+      .stat-value {
+        font-size: 1.5em;
+        font-weight: bold;
+      }
+      .stat-sub {
+        font-size: 0.8em;
+        color: #6c757d;
+        margin-top: 5px;
+      }
+      .score-table, .insight-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 15px 0;
+        background: var(--card-bg);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      }
+      .score-table th, .score-table td,
+      .insight-table th, .insight-table td {
+        padding: 10px 15px;
+        text-align: left;
+        border-bottom: 1px solid var(--border);
+      }
+      .score-table th, .insight-table th {
+        background: #f1f3f5;
+        font-weight: 600;
+      }
+      .total-row {
+        background: #e9ecef !important;
+      }
+      .chart-container {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+        margin: 20px 0;
+        max-width: 400px;
+      }
+      .recommendation {
+        background: var(--card-bg);
+        border-left: 4px solid var(--border);
+        border-radius: 4px;
+        padding: 12px 20px;
+        margin: 10px 0;
+      }
+      .recommendation.red {
+        border-left-color: #dc3545;
+      }
+      .recommendation.yellow {
+        border-left-color: #ffc107;
+      }
+      .recommendation.blue {
+        border-left-color: #007bff;
+      }
+      .severity-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.85em;
+        font-weight: 600;
+      }
+      .severity-badge.red {
+        background: #f8d7da;
+        color: #721c24;
+      }
+      .severity-badge.yellow {
+        background: #fff3cd;
+        color: #856404;
+      }
+      .severity-badge.blue {
+        background: #d1ecf1;
+        color: #0c5460;
+      }
+      @media print {
+        .chart-container, .recommendation {
+          break-inside: avoid;
+        }
+      }
+"#,
+    )
+}
+
+// ============================================================================
 //  单元测试
 // ============================================================================
 
@@ -2784,5 +4306,790 @@ mod tests {
             .recommendations
             .iter()
             .any(|r| r.category == AnalysisCategory::Synergy));
+    }
+
+    // ===== Session 100: HealthScoreHistory 测试 =====
+
+    #[test]
+    fn test_health_score_history_entry_new() {
+        let entry = HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        );
+        assert_eq!(entry.session_index, 1);
+        assert!((entry.score - 75.0).abs() < 0.001);
+        assert_eq!(entry.grade, "良好");
+        assert!((entry.success_rate - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_entry_serde() {
+        let entry = HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        );
+        let json = serde_json::to_string(&entry).unwrap();
+        let de: HealthScoreHistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry, de);
+    }
+
+    #[test]
+    fn test_health_score_history_entry_to_summary() {
+        let entry = HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        );
+        let s = entry.to_summary();
+        assert!(s.contains("Session 1"));
+        assert!(s.contains("75.0"));
+        assert!(s.contains("良好"));
+    }
+
+    #[test]
+    fn test_health_score_history_new() {
+        let h = HealthScoreHistory::new();
+        assert!(h.is_empty());
+        assert_eq!(h.session_count(), 0);
+        assert!((h.latest_score() - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_default() {
+        let h = HealthScoreHistory::default();
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn test_health_score_history_add_entry() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        assert_eq!(h.session_count(), 1);
+        assert!((h.latest_score() - 75.0).abs() < 0.001);
+        assert_eq!(h.next_session_index(), 2);
+    }
+
+    #[test]
+    fn test_health_score_history_add_multiple() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            60.0,
+            "良好".to_string(),
+            0.5,
+            1,
+            2,
+            3,
+            50,
+            1000,
+        ));
+        h.add_entry(HealthScoreHistoryEntry::new(
+            2,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        assert_eq!(h.session_count(), 2);
+        assert!((h.latest_score() - 75.0).abs() < 0.001);
+        assert!((h.avg_score() - 67.5).abs() < 0.001);
+        assert!((h.score_delta() - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_scores_list() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            60.0,
+            "良好".to_string(),
+            0.5,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ));
+        h.add_entry(HealthScoreHistoryEntry::new(
+            2,
+            Utc::now(),
+            80.0,
+            "优秀".to_string(),
+            0.9,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ));
+        let scores = h.scores();
+        assert_eq!(scores.len(), 2);
+        assert!((scores[0] - 60.0).abs() < 0.001);
+        assert!((scores[1] - 80.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_total_critical() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            60.0,
+            "良好".to_string(),
+            0.5,
+            2,
+            1,
+            0,
+            0,
+            0,
+        ));
+        h.add_entry(HealthScoreHistoryEntry::new(
+            2,
+            Utc::now(),
+            80.0,
+            "优秀".to_string(),
+            0.9,
+            1,
+            0,
+            2,
+            0,
+            0,
+        ));
+        assert_eq!(h.total_critical_across_sessions(), 3);
+        assert_eq!(h.total_warning_across_sessions(), 1);
+    }
+
+    #[test]
+    fn test_health_score_history_with_timestamp() {
+        let h = HealthScoreHistory::new().with_timestamp(Utc::now());
+        assert!(h.saved_at.is_some());
+    }
+
+    #[test]
+    fn test_health_score_history_to_summary() {
+        let mut h = HealthScoreHistory::new();
+        assert!(h.to_summary().contains("无记录"));
+
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        let s = h.to_summary();
+        assert!(s.contains("1"));
+        assert!(s.contains("75.0"));
+    }
+
+    #[test]
+    fn test_health_score_history_add_from_analysis() {
+        let summary = DevTraceSummary::empty();
+        let analysis = analyze_dev_trace_summary(&summary);
+        let mut h = HealthScoreHistory::new();
+        h.add_from_analysis(&analysis, Utc::now());
+        assert_eq!(h.session_count(), 1);
+        assert!(h.latest_score() >= 0.0);
+    }
+
+    #[test]
+    fn test_health_score_history_serde() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        let json = serde_json::to_string_pretty(&h).unwrap();
+        let de: HealthScoreHistory = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.session_count(), 1);
+        assert!((de.latest_score() - 75.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_load_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health_score_history.json");
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        h.save(&path).unwrap();
+        assert!(path.exists());
+        let loaded = HealthScoreHistory::load(&path).unwrap();
+        assert_eq!(loaded.session_count(), 1);
+        assert!((loaded.latest_score() - 75.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_health_score_history_load_nonexistent() {
+        let path = std::path::Path::new("/nonexistent/path.json");
+        let h = HealthScoreHistory::load(path).unwrap();
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn test_health_score_history_load_from_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        // 不存在时返回 None
+        assert!(HealthScoreHistory::load_from_workspace(dir.path()).is_none());
+
+        // 创建历史文件后应能加载
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            75.0,
+            "良好".to_string(),
+            0.8,
+            0,
+            2,
+            3,
+            100,
+            3600000,
+        ));
+        h.save_to_workspace(dir.path()).unwrap();
+        let loaded = HealthScoreHistory::load_from_workspace(dir.path());
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().session_count(), 1);
+    }
+
+    #[test]
+    fn test_health_score_history_max_sessions() {
+        let mut h = HealthScoreHistory::new();
+        for i in 0..(MAX_HEALTH_SCORE_HISTORY_SESSIONS + 10) {
+            h.add_entry(HealthScoreHistoryEntry::new(
+                i + 1,
+                Utc::now(),
+                (i as f64) % 100.0,
+                "测试".to_string(),
+                0.5,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ));
+        }
+        assert_eq!(h.session_count(), MAX_HEALTH_SCORE_HISTORY_SESSIONS);
+    }
+
+    // ===== HealthScoreHistorySummary 测试 =====
+
+    #[test]
+    fn test_health_score_history_summary_new() {
+        let s = HealthScoreHistorySummary::new(
+            3,
+            75.0,
+            70.0,
+            ScoreTrend::Improving,
+            15.0,
+            "良好".to_string(),
+            2,
+            5,
+            None,
+        );
+        assert_eq!(s.session_count, 3);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_health_score_history_summary_empty() {
+        let s = HealthScoreHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            String::new(),
+            0,
+            0,
+            None,
+        );
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_health_score_history_summary_serde() {
+        let s = HealthScoreHistorySummary::new(
+            3,
+            75.0,
+            70.0,
+            ScoreTrend::Stable,
+            5.0,
+            "良好".to_string(),
+            2,
+            5,
+            Some("2024-01-01T00:00:00Z".to_string()),
+        );
+        let json = serde_json::to_string(&s).unwrap();
+        let de: HealthScoreHistorySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, de);
+    }
+
+    #[test]
+    fn test_health_score_history_summary_to_summary() {
+        let s = HealthScoreHistorySummary::new(
+            0,
+            0.0,
+            0.0,
+            ScoreTrend::Insufficient,
+            0.0,
+            String::new(),
+            0,
+            0,
+            None,
+        );
+        assert!(s.to_summary().contains("无记录"));
+
+        let s2 = HealthScoreHistorySummary::new(
+            3,
+            75.0,
+            70.0,
+            ScoreTrend::Improving,
+            15.0,
+            "良好".to_string(),
+            2,
+            5,
+            None,
+        );
+        let summary = s2.to_summary();
+        assert!(summary.contains("3"));
+        assert!(summary.contains("75.0"));
+        assert!(summary.contains("良好"));
+    }
+
+    // ===== compute_health_score_trend 测试 =====
+
+    #[test]
+    fn test_compute_health_score_trend_empty() {
+        assert_eq!(compute_health_score_trend(&[]), ScoreTrend::Insufficient);
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_single() {
+        assert_eq!(
+            compute_health_score_trend(&[50.0]),
+            ScoreTrend::Insufficient
+        );
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_improving() {
+        assert_eq!(
+            compute_health_score_trend(&[50.0, 70.0]),
+            ScoreTrend::Improving
+        );
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_declining() {
+        assert_eq!(
+            compute_health_score_trend(&[70.0, 50.0]),
+            ScoreTrend::Declining
+        );
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_stable() {
+        assert_eq!(
+            compute_health_score_trend(&[50.0, 52.0]),
+            ScoreTrend::Stable
+        );
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_three_improving() {
+        assert_eq!(
+            compute_health_score_trend(&[50.0, 60.0, 70.0]),
+            ScoreTrend::Improving
+        );
+    }
+
+    #[test]
+    fn test_compute_health_score_trend_three_declining() {
+        assert_eq!(
+            compute_health_score_trend(&[70.0, 60.0, 50.0]),
+            ScoreTrend::Declining
+        );
+    }
+
+    // ===== build_health_score_history_entry 测试 =====
+
+    #[test]
+    fn test_build_health_score_history_entry() {
+        let summary = DevTraceSummary::empty();
+        let analysis = analyze_dev_trace_summary(&summary);
+        let entry = build_health_score_history_entry(&analysis, 1, Utc::now());
+        assert_eq!(entry.session_index, 1);
+        assert!(entry.score >= 0.0);
+        assert!(!entry.grade.is_empty());
+    }
+
+    #[test]
+    fn test_build_health_score_history_entry_with_data() {
+        let mut summary = DevTraceSummary::empty();
+        summary.success_rate = 0.8;
+        summary.total_entries = 100;
+        summary.total_duration_ms = 3600000;
+        let analysis = analyze_dev_trace_summary(&summary);
+        let entry = build_health_score_history_entry(&analysis, 5, Utc::now());
+        assert_eq!(entry.session_index, 5);
+        assert!((entry.success_rate - 0.8).abs() < 0.001);
+        assert_eq!(entry.total_entries, 100);
+        assert_eq!(entry.total_duration_ms, 3600000);
+    }
+
+    // ===== build_health_score_history_summary 测试 =====
+
+    #[test]
+    fn test_build_health_score_history_summary_empty() {
+        let h = HealthScoreHistory::new();
+        let s = build_health_score_history_summary(&h);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_build_health_score_history_summary_with_data() {
+        let mut h = HealthScoreHistory::new();
+        h.add_entry(HealthScoreHistoryEntry::new(
+            1,
+            Utc::now(),
+            60.0,
+            "良好".to_string(),
+            0.5,
+            1,
+            2,
+            3,
+            50,
+            1000,
+        ));
+        h.add_entry(HealthScoreHistoryEntry::new(
+            2,
+            Utc::now(),
+            80.0,
+            "优秀".to_string(),
+            0.9,
+            0,
+            1,
+            2,
+            100,
+            3600000,
+        ));
+        let s = build_health_score_history_summary(&h);
+        assert_eq!(s.session_count, 2);
+        assert!((s.latest_score - 80.0).abs() < 0.001);
+        assert!((s.avg_score - 70.0).abs() < 0.001);
+        assert_eq!(s.score_trend, ScoreTrend::Improving);
+        assert!((s.score_delta - 20.0).abs() < 0.001);
+        assert_eq!(s.latest_grade, "优秀");
+        assert_eq!(s.total_critical, 1);
+        assert_eq!(s.total_warnings, 3);
+    }
+
+    // ===== AnalysisConfig 测试 =====
+
+    #[test]
+    fn test_analysis_config_default() {
+        let c = AnalysisConfig::default();
+        assert!((c.weights.success_rate - WEIGHT_SUCCESS_RATE).abs() < 0.001);
+        assert!((c.thresholds.success_rate_low - THRESHOLD_SUCCESS_RATE_LOW).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_analysis_config_new() {
+        let c = AnalysisConfig::new();
+        assert!((c.weights.cache - WEIGHT_CACHE).abs() < 0.001);
+        assert!((c.thresholds.cache_hit_rate_low - THRESHOLD_CACHE_HIT_RATE_LOW).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_analysis_config_serde() {
+        let c = AnalysisConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let de: AnalysisConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, de);
+    }
+
+    #[test]
+    fn test_analysis_config_load_nonexistent() {
+        let path = std::path::Path::new("/nonexistent/config.json");
+        let c = AnalysisConfig::load(path).unwrap();
+        assert_eq!(c, AnalysisConfig::default());
+    }
+
+    #[test]
+    fn test_analysis_config_load_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis_config.json");
+        let c = AnalysisConfig::default();
+        c.save(&path).unwrap();
+        assert!(path.exists());
+        let loaded = AnalysisConfig::load(&path).unwrap();
+        assert_eq!(c, loaded);
+    }
+
+    #[test]
+    fn test_analysis_config_load_from_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        // 不存在时返回默认配置
+        let c = AnalysisConfig::load_from_workspace(dir.path());
+        assert_eq!(c, AnalysisConfig::default());
+
+        // 创建配置文件后应能加载
+        let custom = AnalysisConfig::default();
+        custom.save_to_workspace(dir.path()).unwrap();
+        let loaded = AnalysisConfig::load_from_workspace(dir.path());
+        assert_eq!(loaded, AnalysisConfig::default());
+    }
+
+    #[test]
+    fn test_analysis_weights_default() {
+        let w = AnalysisWeights::default();
+        assert!((w.success_rate - 0.30).abs() < 0.001);
+        assert!((w.cache - 0.15).abs() < 0.001);
+        assert!((w.search - 0.15).abs() < 0.001);
+        assert!((w.memory - 0.10).abs() < 0.001);
+        assert!((w.synergy - 0.15).abs() < 0.001);
+        assert!((w.incremental - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_analysis_thresholds_default() {
+        let t = AnalysisThresholds::default();
+        assert!((t.cache_hit_rate_low - 0.30).abs() < 0.001);
+        assert!((t.search_diff_harmful - (-0.10)).abs() < 0.001);
+        assert!((t.memory_diff_harmful - (-0.10)).abs() < 0.001);
+        assert!((t.synergy_low - 0.30).abs() < 0.001);
+        assert!((t.incremental_saved_low - 0.10).abs() < 0.001);
+        assert!((t.success_rate_low - 0.30).abs() < 0.001);
+        assert!((t.success_rate_medium - 0.50).abs() < 0.001);
+    }
+
+    // ===== compute_health_score_with_config 测试 =====
+
+    #[test]
+    fn test_compute_health_score_with_config_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let hs = compute_health_score_with_config(&summary, &config);
+        // 空摘要: 成功率=0
+        assert!(hs.score >= 0.0 && hs.score <= 100.0);
+        assert!(hs.cache_score.is_none());
+    }
+
+    #[test]
+    fn test_compute_health_score_with_config_custom_weights() {
+        let mut summary = DevTraceSummary::empty();
+        summary.success_rate = 0.8;
+        let mut config = AnalysisConfig::default();
+        config.weights.success_rate = 1.0; // 100% 成功率权重
+        config.weights.cache = 0.0;
+        config.weights.search = 0.0;
+        config.weights.memory = 0.0;
+        config.weights.synergy = 0.0;
+        config.weights.incremental = 0.0;
+        let hs = compute_health_score_with_config(&summary, &config);
+        // 成功率=0.8 → 80分, 权重=1.0 → 综合=80
+        assert!((hs.score - 80.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compute_health_score_with_config_equals_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let hs_with = compute_health_score_with_config(&summary, &config);
+        let hs_without = compute_health_score(&summary);
+        assert!((hs_with.score - hs_without.score).abs() < 0.001);
+    }
+
+    // ===== generate_recommendations_with_config 测试 =====
+
+    #[test]
+    fn test_generate_recommendations_with_config_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let recs = generate_recommendations_with_config(&summary, &config);
+        // 空摘要: 成功率=0 → Critical 建议
+        assert!(recs.iter().any(|r| r.is_critical()));
+    }
+
+    #[test]
+    fn test_generate_recommendations_with_config_equals_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let recs_with = generate_recommendations_with_config(&summary, &config);
+        let recs_without = generate_recommendations(&summary);
+        assert_eq!(recs_with.len(), recs_without.len());
+    }
+
+    #[test]
+    fn test_generate_recommendations_with_config_custom_threshold() {
+        let mut summary = DevTraceSummary::empty();
+        summary.success_rate = 0.45; // 低于默认 0.50 中等阈值
+        let config = AnalysisConfig::default();
+        let recs = generate_recommendations_with_config(&summary, &config);
+        assert!(recs.iter().any(|r| r.is_warning()));
+    }
+
+    // ===== analyze_dev_trace_summary_with_config 测试 =====
+
+    #[test]
+    fn test_analyze_dev_trace_summary_with_config_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let analysis = analyze_dev_trace_summary_with_config(&summary, &config);
+        assert!(analysis.health_score.score >= 0.0);
+        assert!(!analysis.recommendations.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_dev_trace_summary_with_config_equals_default() {
+        let summary = DevTraceSummary::empty();
+        let config = AnalysisConfig::default();
+        let a_with = analyze_dev_trace_summary_with_config(&summary, &config);
+        let a_without = analyze_dev_trace_summary(&summary);
+        assert!((a_with.health_score.score - a_without.health_score.score).abs() < 0.001);
+        assert_eq!(
+            a_with.recommendations.len(),
+            a_without.recommendations.len()
+        );
+    }
+
+    // ===== generate_analysis_html_report 测试 =====
+
+    #[test]
+    fn test_generate_analysis_html_report_basic() {
+        let summary = DevTraceSummary::empty();
+        let analysis = analyze_dev_trace_summary(&summary);
+        let html = generate_analysis_html_report(&analysis);
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("chart.js"));
+        assert!(html.contains("健康度评分"));
+    }
+
+    #[test]
+    fn test_generate_analysis_html_report_with_data() {
+        let mut summary = DevTraceSummary::empty();
+        summary.success_rate = 0.8;
+        summary.total_entries = 100;
+        summary.total_duration_ms = 3600000;
+        let analysis = analyze_dev_trace_summary(&summary);
+        let html = generate_analysis_html_report(&analysis);
+        assert!(html.contains("80.0"));
+        assert!(html.contains("100"));
+        assert!(html.contains("建议分布"));
+    }
+
+    #[test]
+    fn test_generate_analysis_html_report_contains_insights() {
+        let mut summary = DevTraceSummary::empty();
+        let mut cache = CacheStatsSummary::new();
+        cache.cache_hits = 5;
+        cache.cache_misses = 3;
+        cache.search_failures = 2;
+        cache.time_saved_ms = 1000;
+        summary.cache_summary = Some(cache);
+        let analysis = analyze_dev_trace_summary(&summary);
+        let html = generate_analysis_html_report(&analysis);
+        assert!(html.contains("洞察列表") || analysis.insights.is_empty());
+    }
+
+    #[test]
+    fn test_generate_analysis_html_report_contains_recommendations() {
+        let summary = DevTraceSummary::empty();
+        let analysis = analyze_dev_trace_summary(&summary);
+        let html = generate_analysis_html_report(&analysis);
+        assert!(html.contains("可操作建议"));
+    }
+
+    #[test]
+    fn test_save_analysis_html_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let html = "<!DOCTYPE html><html><body>test</body></html>";
+        save_analysis_html_to_workspace(html, dir.path()).unwrap();
+        let path = dir
+            .path()
+            .join(".forge")
+            .join(ANALYSIS_HTML_REPORT_FILENAME);
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, html);
+    }
+
+    // ===== hs_grade_color 测试 =====
+
+    #[test]
+    fn test_hs_grade_color() {
+        assert_eq!(hs_grade_color(85.0), "#28a745");
+        assert_eq!(hs_grade_color(80.0), "#28a745");
+        assert_eq!(hs_grade_color(65.0), "#ffc107");
+        assert_eq!(hs_grade_color(60.0), "#ffc107");
+        assert_eq!(hs_grade_color(45.0), "#fd7e14");
+        assert_eq!(hs_grade_color(40.0), "#fd7e14");
+        assert_eq!(hs_grade_color(25.0), "#dc3545");
+        assert_eq!(hs_grade_color(0.0), "#dc3545");
     }
 }

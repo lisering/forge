@@ -36,6 +36,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use crate::dev_trace_analyzer::HealthScoreHistorySummary;
 use crate::evaluator_synergy::{EvaluatorSynergyHistorySummary, EvaluatorSynergySummary};
 use crate::joint_decision::JointDecisionHistorySummary;
 use crate::trace_store::{StorageBackend, StorageConfig as TraceStorageConfig};
@@ -2768,6 +2769,14 @@ pub struct DevTraceSummary {
     /// `None` 表示没有历史数据 (首次运行或未启用联合决策引擎)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joint_decision_history_summary: Option<JointDecisionHistorySummary>,
+
+    /// 健康度评分历史摘要 (Session 100)
+    ///
+    /// 从 `HealthScoreHistory` (`.forge/health_score_history.json`) 提取的
+    /// 跨 session 评分趋势数据, 展示健康度评分的变化趋势。
+    /// `None` 表示没有历史数据 (首次运行或未启用 DevTrace 分析)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_score_history_summary: Option<HealthScoreHistorySummary>,
 }
 
 impl DevTraceSummary {
@@ -2797,6 +2806,7 @@ impl DevTraceSummary {
             search_diff_history: None,
             memory_diff_history: None,
             joint_decision_history_summary: None,
+            health_score_history_summary: None,
         }
     }
 
@@ -2898,6 +2908,7 @@ impl DevTraceSummary {
             search_diff_history: None,
             memory_diff_history: None,
             joint_decision_history_summary: None,
+            health_score_history_summary: None,
         }
     }
 
@@ -3036,6 +3047,19 @@ impl DevTraceSummary {
     /// - `summary`: 联合决策历史摘要
     pub fn with_joint_decision_history(mut self, summary: JointDecisionHistorySummary) -> Self {
         self.joint_decision_history_summary = Some(summary);
+        self
+    }
+
+    /// 附加健康度评分历史摘要 (Session 100)
+    ///
+    /// 从 `HealthScoreHistory` (`.forge/health_score_history.json`) 提取的
+    /// 跨 session 评分趋势数据, 由 Orchestrator 在 `final_report` 时调用。
+    ///
+    /// # 参数
+    ///
+    /// - `summary`: 健康度评分历史摘要
+    pub fn with_health_score_history(mut self, summary: HealthScoreHistorySummary) -> Self {
+        self.health_score_history_summary = Some(summary);
         self
     }
 
@@ -3633,6 +3657,29 @@ impl DevTraceSummary {
                     report.push_str("  当前模式: ✅ 正常模式\n");
                 }
                 if let Some(ref saved_at) = jd.saved_at {
+                    report.push_str(&format!("  保存时间: {}\n", saved_at));
+                }
+            }
+        }
+
+        // === 健康度评分历史 (Session 100) ===
+        if let Some(ref hsh) = self.health_score_history_summary {
+            if !hsh.is_empty() {
+                report.push_str("\n  ── 健康度评分历史 (跨 Session 趋势) ──\n");
+                report.push_str(&format!("  Session 数: {}\n", hsh.session_count));
+                report.push_str(&format!(
+                    "  最新评分: {:.1}/100 ({})\n",
+                    hsh.latest_score, hsh.latest_grade
+                ));
+                report.push_str(&format!("  平均评分: {:.1}/100\n", hsh.avg_score));
+                report.push_str(&format!(
+                    "  趋势: {} (Δ{:+.1})\n",
+                    hsh.score_trend.label(),
+                    hsh.score_delta
+                ));
+                report.push_str(&format!("  累计严重建议: {} 次\n", hsh.total_critical));
+                report.push_str(&format!("  累计警告建议: {} 次\n", hsh.total_warnings));
+                if let Some(ref saved_at) = hsh.saved_at {
                     report.push_str(&format!("  保存时间: {}\n", saved_at));
                 }
             }
