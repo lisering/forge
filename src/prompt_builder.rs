@@ -96,7 +96,10 @@ impl SystemPrompt {
             "❌ 禁止: 修改函数返回类型为 Result 后遗漏 use anyhow::Result; 导入 (Session 120)\n",
         );
         prompt.push_str(
-            "❌ 禁止: 修改函数签名为 Result<T, E> 后遗漏函数体 Ok(...) 包装 (Session 121)\n\n",
+            "❌ 禁止: 修改函数签名为 Result<T, E> 后遗漏函数体 Ok(...) 包装 (Session 121)\n",
+        );
+        prompt.push_str(
+            "❌ 禁止: 使用 bail!()/ensure!() 宏但未导入 use anyhow::{bail, ensure}; (Session 122)\n\n",
         );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");

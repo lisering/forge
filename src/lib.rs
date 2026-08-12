@@ -209,12 +209,14 @@ pub use evaluator_synergy::{
 pub use extract::{
     apply_fixes, apply_fixes_dry_run, apply_fixes_dry_run_except, apply_fixes_dry_run_filtered,
     apply_fixes_except, apply_fixes_filtered, apply_fixes_with_imports, apply_staged_fixes,
-    compute_line_diff, compute_line_diff_lcs, detect_missing_result_returns, ensure_anyhow_import,
-    ensure_anyhow_imports, extract_files, generate_fix, merge_anyhow_imports, run_clippy_check,
-    strip_string_content, validate_rust_braces, validate_rust_code_quality,
-    validate_rust_code_quality_detailed, verify_idempotent, verify_idempotent_detailed,
-    wrap_last_expression_in_ok, DefaultExtractor, FixPreview, IdempotencyResult, IssueType,
-    LineDiff, LineDiffType, QualityIssue,
+    apply_staged_fixes_preview, compute_line_diff, compute_line_diff_lcs, compute_line_diff_myers,
+    detect_missing_result_returns, ensure_anyhow_import, ensure_anyhow_imports,
+    ensure_anyhow_imports_extended, extract_files, format_diff_summary, generate_fix,
+    merge_anyhow_imports, run_clippy_check, strip_string_content, validate_rust_braces,
+    validate_rust_code_quality, validate_rust_code_quality_detailed, verify_idempotent,
+    verify_idempotent_detailed, wrap_last_expression_in_ok, wrap_return_statements_in_ok,
+    DefaultExtractor, FixPreview, IdempotencyResult, IssueType, LineDiff, LineDiffType,
+    QualityIssue, StagedFixPreview,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{

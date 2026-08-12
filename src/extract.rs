@@ -3264,6 +3264,609 @@ pub fn apply_staged_fixes(content: &str) -> String {
     apply_fixes(&after_stage2)
 }
 
+/// 包装 Result 函数中的 `return` 语句 (Session 122)
+///
+/// 与 `wrap_last_expression_in_ok` 互补:
+/// - `wrap_last_expression_in_ok`: 包装函数体最后的尾表达式
+/// - `wrap_return_statements_in_ok`: 包装函数体中的 `return value;` 语句
+///
+/// 检测返回 `Result<T, anyhow::Error>` 的函数中的 `return` 语句,
+/// 如果 return 的值不以 `Ok(` 或 `Err(` 开头, 包装为 `return Ok(value);`。
+///
+/// # 幂等性
+///
+/// 已包装的 `return Ok(...)` 或 `return Err(...)` 语句不会被重复处理。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::wrap_return_statements_in_ok;
+///
+/// // return 42 → return Ok(42)
+/// let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return 42;\n}";
+/// let result = wrap_return_statements_in_ok(code);
+/// assert!(result.contains("return Ok(42);"), "应包装 return 值");
+///
+/// // 已包装不修改 (幂等)
+/// let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return Ok(42);\n}";
+/// assert_eq!(wrap_return_statements_in_ok(code), code, "已包装不修改");
+/// ```
+pub fn wrap_return_statements_in_ok(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let stripped = strip_string_content(content);
+    let stripped_lines: Vec<&str> = stripped.lines().collect();
+
+    let mut i = 0;
+    while i < stripped_lines.len() {
+        let line = stripped_lines[i].trim();
+
+        // 检测函数签名: 包含 fn 和 -> Result< 和 anyhow::Error
+        if (line.contains("fn ") || line.contains("fn\t"))
+            && line.contains("-> Result<")
+            && line.contains("anyhow::Error")
+        {
+            // 找到函数体起始 {
+            if let Some(brace_pos) = stripped_lines[i].find('{') {
+                // 从 { 之后开始处理
+                let after_brace = &stripped_lines[i][brace_pos + 1..];
+                let mut brace_depth = 1i32;
+
+                // 处理同一行 { 之后的 } (单行函数)
+                for ch in after_brace.chars() {
+                    match ch {
+                        '{' => brace_depth += 1,
+                        '}' => brace_depth -= 1,
+                        _ => {}
+                    }
+                }
+
+                // 如果函数体未闭合, 继续到下一行
+                let mut j = i + 1;
+                while j < stripped_lines.len() && brace_depth > 0 {
+                    let cur = stripped_lines[j].trim();
+
+                    // 检测 return 语句
+                    if cur.starts_with("return ")
+                        && !cur.starts_with("return Ok(")
+                        && !cur.starts_with("return Err(")
+                    {
+                        let after_return = &cur["return ".len()..];
+                        let expr = after_return.trim_end_matches(';').trim();
+
+                        if !expr.is_empty() && !expr.starts_with("Ok(") && !expr.starts_with("Err(")
+                        {
+                            let orig_line = result_lines[j].clone();
+                            let indent_len = orig_line.len() - orig_line.trim_start().len();
+                            let indent = &orig_line[..indent_len];
+                            result_lines[j] = format!("{}return Ok({});", indent, expr);
+                        }
+                    }
+
+                    // 更新 brace 深度
+                    for ch in stripped_lines[j].chars() {
+                        match ch {
+                            '{' => brace_depth += 1,
+                            '}' => brace_depth -= 1,
+                            _ => {}
+                        }
+                    }
+
+                    j += 1;
+                }
+
+                // 跳到函数体结束之后
+                i = j;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    result_lines.join("\n")
+}
+
+/// 使用 Myers diff 算法计算行级别差异 (Session 122)
+///
+/// Myers 算法时间复杂度 O(ND), 其中 N 是行数, D 是差异行数。
+/// 当差异较少时 (D << N), 比 LCS 的 O(N×M) 更高效。
+///
+/// 与 `compute_line_diff_lcs` 的区别:
+/// - `compute_line_diff_lcs`: LCS 动态规划, O(N×M) 时间空间
+/// - `compute_line_diff_myers`: Myers O(ND), 稀疏差异时更高效
+/// - 两者产生相同格式的 `LineDiff` 结果
+///
+/// # 算法
+///
+/// 1. 构建编辑图, 寻找最短编辑路径 O(ND)
+/// 2. 沿对角线回溯, 识别公共行 (snake)
+/// 3. 非公共行标记为 Added 或 Removed
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_myers, LineDiffType};
+///
+/// // 无差异
+/// let diffs = compute_line_diff_myers("fn foo() {}", "fn foo() {}");
+/// assert!(diffs.is_empty());
+///
+/// // 插入一行
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diffs = compute_line_diff_myers(original, fixed);
+/// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Added), "应有 Added");
+/// assert!(!diffs.iter().any(|d| d.diff_type == LineDiffType::Modified), "不应有 Modified");
+/// ```
+pub fn compute_line_diff_myers(original: &str, fixed: &str) -> Vec<LineDiff> {
+    let a: Vec<&str> = original.lines().collect();
+    let b: Vec<&str> = fixed.lines().collect();
+    let n = a.len();
+    let m = b.len();
+
+    if n == 0 && m == 0 {
+        return Vec::new();
+    }
+    if n == 0 {
+        return b
+            .iter()
+            .enumerate()
+            .map(|(i, line)| LineDiff {
+                line_number: i + 1,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some(line.to_string()),
+            })
+            .collect();
+    }
+    if m == 0 {
+        return a
+            .iter()
+            .enumerate()
+            .map(|(i, line)| LineDiff {
+                line_number: i + 1,
+                diff_type: LineDiffType::Removed,
+                original_line: Some(line.to_string()),
+                fixed_line: None,
+            })
+            .collect();
+    }
+
+    // Myers O(ND) 算法
+    let max_d = n + m;
+    let offset = max_d;
+    let mut v = vec![0i32; 2 * max_d + 1];
+    let mut trace: Vec<Vec<i32>> = Vec::new();
+
+    for d in 0..=max_d {
+        trace.push(v.clone());
+
+        for k in (-(d as i32)..=d as i32).step_by(2) {
+            let idx = (k + offset as i32) as usize;
+
+            // 确定起始 x
+            let mut x: i32;
+            if k == -(d as i32) {
+                // k == -D: 来自 k+1 (插入/下移)
+                x = v[idx + 1];
+            } else if k == d as i32 {
+                // k == D: 来自 k-1 (删除/右移)
+                x = v[idx - 1] + 1;
+            } else if v[idx - 1] < v[idx + 1] {
+                x = v[idx + 1]; // 下移 (插入)
+            } else {
+                x = v[idx - 1] + 1; // 右移 (删除)
+            }
+
+            let mut y = x - k;
+
+            // 沿对角线 (snake) 匹配
+            while x < n as i32 && y < m as i32 && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+
+            v[idx] = x;
+
+            if x >= n as i32 && y >= m as i32 {
+                // 到达终点 — 回溯
+                return myers_backtrack(&trace, &a, &b, offset, d);
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Myers 算法回溯 — 从终点回溯到起点, 收集差异
+fn myers_backtrack(
+    trace: &[Vec<i32>],
+    a: &[&str],
+    b: &[&str],
+    offset: usize,
+    max_d: usize,
+) -> Vec<LineDiff> {
+    let n = a.len();
+    let m = b.len();
+    let mut diffs = Vec::new();
+
+    let mut cx = n as i32;
+    let mut cy = m as i32;
+
+    for dd in (1..=max_d).rev() {
+        if dd >= trace.len() {
+            break;
+        }
+        let prev_v = &trace[dd];
+        let ck = cx - cy;
+        // 确定前一个 k 值
+        let prev_k: i32;
+        if ck == -(dd as i32) {
+            prev_k = ck + 1; // 插入
+        } else if ck == dd as i32 {
+            prev_k = ck - 1; // 删除
+        } else {
+            let left_idx = (ck - 1 + offset as i32) as usize;
+            let right_idx = (ck + 1 + offset as i32) as usize;
+            if left_idx < prev_v.len() && right_idx < prev_v.len() {
+                if prev_v[left_idx] < prev_v[right_idx] {
+                    prev_k = ck + 1; // 插入
+                } else {
+                    prev_k = ck - 1; // 删除
+                }
+            } else if right_idx < prev_v.len() {
+                prev_k = ck + 1;
+            } else {
+                prev_k = ck - 1;
+            }
+        }
+
+        let prev_x = prev_v[(prev_k + offset as i32) as usize];
+        let prev_y = prev_x - prev_k;
+
+        // 沿 snake 回溯到编辑点
+        while cx > prev_x && cy > prev_y {
+            cx -= 1;
+            cy -= 1;
+        }
+
+        // 确定编辑类型
+        if prev_k == ck + 1 {
+            // 插入: prev (prev_x, prev_y) → (prev_x, prev_y+1)
+            // 插入的行是 b[prev_y] (0-indexed)
+            if prev_y >= 0 && (prev_y as usize) < m {
+                diffs.push(LineDiff {
+                    line_number: (prev_y + 1) as usize,
+                    diff_type: LineDiffType::Added,
+                    original_line: None,
+                    fixed_line: Some(b[prev_y as usize].to_string()),
+                });
+            }
+        } else if prev_k == ck - 1 {
+            // 删除: prev (prev_x, prev_y) → (prev_x+1, prev_y)
+            // 删除的行是 a[prev_x] (0-indexed)
+            if prev_x >= 0 && (prev_x as usize) < n {
+                diffs.push(LineDiff {
+                    line_number: (prev_x + 1) as usize,
+                    diff_type: LineDiffType::Removed,
+                    original_line: Some(a[prev_x as usize].to_string()),
+                    fixed_line: None,
+                });
+            }
+        }
+
+        cx = prev_x;
+        cy = prev_y;
+
+        if cx == 0 && cy == 0 {
+            break;
+        }
+    }
+
+    diffs.reverse();
+    diffs
+}
+
+/// 格式化行差异摘要 (Session 122)
+///
+/// 将 `Vec<LineDiff>` 格式化为人类可读的差异摘要字符串。
+///
+/// # 输出格式
+///
+/// ```text
+/// Diff Summary: 2 Added, 1 Removed, 0 Modified
+///   + Added   | line 3 | let x = 42;
+///   - Removed | line 2 | let y = 10;
+///   + Added   | line 5 | Ok(result)
+/// ```
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_myers, format_diff_summary};
+///
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diffs = compute_line_diff_myers(original, fixed);
+/// let summary = format_diff_summary(&diffs);
+/// assert!(summary.contains("Added"), "应包含 Added 计数");
+/// assert!(summary.contains("let x = 42"), "应包含差异行内容");
+/// ```
+pub fn format_diff_summary(diffs: &[LineDiff]) -> String {
+    if diffs.is_empty() {
+        return "No differences found.".to_string();
+    }
+
+    let added = diffs
+        .iter()
+        .filter(|d| d.diff_type == LineDiffType::Added)
+        .count();
+    let removed = diffs
+        .iter()
+        .filter(|d| d.diff_type == LineDiffType::Removed)
+        .count();
+    let modified = diffs
+        .iter()
+        .filter(|d| d.diff_type == LineDiffType::Modified)
+        .count();
+
+    let mut result = format!(
+        "Diff Summary: {} Added, {} Removed, {} Modified\n",
+        added, removed, modified
+    );
+
+    for d in diffs {
+        let (symbol, label) = match d.diff_type {
+            LineDiffType::Added => ("+", "Added"),
+            LineDiffType::Removed => ("-", "Removed"),
+            LineDiffType::Modified => ("~", "Modified"),
+        };
+        let content = d
+            .fixed_line
+            .as_ref()
+            .or(d.original_line.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        result.push_str(&format!(
+            "  {} {:7} | line {:<4} | {}\n",
+            symbol, label, d.line_number, content
+        ));
+    }
+
+    result
+}
+
+/// 分阶段修复预览 (Session 122)
+///
+/// 与 `apply_staged_fixes` 配合使用, 预览每个阶段的修复结果而不修改原始内容。
+///
+/// # 字段
+///
+/// - `original_content`: 原始代码
+/// - `stage1_result`: 高优先级修复后的代码
+/// - `stage2_result`: 中优先级修复后的代码
+/// - `stage3_result`: 低优先级修复后的代码
+/// - `stage1_changed`: 高优先级阶段是否有变化
+/// - `stage2_changed`: 中优先级阶段是否有变化
+/// - `stage3_changed`: 低优先级阶段是否有变化
+/// - `total_changed`: 是否有任何变化
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedFixPreview {
+    pub original_content: String,
+    pub stage1_result: String,
+    pub stage2_result: String,
+    pub stage3_result: String,
+    pub stage1_changed: bool,
+    pub stage2_changed: bool,
+    pub stage3_changed: bool,
+    pub total_changed: bool,
+}
+
+/// 分阶段修复预览 — 预览每个阶段的修复结果 (Session 122)
+///
+/// 与 `apply_staged_fixes` 使用相同的分阶段逻辑, 但返回每个阶段的中间结果。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_staged_fixes_preview;
+///
+/// let code = "pub fn foo() { let x = bar().unwrap(); }";
+/// let preview = apply_staged_fixes_preview(code);
+/// assert!(preview.total_changed, "应有变化");
+/// assert!(preview.stage1_changed, "高优先级阶段应修复 unwrap");
+/// ```
+pub fn apply_staged_fixes_preview(content: &str) -> StagedFixPreview {
+    // 阶段 1: 高优先级
+    let stage1_exclude = [
+        IssueType::UnsafeBlock,
+        IssueType::UnsafeFn,
+        IssueType::UnsafeImpl,
+        IssueType::UnwrapOr,
+        IssueType::UnwrapOrDefault,
+        IssueType::MissingMustUse,
+        IssueType::MissingDoc,
+    ];
+    let stage1_result = apply_fixes_except(content, &stage1_exclude);
+    let stage1_changed = stage1_result != content;
+
+    // 阶段 2: 中优先级
+    let stage2_exclude = [IssueType::MissingDoc];
+    let stage2_result = apply_fixes_except(&stage1_result, &stage2_exclude);
+    let stage2_changed = stage2_result != stage1_result;
+
+    // 阶段 3: 低优先级
+    let stage3_result = apply_fixes(&stage2_result);
+    let stage3_changed = stage3_result != stage2_result;
+
+    let total_changed = stage1_changed || stage2_changed || stage3_changed;
+
+    StagedFixPreview {
+        original_content: content.to_string(),
+        stage1_result,
+        stage2_result,
+        stage3_result,
+        stage1_changed,
+        stage2_changed,
+        stage3_changed,
+        total_changed,
+    }
+}
+
+/// 增强版 anyhow 导入检查 — 支持 bail!/ensure! 宏 (Session 122)
+///
+/// 在 `ensure_anyhow_imports` 基础上, 额外检测 `bail!()` 和 `ensure!()` 宏的使用,
+/// 并将它们添加到合并导入中。
+///
+/// # 规则
+///
+/// 1. 检测 `Result`/`Error`/`bail!`/`ensure!` 的使用需求
+/// 2. 检查已有导入
+/// 3. 构建合并导入: `use anyhow::{Result, Error, bail, ensure};`
+/// 4. 幂等: 已有合并导入不重复处理
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::ensure_anyhow_imports_extended;
+///
+/// // 使用 bail! 但没有导入
+/// let code = "fn foo() -> Result<(), anyhow::Error> { bail!(\"error\"); }";
+/// let result = ensure_anyhow_imports_extended(code);
+/// assert!(result.contains("bail"), "应包含 bail 导入");
+///
+/// // 幂等
+/// let second = ensure_anyhow_imports_extended(&result);
+/// assert_eq!(result, second, "二次调用不变化");
+/// ```
+pub fn ensure_anyhow_imports_extended(content: &str) -> String {
+    // 检测需要的导入
+    let needs_result = content.contains("anyhow::Result") || content.contains("Result<");
+    let needs_error = content.contains("anyhow::Error");
+    let needs_bail = content.contains("bail!(") || content.contains("anyhow::bail!(");
+    let needs_ensure = content.contains("ensure!(") || content.contains("anyhow::ensure!(");
+
+    if !needs_result && !needs_error && !needs_bail && !needs_ensure {
+        return content.to_string();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+
+    // 收集所有需要的导入项
+    let mut needed_items: Vec<&str> = Vec::new();
+    if needs_result {
+        needed_items.push("Result");
+    }
+    if needs_error {
+        needed_items.push("Error");
+    }
+    if needs_bail {
+        needed_items.push("bail");
+    }
+    if needs_ensure {
+        needed_items.push("ensure");
+    }
+
+    // 收集所有已有的导入项和行索引
+    let mut existing_items: Vec<&str> = Vec::new();
+    let mut anyhow_line_indices: Vec<usize> = Vec::new();
+    let mut has_wildcard = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "use anyhow::Result;" {
+            if !existing_items.contains(&"Result") {
+                existing_items.push("Result");
+            }
+            anyhow_line_indices.push(i);
+        } else if trimmed == "use anyhow::Error;" {
+            if !existing_items.contains(&"Error") {
+                existing_items.push("Error");
+            }
+            anyhow_line_indices.push(i);
+        } else if trimmed == "use anyhow::*;" {
+            has_wildcard = true;
+        } else if trimmed.starts_with("use anyhow::{") && trimmed.ends_with("};") {
+            let inner = trimmed
+                .trim_start_matches("use anyhow::{")
+                .trim_end_matches("};");
+            for item in inner.split(',').map(|s| s.trim()) {
+                if !existing_items.contains(&item) && !item.is_empty() {
+                    existing_items.push(item);
+                }
+            }
+            anyhow_line_indices.push(i);
+        }
+    }
+
+    // 通配导入已覆盖所有
+    if has_wildcard {
+        return content.to_string();
+    }
+
+    // 合并已有和需要的导入项
+    let mut all_items = existing_items.clone();
+    for item in &needed_items {
+        if !all_items.contains(item) {
+            all_items.push(item);
+        }
+    }
+
+    // 排序: Result, Error, bail, ensure, 其他
+    all_items.sort_by_key(|item| match *item {
+        "Result" => 0,
+        "Error" => 1,
+        "bail" => 2,
+        "ensure" => 3,
+        _ => 4,
+    });
+
+    if anyhow_line_indices.is_empty() {
+        // 需要新增导入行
+        let import_line = format!("use anyhow::{{{}}};", all_items.join(", "));
+
+        let mut insert_pos = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("*")
+                || trimmed.starts_with("#![")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("///")
+            {
+                continue;
+            }
+            insert_pos = i;
+            break;
+        }
+
+        if insert_pos == 0 && !lines.is_empty() {
+            let all_comments = lines
+                .iter()
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+            if all_comments {
+                insert_pos = lines.len();
+            }
+        }
+
+        result_lines.insert(insert_pos, import_line);
+    } else {
+        // 保留第一个位置, 删除其余
+        let keep_idx = anyhow_line_indices[0];
+        result_lines[keep_idx] = format!("use anyhow::{{{}}};", all_items.join(", "));
+        // 从后向前删除其他行
+        for &idx in anyhow_line_indices[1..].iter().rev() {
+            result_lines.remove(idx);
+        }
+    }
+
+    result_lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6993,5 +7596,448 @@ fn foo(
         let result = apply_fixes_with_imports(code);
         let import_count = result.matches("use anyhow::").count();
         assert_eq!(import_count, 1, "应只有一个 anyhow 导入行: {}", result);
+    }
+
+    // ===== Session 122: wrap_return_statements_in_ok 测试 =====
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_basic() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return 42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(42);"),
+            "应包装 return 值: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_already_ok() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return Ok(42);\n}";
+        assert_eq!(wrap_return_statements_in_ok(code), code, "已包装不修改");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_already_err() {
+        let code =
+            "fn foo() -> Result<i32, anyhow::Error> {\n    return Err(anyhow::Error::msg(\"e\"));\n}";
+        assert_eq!(
+            wrap_return_statements_in_ok(code),
+            code,
+            "return Err 不修改"
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return 42;\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "二次调用不变化");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_non_result_fn() {
+        let code = "fn foo() -> i32 {\n    return 42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert_eq!(result, code, "非 Result 函数不修改");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiple_returns() {
+        let code = "fn foo(x: bool) -> Result<i32, anyhow::Error> {\n    if x {\n        return 1;\n    }\n    return 2;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(result.contains("return Ok(1);"), "应包装第一个 return");
+        assert!(result.contains("return Ok(2);"), "应包装第二个 return");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_no_return() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    Ok(42)\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert_eq!(result, code, "无 return 语句不修改");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_return_with_expression() {
+        let code = "fn foo(a: i32, b: i32) -> Result<i32, anyhow::Error> {\n    return a + b;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(a + b);"),
+            "应包装表达式: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_mixed_ok_and_plain() {
+        let code = "fn foo(x: bool) -> Result<i32, anyhow::Error> {\n    if x {\n        return Ok(1);\n    }\n    return 2;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(result.contains("return Ok(1);"), "已包装的 Ok 不变");
+        assert!(
+            result.contains("return Ok(2);"),
+            "未包装的应包装: {}",
+            result
+        );
+    }
+
+    // ===== Session 122: compute_line_diff_myers 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_myers_no_diff() {
+        let diffs = compute_line_diff_myers("fn foo() {}", "fn foo() {}");
+        assert!(diffs.is_empty(), "无差异应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_insertion() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diffs = compute_line_diff_myers(original, fixed);
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(added, 1, "应有 1 个 Added");
+        assert!(
+            !diffs.iter().any(|d| d.diff_type == LineDiffType::Removed),
+            "不应有 Removed"
+        );
+        let removed = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        assert_eq!(removed, 0, "不应有 Removed");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_deletion() {
+        let original = "fn foo() {\n    let x = 42;\n}\n";
+        let fixed = "fn foo() {\n}\n";
+        let diffs = compute_line_diff_myers(original, fixed);
+        let removed = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        assert_eq!(removed, 1, "应有 1 个 Removed");
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(added, 0, "不应有 Added");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_empty_original() {
+        let fixed = "a\nb\nc";
+        let diffs = compute_line_diff_myers("", fixed);
+        assert_eq!(diffs.len(), 3, "空 original 应全部 Added");
+        assert!(diffs.iter().all(|d| d.diff_type == LineDiffType::Added));
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_empty_fixed() {
+        let original = "a\nb\nc";
+        let diffs = compute_line_diff_myers(original, "");
+        assert_eq!(diffs.len(), 3, "空 fixed 应全部 Removed");
+        assert!(diffs.iter().all(|d| d.diff_type == LineDiffType::Removed));
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_both_empty() {
+        let diffs = compute_line_diff_myers("", "");
+        assert!(diffs.is_empty(), "双空应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_multiple_changes() {
+        let original = "a\nb\nc\nd\ne";
+        let fixed = "a\nx\nc\ny\ne";
+        let diffs = compute_line_diff_myers(original, fixed);
+        assert!(!diffs.is_empty(), "应有差异");
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        let removed = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        assert!(added + removed > 0, "应有 Added 或 Removed");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_vs_lcs_same_result() {
+        let original = "fn foo() {\n}\nfn bar() {}";
+        let fixed = "fn foo() {\n    let x = 42;\n}\nfn bar() {}";
+
+        let lcs_diffs = compute_line_diff_lcs(original, fixed);
+        let myers_diffs = compute_line_diff_myers(original, fixed);
+
+        let lcs_added = lcs_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        let myers_added = myers_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(lcs_added, myers_added, "LCS 和 Myers 应有相同 Added 计数");
+    }
+
+    #[test]
+    fn test_compute_line_diff_myers_no_modified() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diffs = compute_line_diff_myers(original, fixed);
+        let modified = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Modified)
+            .count();
+        assert_eq!(modified, 0, "Myers 不应产生 Modified");
+    }
+
+    // ===== Session 122: format_diff_summary 测试 =====
+
+    #[test]
+    fn test_format_diff_summary_empty() {
+        let summary = format_diff_summary(&[]);
+        assert!(
+            summary.contains("No differences"),
+            "空差异应提示无差异: {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_format_diff_summary_with_additions() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diffs = compute_line_diff_myers(original, fixed);
+        let summary = format_diff_summary(&diffs);
+        assert!(summary.contains("Added"), "应包含 Added 计数: {}", summary);
+        assert!(
+            summary.contains("let x = 42"),
+            "应包含差异行内容: {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_format_diff_summary_counts() {
+        let diffs = vec![
+            LineDiff {
+                line_number: 1,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some("new line".to_string()),
+            },
+            LineDiff {
+                line_number: 2,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some("another".to_string()),
+            },
+            LineDiff {
+                line_number: 3,
+                diff_type: LineDiffType::Removed,
+                original_line: Some("old line".to_string()),
+                fixed_line: None,
+            },
+        ];
+        let summary = format_diff_summary(&diffs);
+        assert!(summary.contains("2 Added"), "应显示 2 Added: {}", summary);
+        assert!(
+            summary.contains("1 Removed"),
+            "应显示 1 Removed: {}",
+            summary
+        );
+        assert!(
+            summary.contains("0 Modified"),
+            "应显示 0 Modified: {}",
+            summary
+        );
+    }
+
+    #[test]
+    fn test_format_diff_summary_symbols() {
+        let diffs = vec![
+            LineDiff {
+                line_number: 1,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some("add".to_string()),
+            },
+            LineDiff {
+                line_number: 2,
+                diff_type: LineDiffType::Removed,
+                original_line: Some("remove".to_string()),
+                fixed_line: None,
+            },
+            LineDiff {
+                line_number: 3,
+                diff_type: LineDiffType::Modified,
+                original_line: Some("old".to_string()),
+                fixed_line: Some("new".to_string()),
+            },
+        ];
+        let summary = format_diff_summary(&diffs);
+        assert!(summary.contains("+"), "应有 + 符号");
+        assert!(summary.contains("-"), "应有 - 符号");
+        assert!(summary.contains("~"), "应有 ~ 符号");
+    }
+
+    // ===== Session 122: apply_staged_fixes_preview 测试 =====
+
+    #[test]
+    fn test_apply_staged_fixes_preview_basic() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_staged_fixes_preview(code);
+        assert!(preview.total_changed, "应有变化");
+        assert!(preview.stage1_changed, "高优先级阶段应修复 unwrap");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let preview = apply_staged_fixes_preview(code);
+        assert!(!preview.total_changed, "无问题不应有变化");
+        assert!(!preview.stage1_changed, "阶段 1 不应有变化");
+        assert!(!preview.stage2_changed, "阶段 2 不应有变化");
+        assert!(!preview.stage3_changed, "阶段 3 不应有变化");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_stage1_only() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_staged_fixes_preview(code);
+        assert!(preview.stage1_changed, "阶段 1 应修复 unwrap");
+        assert!(
+            !preview.stage1_result.contains(".unwrap()"),
+            "阶段 1 结果不应有 unwrap"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_stage2_must_use() {
+        let code = "pub fn foo() -> bool { true }";
+        let preview = apply_staged_fixes_preview(code);
+        assert!(preview.stage2_changed, "阶段 2 应添加 #[must_use]");
+        assert!(
+            preview.stage2_result.contains("#[must_use]"),
+            "阶段 2 结果应有 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_stage3_doc() {
+        let code = "pub fn foo() -> bool { true }";
+        let preview = apply_staged_fixes_preview(code);
+        assert!(preview.total_changed, "应有变化");
+        assert!(
+            preview.stage3_result.contains("///") || preview.stage3_result.contains("TODO"),
+            "阶段 3 应有文档注释或 TODO"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_final_matches_apply_staged() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_staged_fixes_preview(code);
+        let direct = apply_staged_fixes(code);
+        assert_eq!(
+            preview.stage3_result, direct,
+            "预览最终结果应与直接调用一致"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_preview_serde() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_staged_fixes_preview(code);
+        let json = serde_json::to_string(&preview).expect("序列化失败");
+        let deserialized: StagedFixPreview = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(preview.total_changed, deserialized.total_changed);
+        assert_eq!(preview.stage1_changed, deserialized.stage1_changed);
+    }
+
+    // ===== Session 122: ensure_anyhow_imports_extended 测试 =====
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_bail() {
+        let code = "fn foo() -> Result<(), anyhow::Error> { bail!(\"error\"); }";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(result.contains("bail"), "应包含 bail 导入: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_ensure() {
+        let code = "fn foo(x: bool) -> Result<(), anyhow::Error> { ensure!(x, \"err\"); }";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(result.contains("ensure"), "应包含 ensure 导入: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_bail_and_ensure() {
+        let code = "fn foo(x: bool) -> Result<(), anyhow::Error> {\n    ensure!(x, \"err\");\n    bail!(\"err2\");\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(result.contains("bail"), "应包含 bail");
+        assert!(result.contains("ensure"), "应包含 ensure");
+        assert!(
+            result.contains("use anyhow::{"),
+            "应使用合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_no_macros() {
+        let code = "fn foo() -> Result<(), anyhow::Error> { Ok(()) }";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(!result.contains("bail"), "不需要 bail 不应添加");
+        assert!(!result.contains("ensure"), "不需要 ensure 不应添加");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_idempotent() {
+        let code = "fn foo() -> Result<(), anyhow::Error> { bail!(\"error\"); }";
+        let first = ensure_anyhow_imports_extended(code);
+        let second = ensure_anyhow_imports_extended(&first);
+        assert_eq!(first, second, "二次调用不变化");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_already_has_bail() {
+        let code =
+            "use anyhow::{Result, bail};\nfn foo() -> Result<(), anyhow::Error> { bail!(\"e\"); }";
+        let result = ensure_anyhow_imports_extended(code);
+        let import_count = result.matches("use anyhow::").count();
+        assert_eq!(import_count, 1, "应只有一个 anyhow 导入行: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_adds_to_merged() {
+        let code =
+            "use anyhow::{Result, Error};\nfn foo() -> Result<(), anyhow::Error> { bail!(\"e\"); }";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(
+            result.contains("bail"),
+            "应添加 bail 到合并导入: {}",
+            result
+        );
+        let import_count = result.matches("use anyhow::").count();
+        assert_eq!(import_count, 1, "应只有一个导入行");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_sorted() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    bail!(\"e\");\n    ensure!(true, \"e2\");\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        if let Some(pos) = result.find("use anyhow::{") {
+            let import_line = &result[pos..result[pos..].find("};").unwrap_or(pos) + 2];
+            assert!(import_line.contains("Result"), "应有 Result");
+            assert!(import_line.contains("bail"), "应有 bail");
+            assert!(import_line.contains("ensure"), "应有 ensure");
+        }
     }
 }
