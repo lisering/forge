@@ -1,9 +1,44 @@
 //! 从 AI 回复中提取代码文件
+//!
+//! 性能优化: 使用 `OnceLock` 预编译正则表达式, 避免每次调用重新编译。
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
+
+/// 预编译正则: 规范化 file: 标记 (file:path 后跟多个空格 → 插入换行)
+///
+/// 使用 `OnceLock` 只编译一次, 后续调用直接复用。
+fn normalize_file_markers_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)^(file:\S+)\s{2,}").expect("预编译 normalize_file_markers 正则失败")
+    })
+}
+
+/// 预编译正则: 模式1 — ```file:path\n...``` 或 ```lang:path\n...```
+fn tagged_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?s)```(?:file|rust|python|toml|yaml|json|markdown|md|shell|bash|sh|javascript|js|typescript|ts|html|css):([^\n]+?)\n(.*?)```"
+        ).expect("预编译 tagged 正则失败")
+    })
+}
+
+/// 预编译正则: 模式2 — 普通 ```lang\n...``` 代码块 (无路径)
+fn plain_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)```(\w+)\n(.*?)```").expect("预编译 plain 正则失败"))
+}
+
+/// 预编译正则: 模式3 — file:path 行标记 (无代码块)
+fn file_marker_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?m)^file:(.+)$").expect("预编译 file_marker 正则失败"))
+}
 
 /// 一个提取出的文件
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +102,7 @@ fn clean_ui_text(text: &str) -> String {
 /// (如 "file:Cargo.toml     [package]..." → "file:Cargo.toml\n[package]...")
 /// 此函数检测 file:path 后跟多个空格的情况, 插入换行符分隔路径和内容
 fn normalize_file_markers(text: &str) -> String {
-    let re = Regex::new(r"(?m)^(file:\S+)\s{2,}").unwrap();
+    let re = normalize_file_markers_regex();
     re.replace_all(text, "$1\n").to_string()
 }
 
@@ -149,9 +184,7 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
     let mut files = Vec::new();
 
     // 模式1: ```file:path\n...``` 或 ```lang:path\n...```
-    let re_tagged = Regex::new(
-        r"(?s)```(?:file|rust|python|toml|yaml|json|markdown|md|shell|bash|sh|javascript|js|typescript|ts|html|css):([^\n]+?)\n(.*?)```"
-    ).unwrap();
+    let re_tagged = tagged_regex();
 
     for cap in re_tagged.captures_iter(text) {
         let path = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
@@ -169,7 +202,7 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
 
     // 模式2: 普通 ```lang\n...``` 代码块 (无路径)
     if files.is_empty() {
-        let re_plain = Regex::new(r"(?s)```(\w+)\n(.*?)```").unwrap();
+        let re_plain = plain_regex();
         for cap in re_plain.captures_iter(text) {
             let lang = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let content = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -187,7 +220,7 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
 
     // 模式3: 无反引号 — "file:path\n...代码..." (AI 没用代码块格式时)
     if files.is_empty() {
-        let re_file_marker = Regex::new(r"(?m)^file:(.+)$").unwrap();
+        let re_file_marker = file_marker_regex();
         let markers: Vec<(usize, String)> = re_file_marker
             .captures_iter(text)
             .map(|cap| {

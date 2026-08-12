@@ -273,7 +273,7 @@ impl ForgeError {
             | ForgeError::NoChatTab => ErrorCategory::Browser,
 
             ForgeError::ChatTimeout(..)
-            | ForgeError::ChatEmptyResponse(..)
+            | ForgeError::ChatEmptyResponse
             | ForgeError::ChatSiteUnavailable(..)
             | ForgeError::SendMessageFailed(..) => ErrorCategory::Chat,
 
@@ -285,20 +285,19 @@ impl ForgeError {
             | ForgeError::FileWriteFailed(..)
             | ForgeError::ExtractFailed(..) => ErrorCategory::File,
 
-            ForgeError::InvalidProxyUrl(..)
-            | ForgeError::ProxyConnectionFailed(..) => ErrorCategory::Proxy,
+            ForgeError::InvalidProxyUrl(..) | ForgeError::ProxyConnectionFailed(..) => {
+                ErrorCategory::Proxy
+            }
 
-            ForgeError::ConfigError(..)
-            | ForgeError::InvalidEnvVar(..) => ErrorCategory::Config,
+            ForgeError::ConfigError(..) | ForgeError::InvalidEnvVar(..) => ErrorCategory::Config,
 
-            ForgeError::HttpError(..)
-            | ForgeError::UrlParseError(..) => ErrorCategory::Network,
+            ForgeError::HttpError(..) | ForgeError::UrlParseError(..) => ErrorCategory::Network,
 
-            ForgeError::RecoveryFailed(..)
-            | ForgeError::RecoveryExhausted(..) => ErrorCategory::Recovery,
+            ForgeError::RecoveryFailed(..) | ForgeError::RecoveryExhausted(..) => {
+                ErrorCategory::Recovery
+            }
 
-            ForgeError::Internal(..)
-            | ForgeError::Unknown(..) => ErrorCategory::Internal,
+            ForgeError::Internal(..) | ForgeError::Unknown(..) => ErrorCategory::Internal,
         }
     }
 }
@@ -379,6 +378,12 @@ pub fn classify_anyhow(err: &anyhow::Error) -> ForgeError {
         ForgeError::TabClosed(msg)
     } else if msg.contains("编译") || msg.contains("compile") {
         ForgeError::CompileFailed(msg)
+    } else if msg.contains("文件") || msg.contains("file") {
+        if msg.contains("不存在") || msg.contains("not found") {
+            ForgeError::FileNotFound(msg)
+        } else {
+            ForgeError::FileWriteFailed(msg)
+        }
     } else if msg.contains("测试") || msg.contains("test") {
         ForgeError::TestFailed(msg)
     } else if msg.contains("代理") || msg.contains("proxy") {
@@ -386,12 +391,6 @@ pub fn classify_anyhow(err: &anyhow::Error) -> ForgeError {
             ForgeError::InvalidProxyUrl(msg)
         } else {
             ForgeError::ProxyConnectionFailed(msg)
-        }
-    } else if msg.contains("文件") || msg.contains("file") {
-        if msg.contains("不存在") || msg.contains("not found") {
-            ForgeError::FileNotFound(msg)
-        } else {
-            ForgeError::FileWriteFailed(msg)
         }
     } else if msg.contains("配置") || msg.contains("config") {
         ForgeError::ConfigError(msg)
@@ -532,26 +531,47 @@ mod tests {
 
     #[test]
     fn test_category_cdp() {
-        assert_eq!(ForgeError::CdpTimeout("".to_string(), 0).category(), ErrorCategory::Cdp);
-        assert_eq!(ForgeError::CdpWebSocketClosed.category(), ErrorCategory::Cdp);
+        assert_eq!(
+            ForgeError::CdpTimeout("".to_string(), 0).category(),
+            ErrorCategory::Cdp
+        );
+        assert_eq!(
+            ForgeError::CdpWebSocketClosed.category(),
+            ErrorCategory::Cdp
+        );
     }
 
     #[test]
     fn test_category_browser() {
-        assert_eq!(ForgeError::BrowserUnreachable("".to_string()).category(), ErrorCategory::Browser);
-        assert_eq!(ForgeError::TabClosed("".to_string()).category(), ErrorCategory::Browser);
+        assert_eq!(
+            ForgeError::BrowserUnreachable("".to_string()).category(),
+            ErrorCategory::Browser
+        );
+        assert_eq!(
+            ForgeError::TabClosed("".to_string()).category(),
+            ErrorCategory::Browser
+        );
     }
 
     #[test]
     fn test_category_chat() {
         assert_eq!(ForgeError::ChatTimeout(0).category(), ErrorCategory::Chat);
-        assert_eq!(ForgeError::ChatEmptyResponse.category(), ErrorCategory::Chat);
+        assert_eq!(
+            ForgeError::ChatEmptyResponse.category(),
+            ErrorCategory::Chat
+        );
     }
 
     #[test]
     fn test_category_build() {
-        assert_eq!(ForgeError::CompileFailed("".to_string()).category(), ErrorCategory::Build);
-        assert_eq!(ForgeError::TestFailed("".to_string()).category(), ErrorCategory::Build);
+        assert_eq!(
+            ForgeError::CompileFailed("".to_string()).category(),
+            ErrorCategory::Build
+        );
+        assert_eq!(
+            ForgeError::TestFailed("".to_string()).category(),
+            ErrorCategory::Build
+        );
     }
 
     #[test]

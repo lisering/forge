@@ -73,6 +73,7 @@ pub mod context_handoff;
 pub mod deadline;
 pub mod dev_trace;
 pub mod dev_trace_analyzer;
+pub mod error_code;
 pub mod error_diagnosis;
 pub mod error_search;
 pub mod evaluator_synergy;
