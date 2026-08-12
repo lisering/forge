@@ -307,6 +307,15 @@ enum Commands {
         #[arg(long)]
         clippy_check: bool,
 
+        /// 启用修复预览 — 显示分阶段修复预览但不实际修改 (Session 123)
+        ///
+        /// 启用后, 在分阶段修复时显示每个阶段的预览信息,
+        /// 包括变化行数和 diff 摘要, 但不实际修改文件内容。
+        /// 需要同时启用 --auto-fix --staged-fix。
+        /// 默认禁用。
+        #[arg(long)]
+        preview: bool,
+
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
         /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
@@ -873,6 +882,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             web_tool: enable_web_tool,
             auto_fix,
             clippy_check,
+            preview: fix_preview,
             profile: _,
             profile_output: _,
         } => {
@@ -1067,6 +1077,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         web_tool,
                         auto_fix,
                         clippy_check,
+                        fix_preview,
                     )
                     .await?;
 
@@ -1101,6 +1112,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         web_tool,
                         auto_fix,
                         clippy_check,
+                        fix_preview,
                     )
                     .await?;
 
@@ -1153,6 +1165,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         web_tool,
                         auto_fix,
                         clippy_check,
+                        fix_preview,
                     )
                     .await?;
                 } else {
@@ -1184,6 +1197,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         web_tool,
                         auto_fix,
                         clippy_check,
+                        fix_preview,
                     )
                     .await?;
                 }
@@ -1302,6 +1316,7 @@ async fn run_with_clarifier<C, Q>(
     web_tool: Option<Box<dyn WebTool>>,
     auto_fix: bool,
     clippy_check: bool,
+    fix_preview: bool,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1337,6 +1352,11 @@ where
     // Session 120: clippy 检查
     if clippy_check {
         orch = orch.with_clippy_check(true);
+    }
+
+    // Session 123: 修复预览
+    if fix_preview {
+        orch = orch.with_fix_preview(true);
     }
 
     // Session 113: Web 工具集成

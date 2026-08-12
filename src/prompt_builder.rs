@@ -99,7 +99,13 @@ impl SystemPrompt {
             "❌ 禁止: 修改函数签名为 Result<T, E> 后遗漏函数体 Ok(...) 包装 (Session 121)\n",
         );
         prompt.push_str(
-            "❌ 禁止: 使用 bail!()/ensure!() 宏但未导入 use anyhow::{bail, ensure}; (Session 122)\n\n",
+            "❌ 禁止: 使用 bail!()/ensure!() 宏但未导入 use anyhow::{bail, ensure}; (Session 122)\n",
+        );
+        prompt.push_str(
+            "❌ 禁止: 使用 anyhow!() 宏或 .context() 但未导入 use anyhow::{anyhow, Context}; (Session 123)\n",
+        );
+        prompt.push_str(
+            "❌ 禁止: 使用 quote! 宏时括号不配对 — #(#field),* 等重复语法需确保 () {} [] 配对 (Session 123)\n\n",
         );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -397,6 +403,30 @@ mod tests {
         assert!(
             prompt.contains("Ok(...)"),
             "系统 prompt 应包含 Ok(...) 包装约束 (Session 121)"
+        );
+    }
+
+    // ===== Session 123: anyhow!/Context + quote! 宏约束测试 =====
+
+    #[test]
+    fn test_build_contains_anyhow_macro_context_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("anyhow!()"),
+            "系统 prompt 应包含 anyhow!() 宏导入约束 (Session 123)"
+        );
+        assert!(
+            prompt.contains("Context"),
+            "系统 prompt 应包含 Context trait 导入约束 (Session 123)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_quote_macro_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("quote!"),
+            "系统 prompt 应包含 quote! 宏括号配对约束 (Session 123)"
         );
     }
 }

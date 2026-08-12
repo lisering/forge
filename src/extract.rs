@@ -3326,20 +3326,89 @@ pub fn wrap_return_statements_in_ok(content: &str) -> String {
                 while j < stripped_lines.len() && brace_depth > 0 {
                     let cur = stripped_lines[j].trim();
 
-                    // 检测 return 语句
+                    // 检测 return 语句 (Session 122 + Session 123 多行增强)
                     if cur.starts_with("return ")
                         && !cur.starts_with("return Ok(")
                         && !cur.starts_with("return Err(")
                     {
                         let after_return = &cur["return ".len()..];
-                        let expr = after_return.trim_end_matches(';').trim();
+                        let trimmed_expr = after_return.trim();
 
-                        if !expr.is_empty() && !expr.starts_with("Ok(") && !expr.starts_with("Err(")
+                        // 跳过已包装或空表达式
+                        if !trimmed_expr.is_empty()
+                            && !trimmed_expr.starts_with("Ok(")
+                            && !trimmed_expr.starts_with("Err(")
                         {
-                            let orig_line = result_lines[j].clone();
-                            let indent_len = orig_line.len() - orig_line.trim_start().len();
-                            let indent = &orig_line[..indent_len];
-                            result_lines[j] = format!("{}return Ok({});", indent, expr);
+                            if trimmed_expr.ends_with(';') {
+                                // 单行 return (Session 122)
+                                let expr = trimmed_expr.trim_end_matches(';').trim();
+                                let orig_line = result_lines[j].clone();
+                                let indent_len = orig_line.len() - orig_line.trim_start().len();
+                                let indent = &orig_line[..indent_len];
+                                result_lines[j] = format!("{}return Ok({});", indent, expr);
+                            } else {
+                                // 多行 return (Session 123)
+                                // 跟踪表达式内的括号深度, 找到终止 ;
+                                let mut expr_depth = 0i32;
+                                let mut found_semi = false;
+
+                                // 计算首行 return 之后部分的深度
+                                for ch in after_return.chars() {
+                                    match ch {
+                                        '(' | '[' | '{' => expr_depth += 1,
+                                        ')' | ']' | '}' => expr_depth -= 1,
+                                        ';' if expr_depth == 0 => found_semi = true,
+                                        _ => {}
+                                    }
+                                }
+
+                                if !found_semi && expr_depth > 0 {
+                                    // 扫描后续行找到终止 ;
+                                    let mut end_line = j + 1;
+                                    while end_line < stripped_lines.len() {
+                                        for ch in stripped_lines[end_line].chars() {
+                                            match ch {
+                                                '(' | '[' | '{' => expr_depth += 1,
+                                                ')' | ']' | '}' => expr_depth -= 1,
+                                                ';' if expr_depth == 0 => found_semi = true,
+                                                _ => {}
+                                            }
+                                        }
+                                        if found_semi && expr_depth == 0 {
+                                            break;
+                                        }
+                                        end_line += 1;
+                                    }
+
+                                    if found_semi && end_line < stripped_lines.len() {
+                                        // 包装多行表达式: return expr → return Ok(expr
+                                        let orig_line = result_lines[j].clone();
+                                        let indent_len =
+                                            orig_line.len() - orig_line.trim_start().len();
+                                        let indent = &orig_line[..indent_len];
+
+                                        // 修改首行: "    return expr..." → "    return Ok(expr..."
+                                        result_lines[j] = format!(
+                                            "{}return Ok({}",
+                                            indent,
+                                            after_return.trim_start()
+                                        );
+
+                                        // 修改末行: "...);" → "...);"
+                                        // 在最后一个 ; 前插入 )
+                                        let last_line = result_lines[end_line].clone();
+                                        let last_trimmed = last_line.trim();
+                                        if let Some(semi_pos) = last_trimmed.rfind(';') {
+                                            let before_semi = &last_trimmed[..semi_pos];
+                                            let last_indent_len =
+                                                last_line.len() - last_line.trim_start().len();
+                                            let last_indent = &last_line[..last_indent_len];
+                                            result_lines[end_line] =
+                                                format!("{}{});", last_indent, before_semi);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -3568,6 +3637,142 @@ fn myers_backtrack(
     diffs
 }
 
+/// Diff 算法选择策略 (Session 123)
+///
+/// 用于 `compute_line_diff_with_algorithm` 指定使用哪种 diff 算法。
+///
+/// # 变体
+///
+/// - `Auto`: 自动选择最优算法 (基于输入特征启发式选择)
+/// - `Basic`: 基础逐行比较 O(N), 只比较相同行号的行
+/// - `Lcs`: LCS 动态规划 O(N×M), 适合中等规模输入
+/// - `Myers`: Myers O(ND), 适合大规模稀疏差异
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_with_algorithm, DiffAlgorithm, LineDiffType};
+///
+/// let original = "a\nb\nc";
+/// let fixed = "a\nx\nc";
+///
+/// let auto_diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Auto);
+/// let lcs_diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Lcs);
+/// let myers_diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Myers);
+///
+/// // 所有算法都应检测到差异
+/// assert!(!auto_diffs.is_empty());
+/// assert!(!lcs_diffs.is_empty());
+/// assert!(!myers_diffs.is_empty());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub enum DiffAlgorithm {
+    /// 自动选择最优算法 (默认)
+    ///
+    /// 启发式策略:
+    /// 1. 任一输入为空 → Myers (直接处理边界)
+    /// 2. 两输入都 < 20 行 → Basic (最快, 无需构建 DP 表)
+    /// 3. N × M ≤ 10000 → LCS (中等规模, 稳定)
+    /// 4. N × M > 10000 → Myers (大规模, 稀疏差异更高效)
+    #[default]
+    Auto,
+    /// 基础逐行比较 O(N)
+    Basic,
+    /// LCS 动态规划 O(N×M)
+    Lcs,
+    /// Myers O(ND)
+    Myers,
+}
+
+/// 使用指定算法计算行级别差异 (Session 123)
+///
+/// 根据 `algorithm` 参数选择 diff 算法, 返回 `Vec<LineDiff>`。
+///
+/// # 算法对比
+///
+/// | 算法 | 时间复杂度 | 空间复杂度 | 适用场景 |
+/// |------|-----------|-----------|---------|
+/// | Basic | O(N) | O(1) | 小输入, 行号对齐 |
+/// | LCS | O(N×M) | O(N×M) | 中等输入, 行插入/删除 |
+/// | Myers | O(ND) | O(D²) | 大输入, 稀疏差异 |
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_with_algorithm, DiffAlgorithm};
+///
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Myers);
+/// assert!(!diffs.is_empty(), "应有差异");
+/// ```
+pub fn compute_line_diff_with_algorithm(
+    original: &str,
+    fixed: &str,
+    algorithm: DiffAlgorithm,
+) -> Vec<LineDiff> {
+    match algorithm {
+        DiffAlgorithm::Basic => compute_line_diff(original, fixed),
+        DiffAlgorithm::Lcs => compute_line_diff_lcs(original, fixed),
+        DiffAlgorithm::Myers => compute_line_diff_myers(original, fixed),
+        DiffAlgorithm::Auto => {
+            let n = original.lines().count();
+            let m = fixed.lines().count();
+
+            // 边界: 任一输入为空 → Myers 直接处理
+            if n == 0 || m == 0 {
+                return compute_line_diff_myers(original, fixed);
+            }
+
+            // 小输入: 基础比较最快 (无 DP 表开销)
+            if n < 20 && m < 20 {
+                return compute_line_diff(original, fixed);
+            }
+
+            // 中等输入: LCS 更稳定
+            let nm = n.saturating_mul(m);
+            if nm <= 10_000 {
+                return compute_line_diff_lcs(original, fixed);
+            }
+
+            // 大输入: Myers 更适合稀疏差异
+            compute_line_diff_myers(original, fixed)
+        }
+    }
+}
+
+/// 统一 diff 接口 — 自动选择最优算法 (Session 123)
+///
+/// 这是计算行差异的推荐入口, 自动根据输入特征选择最优算法:
+///
+/// - **小输入** (< 20 行): 基础逐行比较, 无 DP 表开销
+/// - **中等输入** (N×M ≤ 10000): LCS 动态规划, 稳定可靠
+/// - **大输入** (N×M > 10000): Myers O(ND), 稀疏差异更高效
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_unified, LineDiffType};
+///
+/// // 小输入 → Basic
+/// let diffs = compute_line_diff_unified("a\nb", "a\nc");
+/// assert!(!diffs.is_empty());
+///
+/// // 空输入
+/// let diffs = compute_line_diff_unified("", "");
+/// assert!(diffs.is_empty());
+///
+/// // 大规模稀疏差异 → Myers
+/// let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+/// let mut fixed = original.clone();
+/// fixed.push_str("line 100\n");
+/// let diffs = compute_line_diff_unified(&original, &fixed);
+/// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Added));
+/// ```
+pub fn compute_line_diff_unified(original: &str, fixed: &str) -> Vec<LineDiff> {
+    compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Auto)
+}
+
 /// 格式化行差异摘要 (Session 122)
 ///
 /// 将 `Vec<LineDiff>` 格式化为人类可读的差异摘要字符串。
@@ -3714,17 +3919,21 @@ pub fn apply_staged_fixes_preview(content: &str) -> StagedFixPreview {
     }
 }
 
-/// 增强版 anyhow 导入检查 — 支持 bail!/ensure! 宏 (Session 122)
+/// 增强版 anyhow 导入检查 — 支持 bail!/ensure!/anyhow! 宏 + Context trait (Session 122 + Session 123)
 ///
-/// 在 `ensure_anyhow_imports` 基础上, 额外检测 `bail!()` 和 `ensure!()` 宏的使用,
-/// 并将它们添加到合并导入中。
+/// 在 `ensure_anyhow_imports` 基础上, 额外检测以下导入需求:
+/// - `bail!()` 宏
+/// - `ensure!()` 宏
+/// - `anyhow!()` 宏 (Session 123 新增)
+/// - `.context()` 方法 → `Context` trait (Session 123 新增)
 ///
 /// # 规则
 ///
-/// 1. 检测 `Result`/`Error`/`bail!`/`ensure!` 的使用需求
+/// 1. 检测 `Result`/`Error`/`bail!`/`ensure!`/`anyhow!`/`Context` 的使用需求
 /// 2. 检查已有导入
-/// 3. 构建合并导入: `use anyhow::{Result, Error, bail, ensure};`
-/// 4. 幂等: 已有合并导入不重复处理
+/// 3. 构建合并导入: `use anyhow::{Result, Error, Context, anyhow, bail, ensure};`
+/// 4. 排序: Result → Error → Context → anyhow → bail → ensure → format_err → 其他
+/// 5. 幂等: 已有合并导入不重复处理
 ///
 /// # 示例
 ///
@@ -3736,6 +3945,11 @@ pub fn apply_staged_fixes_preview(content: &str) -> StagedFixPreview {
 /// let result = ensure_anyhow_imports_extended(code);
 /// assert!(result.contains("bail"), "应包含 bail 导入");
 ///
+/// // 使用 anyhow! 宏 (Session 123)
+/// let code = "fn foo() -> Result<(), anyhow::Error> { Err(anyhow!(\"error\")) }";
+/// let result = ensure_anyhow_imports_extended(code);
+/// assert!(result.contains("anyhow"), "应包含 anyhow 宏导入");
+///
 /// // 幂等
 /// let second = ensure_anyhow_imports_extended(&result);
 /// assert_eq!(result, second, "二次调用不变化");
@@ -3746,8 +3960,17 @@ pub fn ensure_anyhow_imports_extended(content: &str) -> String {
     let needs_error = content.contains("anyhow::Error");
     let needs_bail = content.contains("bail!(") || content.contains("anyhow::bail!(");
     let needs_ensure = content.contains("ensure!(") || content.contains("anyhow::ensure!(");
+    // Session 123: anyhow! 宏和 Context trait
+    let needs_anyhow_macro = content.contains("anyhow!(");
+    let needs_context = content.contains(".context(") || content.contains(".with_context(");
 
-    if !needs_result && !needs_error && !needs_bail && !needs_ensure {
+    if !needs_result
+        && !needs_error
+        && !needs_bail
+        && !needs_ensure
+        && !needs_anyhow_macro
+        && !needs_context
+    {
         return content.to_string();
     }
 
@@ -3761,6 +3984,12 @@ pub fn ensure_anyhow_imports_extended(content: &str) -> String {
     }
     if needs_error {
         needed_items.push("Error");
+    }
+    if needs_context {
+        needed_items.push("Context");
+    }
+    if needs_anyhow_macro {
+        needed_items.push("anyhow");
     }
     if needs_bail {
         needed_items.push("bail");
@@ -3814,13 +4043,16 @@ pub fn ensure_anyhow_imports_extended(content: &str) -> String {
         }
     }
 
-    // 排序: Result, Error, bail, ensure, 其他
+    // 排序: Result, Error, Context, anyhow, bail, ensure, format_err, 其他
     all_items.sort_by_key(|item| match *item {
         "Result" => 0,
         "Error" => 1,
-        "bail" => 2,
-        "ensure" => 3,
-        _ => 4,
+        "Context" => 2,
+        "anyhow" => 3,
+        "bail" => 4,
+        "ensure" => 5,
+        "format_err" => 6,
+        _ => 7,
     });
 
     if anyhow_line_indices.is_empty() {
@@ -8039,5 +8271,346 @@ fn foo(
             assert!(import_line.contains("bail"), "应有 bail");
             assert!(import_line.contains("ensure"), "应有 ensure");
         }
+    }
+
+    // ===== Session 123: compute_line_diff_unified 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_unified_no_diff() {
+        let diffs = compute_line_diff_unified("fn foo() {}", "fn foo() {}");
+        assert!(diffs.is_empty(), "无差异应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_unified_empty_both() {
+        let diffs = compute_line_diff_unified("", "");
+        assert!(diffs.is_empty(), "双空应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_unified_small_input() {
+        // 小输入 (< 20 行) → Basic
+        let original = "a\nb\nc";
+        let fixed = "a\nx\nc";
+        let diffs = compute_line_diff_unified(original, fixed);
+        assert!(!diffs.is_empty(), "小输入应有差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_unified_medium_input() {
+        // 中等输入 (20-100 行) → LCS
+        let original: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        fixed.push_str("line 30\n");
+        let diffs = compute_line_diff_unified(&original, &fixed);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "中等输入应检测到新增行"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_unified_large_input() {
+        // 大输入 (N×M > 10000) → Myers
+        let original: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        fixed.push_str("line 200\n");
+        let diffs = compute_line_diff_unified(&original, &fixed);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "大输入应检测到新增行"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_basic() {
+        let original = "a\nb";
+        let fixed = "a\nc";
+        let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Basic);
+        assert!(!diffs.is_empty(), "Basic 应检测到差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_lcs() {
+        let original = "a\nb\nc\nd";
+        let fixed = "a\nx\nc\ny";
+        let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Lcs);
+        assert!(!diffs.is_empty(), "LCS 应检测到差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_myers() {
+        let original = "a\nb\nc\nd";
+        let fixed = "a\nx\nc\ny";
+        let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Myers);
+        assert!(!diffs.is_empty(), "Myers 应检测到差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_auto() {
+        let original = "a\nb\nc";
+        let fixed = "a\nb\nc\nd";
+        let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Auto);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "Auto 应检测到新增行"
+        );
+    }
+
+    #[test]
+    fn test_diff_algorithm_default() {
+        let algo = DiffAlgorithm::default();
+        assert_eq!(algo, DiffAlgorithm::Auto, "默认应为 Auto");
+    }
+
+    #[test]
+    fn test_diff_algorithm_serde() {
+        let algo = DiffAlgorithm::Myers;
+        let json = serde_json::to_string(&algo).unwrap();
+        let deserialized: DiffAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(algo, deserialized, "Serde 往返应保持一致");
+    }
+
+    #[test]
+    fn test_compute_line_diff_unified_one_empty() {
+        let diffs = compute_line_diff_unified("", "a\nb\nc");
+        assert_eq!(diffs.len(), 3, "空 original 应全部 Added");
+        assert!(diffs.iter().all(|d| d.diff_type == LineDiffType::Added));
+    }
+
+    // ===== Session 123: wrap_return_statements_in_ok 多行测试 =====
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_function_call() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return bar(\n        1,\n        2,\n    );\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(bar("),
+            "应包装多行函数调用: {}",
+            result
+        );
+        assert!(result.contains("));"), "应在末行添加闭合括号: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_struct() {
+        let code = "fn foo() -> Result<Foo, anyhow::Error> {\n    return Foo {\n        x: 1,\n        y: 2,\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(Foo {"),
+            "应包装多行结构体: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合括号: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_single_line_still_works() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return 42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(42);"),
+            "单行 return 仍应正确包装: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_idempotent() {
+        let code =
+            "fn foo() -> Result<i32, anyhow::Error> {\n    return bar(\n        1,\n    );\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "多行包装应幂等");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_already_ok() {
+        let code =
+            "fn foo() -> Result<i32, anyhow::Error> {\n    return Ok(bar(\n        1,\n    ));\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert_eq!(result, code, "已包装的 return Ok(...) 不应修改");
+    }
+
+    // ===== Session 123: validate_rust_braces quote! 宏测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_basic() {
+        let code = "fn foo() {\n    quote! {\n        let x = 42;\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏基本用法应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_with_interpolation() {
+        let code =
+            "fn foo() {\n    let name = \"test\";\n    quote! {\n        #name = 42;\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏插值 #name 应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_repetition() {
+        let code = "fn foo() {\n    quote! {\n        #(#field: #field_types,)*\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏重复语法 #(#field),* 应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_nested() {
+        let code = "fn foo() {\n    quote! {\n        if true {\n            do_something();\n        }\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏嵌套块应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_raw_string() {
+        let code = "fn foo() {\n    quote! {\n        let s = r#\"hello\"#;\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏内 raw string 应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_raw_identifier() {
+        let code = "fn foo() {\n    quote! {\n        r#type = 42;\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏内 raw identifier r#type 应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_paren_delimiter() {
+        let code = "fn foo() {\n    quote!(let x = 42;)\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote!() 圆括号分隔符应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_derive_attribute() {
+        let code = "fn foo() {\n    quote! {\n        #[derive(Debug)]\n        struct Foo {\n            bar: u32,\n        }\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "quote! 宏内 derive 属性应无问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_quote_macro_unbalanced() {
+        let code = "fn foo() {\n    quote! {\n        let x = 42;\n    }\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "平衡的 quote! 宏应无问题"
+        );
+        // 真正不平衡的情况
+        let bad_code = "fn foo() {\n    quote! {\n        let x = 42;\n}";
+        assert!(
+            validate_rust_braces(bad_code).is_some(),
+            "不平衡的 quote! 宏应报告问题"
+        );
+    }
+
+    // ===== Session 123: ensure_anyhow_imports_extended anyhow!/Context 测试 =====
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_anyhow_macro() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    Err(anyhow!(\"error\"))\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(
+            result.contains("anyhow"),
+            "应包含 anyhow 宏导入: {}",
+            result
+        );
+        assert!(
+            result.contains("use anyhow::{"),
+            "应使用合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_context_trait() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    file.read_to_end(&mut buf).context(\"read failed\")?;\n    Ok(())\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(
+            result.contains("Context"),
+            "应包含 Context trait 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_with_context() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    file.read_to_end(&mut buf).with_context(|| \"read failed\")?;\n    Ok(())\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(
+            result.contains("Context"),
+            "应包含 Context trait 导入 (with_context): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_all_items() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    bail!(\"e1\");\n    ensure!(true, \"e2\");\n    let e = anyhow!(\"e3\");\n    x.context(\"e4\")?;\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(result.contains("Result"), "应有 Result");
+        assert!(result.contains("bail"), "应有 bail");
+        assert!(result.contains("ensure"), "应有 ensure");
+        assert!(result.contains("anyhow"), "应有 anyhow");
+        assert!(result.contains("Context"), "应有 Context");
+        let import_count = result.matches("use anyhow::").count();
+        assert_eq!(import_count, 1, "应只有一个合并导入行: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_context_idempotent() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    x.context(\"e\")?;\n    Ok(())\n}";
+        let first = ensure_anyhow_imports_extended(code);
+        let second = ensure_anyhow_imports_extended(&first);
+        assert_eq!(first, second, "Context 检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_sorted_with_new_items() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    x.context(\"e\")?;\n    bail!(\"e2\");\n    let e = anyhow!(\"e3\");\n}";
+        let result = ensure_anyhow_imports_extended(code);
+        if let Some(pos) = result.find("use anyhow::{") {
+            let inner_start = pos + "use anyhow::{".len();
+            if let Some(end) = result[inner_start..].find("};") {
+                let inner = &result[inner_start..inner_start + end];
+                // 验证排序: Result → Context → anyhow → bail
+                let result_pos = inner.find("Result").unwrap_or(usize::MAX);
+                let context_pos = inner.find("Context").unwrap_or(usize::MAX);
+                let anyhow_pos = inner.find("anyhow").unwrap_or(usize::MAX);
+                let bail_pos = inner.find("bail").unwrap_or(usize::MAX);
+                assert!(result_pos < context_pos, "Result 应在 Context 前");
+                assert!(context_pos < anyhow_pos, "Context 应在 anyhow 前");
+                assert!(anyhow_pos < bail_pos, "anyhow 应在 bail 前");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_extended_no_context_when_not_needed() {
+        let code = "fn foo() -> Result<(), anyhow::Error> { Ok(()) }";
+        let result = ensure_anyhow_imports_extended(code);
+        assert!(
+            !result.contains("Context"),
+            "不需要 Context 时不应添加: {}",
+            result
+        );
     }
 }

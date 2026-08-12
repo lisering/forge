@@ -739,6 +739,15 @@ where
     ///
     /// 默认 false (向后兼容, 使用一次性修复)。
     pub staged_fix_enabled: bool,
+
+    /// 修复预览开关 — 显示分阶段修复预览而不实际修改 (Session 123)
+    ///
+    /// 启用后, 使用 `apply_staged_fixes_preview` 显示每个阶段的修复预览,
+    /// 包括每个阶段是否有变化、变化内容摘要, 但不实际修改文件内容。
+    /// 需要同时启用 `auto_fix_enabled` 和 `staged_fix_enabled`。
+    ///
+    /// 默认 false (向后兼容)。
+    pub fix_preview_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -781,6 +790,7 @@ where
             handler_chain: None,
             web_tool: None,
             compaction_config: None,
+            fix_preview_enabled: false,
             live_continuation: None,
             conversation_tracker: None,
             incremental_stats: crate::dev_trace::IncrementalStats::new(),
@@ -865,6 +875,7 @@ where
             auto_fix_enabled: self.auto_fix_enabled,
             clippy_check_enabled: self.clippy_check_enabled,
             staged_fix_enabled: self.staged_fix_enabled,
+            fix_preview_enabled: self.fix_preview_enabled,
         }
     }
 
@@ -1197,6 +1208,16 @@ where
         self
     }
 
+    /// 启用/禁用修复预览 (Session 123)
+    ///
+    /// 启用后, 在分阶段修复时显示每个阶段的预览信息,
+    /// 包括变化行数和 diff 摘要, 但不实际修改文件内容。
+    /// 需要同时启用 `auto_fix_enabled` 和 `staged_fix_enabled`。
+    pub fn with_fix_preview(mut self, enabled: bool) -> Self {
+        self.fix_preview_enabled = enabled;
+        self
+    }
+
     /// 对项目运行 clippy 检查并打印结果 (Session 120)
     ///
     /// 在代码写入工作区后调用, 如果 clippy 发现问题则打印警告和错误。
@@ -1236,7 +1257,10 @@ where
         &self,
         files: Vec<crate::extract::ExtractedFile>,
     ) -> Vec<crate::extract::ExtractedFile> {
-        use crate::extract::{apply_fixes_dry_run, apply_staged_fixes};
+        use crate::extract::{
+            apply_fixes_dry_run, apply_staged_fixes, apply_staged_fixes_preview,
+            compute_line_diff_unified, format_diff_summary,
+        };
 
         let mut fixed_files = Vec::with_capacity(files.len());
         let mut total_fixes = 0usize;
@@ -1244,6 +1268,34 @@ where
 
         for file in files {
             if file.path.ends_with(".rs") {
+                // Session 123: 预览模式 — 显示分阶段修复预览但不修改
+                if self.fix_preview_enabled && self.staged_fix_enabled {
+                    let preview = apply_staged_fixes_preview(&file.content);
+                    if preview.total_changed {
+                        println!("    👁 修复预览 {}:", file.path);
+                        if preview.stage1_changed {
+                            println!("      阶段 1 (高优先级): 有变化");
+                            let diff = compute_line_diff_unified(
+                                &preview.original_content,
+                                &preview.stage1_result,
+                            );
+                            let summary = format_diff_summary(&diff);
+                            for line in summary.lines().take(5) {
+                                println!("        {}", line);
+                            }
+                        }
+                        if preview.stage2_changed {
+                            println!("      阶段 2 (中优先级): 有变化");
+                        }
+                        if preview.stage3_changed {
+                            println!("      阶段 3 (低优先级): 有变化");
+                        }
+                    }
+                    // 预览模式: 不修改文件内容
+                    fixed_files.push(file);
+                    continue;
+                }
+
                 // Session 121: 分阶段修复时直接使用 apply_staged_fixes
                 let fixed_content = if self.staged_fix_enabled {
                     apply_staged_fixes(&file.content)
@@ -1274,6 +1326,14 @@ where
                     if fixed_content != file.content {
                         fixed_count += 1;
                         println!("    🔧 分阶段修复 {} (高→中→低优先级)", file.path);
+
+                        // Session 123: 打印 diff 摘要
+                        let diffs = compute_line_diff_unified(&file.content, &fixed_content);
+                        let summary = format_diff_summary(&diffs);
+                        for line in summary.lines().take(10) {
+                            println!("        {}", line);
+                        }
+
                         fixed_files.push(crate::extract::ExtractedFile {
                             content: fixed_content,
                             ..file
@@ -1282,6 +1342,14 @@ where
                         fixed_files.push(file);
                     }
                 } else {
+                    // Session 123: 非分阶段模式也打印 diff 摘要
+                    if fixed_content != file.content {
+                        let diffs = compute_line_diff_unified(&file.content, &fixed_content);
+                        let summary = format_diff_summary(&diffs);
+                        for line in summary.lines().take(10) {
+                            println!("        {}", line);
+                        }
+                    }
                     fixed_files.push(crate::extract::ExtractedFile {
                         content: fixed_content,
                         ..file
@@ -10689,6 +10757,81 @@ mod tests {
             fixed[0].content.contains("#[must_use]"),
             "分阶段模式应添加 #[must_use]"
         );
+    }
+
+    // ===== Session 123: 修复预览测试 =====
+
+    #[test]
+    fn test_fix_preview_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(
+            !orch.fix_preview_enabled,
+            "fix_preview_enabled 应默认为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_fix_preview_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_fix_preview(true);
+        assert!(
+            orch.fix_preview_enabled,
+            "with_fix_preview(true) 应设置 fix_preview_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_fix_preview_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_fix_preview(false);
+        assert!(
+            !orch.fix_preview_enabled,
+            "with_fix_preview(false) 应设置 fix_preview_enabled 为 false"
+        );
+    }
+
+    #[test]
+    fn test_fix_preview_mode_does_not_modify_files() {
+        use crate::extract::ExtractedFile;
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_staged_fix(true)
+            .with_fix_preview(true);
+
+        let original_content = "pub fn foo() { let x = bar().unwrap(); }";
+        let files = vec![ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: original_content.to_string(),
+            language: "rust".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        // 预览模式不应修改文件内容
+        assert_eq!(
+            fixed[0].content, original_content,
+            "预览模式不应修改文件内容"
+        );
+    }
+
+    #[test]
+    fn test_fix_preview_with_auto_fix_and_staged_fix() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_staged_fix(true)
+            .with_fix_preview(true)
+            .with_clippy_check(true);
+        assert!(orch.auto_fix_enabled, "auto_fix 应启用");
+        assert!(orch.staged_fix_enabled, "staged_fix 应启用");
+        assert!(orch.fix_preview_enabled, "fix_preview 应启用");
+        assert!(orch.clippy_check_enabled, "clippy_check 应启用");
     }
 }
 
