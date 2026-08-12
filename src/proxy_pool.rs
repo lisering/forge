@@ -386,6 +386,10 @@ pub fn build_reqwest_proxy(url: &str) -> Result<reqwest::Proxy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 使用 Mutex 串行化环境变量测试, 避免并行测试时环境变量竞争
+    // (类似 browser_launcher 的 ENV_LOCK 修复)
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ===== is_valid_proxy_url 测试 =====
 
@@ -560,6 +564,7 @@ mod tests {
 
     #[test]
     fn test_load_proxies_from_env_not_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved1 = std::env::var_os("FORGE_PROXY");
         let saved2 = std::env::var_os("FORGE_PROXY_LIST");
         std::env::remove_var("FORGE_PROXY");
@@ -577,6 +582,7 @@ mod tests {
 
     #[test]
     fn test_load_proxies_from_env_single() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_PROXY");
         std::env::set_var("FORGE_PROXY", "http://proxy:8080");
 
@@ -592,6 +598,7 @@ mod tests {
 
     #[test]
     fn test_load_proxies_from_env_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_PROXY_LIST");
         std::env::set_var(
             "FORGE_PROXY_LIST",
@@ -612,6 +619,7 @@ mod tests {
 
     #[test]
     fn test_load_proxies_from_env_invalid_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_PROXY_LIST");
         std::env::set_var("FORGE_PROXY_LIST", "invalid,http://valid:8080,also-invalid");
 

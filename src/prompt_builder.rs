@@ -85,7 +85,10 @@ impl SystemPrompt {
         prompt.push_str("❌ 禁止: 违反 SOLID 原则 (特别是 DIP 依赖倒置)\n");
         prompt.push_str("❌ 禁止: 在单元测试中访问真实的外部依赖\n");
         prompt.push_str("❌ 禁止: 大括号/圆括号/方括号不配对 (最常见的 AI 代码生成错误)\n");
-        prompt.push_str("❌ 禁止: 使用 todo!()/unimplemented!()/panic!() (非测试代码)\n\n");
+        prompt.push_str("❌ 禁止: 使用 todo!()/unimplemented!()/panic!() (非测试代码)\n");
+        prompt.push_str(
+            "❌ 禁止: 使用 unsafe 块/函数/实现 (非必要不使用, 必须时添加 SAFETY 注释)\n\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -93,7 +96,8 @@ impl SystemPrompt {
         prompt.push_str("✅ 必须: 使用 ```file:路径``` 格式输出完整文件内容\n");
         prompt.push_str("✅ 必须: 代码零警告、零 clippy 警告\n");
         prompt.push_str("✅ 必须: 使用 trait 抽象外部依赖，支持无 Chrome 环境测试\n");
-        prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n\n");
+        prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n");
+        prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n\n");
 
         prompt.push_str("📎 附件内容 (必须逐条执行):\n");
         prompt.push_str("  1. 前沿技术要求 — 使用最新最前沿的技术\n");
@@ -244,6 +248,34 @@ mod tests {
         assert!(
             prompt.contains("panic!()"),
             "系统 prompt 应包含 panic!() 禁止项"
+        );
+    }
+
+    // ===== Session 115: unsafe + 公共 API 文档要求测试 =====
+
+    #[test]
+    fn test_build_contains_unsafe_warning() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("unsafe"),
+            "系统 prompt 应包含 unsafe 禁止项"
+        );
+        assert!(
+            prompt.contains("SAFETY"),
+            "系统 prompt 应提及 SAFETY 注释要求"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_doc_comment_requirement() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("文档注释"),
+            "系统 prompt 应包含公共 API 文档注释要求"
+        );
+        assert!(
+            prompt.contains("pub fn/struct/enum/trait"),
+            "系统 prompt 应明确列出需要文档注释的公共 API 类型"
         );
     }
 }

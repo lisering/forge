@@ -578,7 +578,7 @@ fn validate_extracted_files(files: &[ExtractedFile]) {
     }
 }
 
-/// 验证 Rust 代码质量 — 检查违反约束的常见 AI 代码模式 (Session 114)
+/// 验证 Rust 代码质量 — 检查违反约束的常见 AI 代码模式 (Session 114, Session 115 增强)
 ///
 /// AI 生成的 Rust 代码可能包含以下违反开发约束的模式:
 /// - `unwrap()` — 应使用 `?` 或 `match` 处理错误
@@ -586,10 +586,12 @@ fn validate_extracted_files(files: &[ExtractedFile]) {
 /// - `todo!()` — 未实现的占位代码
 /// - `unimplemented!()` — 同上
 /// - `panic!()` — 非测试代码中不应使用
+/// - `unsafe { }` / `unsafe fn` / `unsafe impl` — 应避免 unsafe (Session 115)
+/// - 公共 API 缺少 `///` 文档注释 (Session 115)
 ///
 /// 测试代码 (`#[cfg(test)]` 模块内) 中的 `unwrap()`/`expect()` 是允许的。
 ///
-/// 返回问题列表 (空列表表示无问题)。
+/// 返回问题列表 (空列表表示无问题)。每个问题包含行号、描述和修复建议。
 ///
 /// # 示例
 ///
@@ -605,10 +607,287 @@ fn validate_extracted_files(files: &[ExtractedFile]) {
 /// assert!(issues[0].contains("unwrap"));
 /// ```
 pub fn validate_rust_code_quality(content: &str) -> Vec<String> {
+    validate_rust_code_quality_detailed(content)
+        .iter()
+        .map(|issue| {
+            let base = format!("行 {}: {}", issue.line, issue.message);
+            if let Some(ref suggestion) = issue.suggestion {
+                format!("{} | 建议: {}", base, suggestion)
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
+/// 检查行中是否包含模式 (排除注释部分)
+fn contains_pattern_outside_comment(line: &str, pattern: &str) -> bool {
+    // 找到 // 注释的位置 (简化处理: 不考虑字符串中的 //)
+    let code_part = if let Some(pos) = line.find("//") {
+        &line[..pos]
+    } else {
+        line
+    };
+    code_part.contains(pattern)
+}
+
+// ============================================================================
+//  Session 115: 增强代码质量验证 — unsafe 检测 + 缺失文档检测 + 修复建议
+// ============================================================================
+
+/// 代码质量问题类型 (Session 115)
+///
+/// 对应 `validate_rust_code_quality_detailed` 返回的 `QualityIssue` 的类型。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum IssueType {
+    /// 使用 `.unwrap()` — 应使用 `?` 或 `match` 处理错误
+    Unwrap,
+    /// 使用 `.expect()` — 应使用 `?` 或 `match` 处理错误
+    Expect,
+    /// 使用 `todo!()` 宏 — 未实现的占位代码
+    Todo,
+    /// 使用 `unimplemented!()` 宏 — 未实现的占位代码
+    Unimplemented,
+    /// 使用 `panic!()` — 非测试代码不应直接 panic
+    Panic,
+    /// 使用 `unsafe { }` 块 — 应避免 unsafe, 寻找安全替代方案
+    UnsafeBlock,
+    /// 使用 `unsafe fn` — 应避免 unsafe 函数
+    UnsafeFn,
+    /// 使用 `unsafe impl` — 应避免 unsafe 实现
+    UnsafeImpl,
+    /// 公共 API 缺少 `///` 文档注释
+    MissingDoc,
+}
+
+/// 代码质量问题 — 包含行号、类型、消息和自动修复建议 (Session 115)
+///
+/// 由 `validate_rust_code_quality_detailed` 返回, 提供结构化的质量问题信息。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{validate_rust_code_quality_detailed, IssueType};
+///
+/// let issues = validate_rust_code_quality_detailed("fn foo() { bar().unwrap(); }");
+/// assert!(!issues.is_empty());
+/// assert_eq!(issues[0].issue_type, IssueType::Unwrap);
+/// assert!(issues[0].suggestion.is_some());
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QualityIssue {
+    /// 行号 (1-based)
+    pub line: usize,
+    /// 问题类型
+    pub issue_type: IssueType,
+    /// 问题描述
+    pub message: String,
+    /// 自动修复建议 (如果有)
+    pub suggestion: Option<String>,
+}
+
+/// 检测行中是否包含 `unsafe` 关键字 (不是标识符的一部分) (Session 115)
+///
+/// 返回 unsafe 的类型: `"block"` / `"fn"` / `"impl"`, 或 `None`。
+///
+/// # 精确匹配
+///
+/// - `unsafe { ... }` → `"block"`
+/// - `unsafe fn ...` → `"fn"`
+/// - `unsafe impl ...` → `"impl"`
+/// - `unsafe_value` → `None` (标识符的一部分)
+/// - `is_unsafe = true` → `None` (标识符的一部分)
+/// - `// unsafe` → `None` (注释)
+fn detect_unsafe_keyword(line: &str) -> Option<&'static str> {
+    let code_part = if let Some(pos) = line.find("//") {
+        &line[..pos]
+    } else {
+        line
+    };
+
+    let mut search_start = 0;
+    while let Some(pos) = code_part[search_start..].find("unsafe") {
+        let abs_pos = search_start + pos;
+
+        // 检查前一个字符是否是标识符字符
+        let is_start_of_word = if abs_pos == 0 {
+            true
+        } else {
+            let prev = code_part.as_bytes()[abs_pos - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_')
+        };
+
+        if !is_start_of_word {
+            search_start = abs_pos + 6; // 6 = len("unsafe")
+            continue;
+        }
+
+        // 检查 "unsafe" 后面的内容
+        let after = &code_part[abs_pos + 6..]; // 6 = len("unsafe")
+        let after_trimmed = after.trim_start();
+
+        if after_trimmed.starts_with('{') {
+            return Some("block");
+        }
+
+        // 检查 "fn" 是否是独立单词
+        if after_trimmed.starts_with("fn ") || after_trimmed == "fn" {
+            return Some("fn");
+        }
+
+        // 检查 "impl" 是否是独立单词
+        if after_trimmed.starts_with("impl ") || after_trimmed == "impl" {
+            return Some("impl");
+        }
+
+        search_start = abs_pos + 6;
+    }
+
+    None
+}
+
+/// 检查行是否是公共 API 声明 (需要文档注释) (Session 115)
+///
+/// 检测 `pub fn` / `pub struct` / `pub enum` / `pub trait` / `pub mod`
+/// (包括 `pub async fn`, `pub unsafe fn`, `pub const fn` 等修饰符组合)。
+///
+/// 排除:
+/// - `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in ...)` — 非完全公共
+/// - `pub use` — 重导出, 不需要文档
+/// - `pub const`, `pub static`, `pub type` — 简化处理, 暂不要求
+fn is_public_api_declaration(line: &str) -> bool {
+    // 排除 pub(crate), pub(super), pub(self), pub(in ...)
+    if line.starts_with("pub(crate)")
+        || line.starts_with("pub(super)")
+        || line.starts_with("pub(self)")
+        || line.starts_with("pub(in ")
+    {
+        return false;
+    }
+
+    let Some(after_pub) = line.strip_prefix("pub ") else {
+        return false;
+    };
+    let after_pub = after_pub.trim_start();
+
+    // 跳过修饰符: unsafe, async, const
+    let after_modifiers = skip_modifiers(after_pub);
+
+    // pub use 不需要文档注释 (重导出)
+    if after_modifiers.starts_with("use ") {
+        return false;
+    }
+
+    after_modifiers.starts_with("fn ")
+        || after_modifiers.starts_with("struct ")
+        || after_modifiers.starts_with("enum ")
+        || after_modifiers.starts_with("trait ")
+        || after_modifiers.starts_with("mod ")
+}
+
+/// 跳过 Rust 修饰符 (unsafe, async, const) 并返回剩余内容
+fn skip_modifiers(s: &str) -> &str {
+    let mut current = s;
+    loop {
+        let trimmed = current.trim_start();
+        if let Some(stripped) = trimmed.strip_prefix("unsafe ") {
+            current = stripped;
+        } else if let Some(stripped) = trimmed.strip_prefix("async ") {
+            current = stripped;
+        } else if let Some(stripped) = trimmed.strip_prefix("const ") {
+            current = stripped;
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+/// 提取公共 API 的类型描述 (Session 115)
+///
+/// 从 `pub fn foo()` 中提取 `"pub fn foo"`, 从 `pub struct Bar` 中提取 `"pub struct Bar"`。
+fn extract_public_item_type(line: &str) -> String {
+    let after_pub = line.strip_prefix("pub ").unwrap_or(line);
+    let after_modifiers = skip_modifiers(after_pub.trim_start());
+
+    if let Some(rest) = after_modifiers.strip_prefix("fn ") {
+        format!("pub fn {}", extract_first_identifier(rest))
+    } else if let Some(rest) = after_modifiers.strip_prefix("struct ") {
+        format!("pub struct {}", extract_first_identifier(rest))
+    } else if let Some(rest) = after_modifiers.strip_prefix("enum ") {
+        format!("pub enum {}", extract_first_identifier(rest))
+    } else if let Some(rest) = after_modifiers.strip_prefix("trait ") {
+        format!("pub trait {}", extract_first_identifier(rest))
+    } else if let Some(rest) = after_modifiers.strip_prefix("mod ") {
+        format!("pub mod {}", extract_first_identifier(rest))
+    } else {
+        "pub item".to_string()
+    }
+}
+
+/// 从字符串中提取第一个标识符 (字母数字+下划线序列)
+fn extract_first_identifier(s: &str) -> &str {
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("")
+}
+
+/// 检查公共 API 声明前是否有文档注释 (Session 115)
+///
+/// 从当前行向上查找, 跳过空行和 `#[...]` 属性, 检查是否有 `///` 或 `//!` 注释。
+fn has_doc_comment(lines: &[&str], line_num: usize) -> bool {
+    let mut i = line_num;
+    while i > 0 {
+        i -= 1;
+        let prev = lines[i].trim();
+
+        // 跳过空行
+        if prev.is_empty() {
+            continue;
+        }
+
+        // 跳过属性 #[...] 和 #![...]
+        if prev.starts_with("#[") || prev.starts_with("#![") {
+            continue;
+        }
+
+        // 检查是否是文档注释
+        if prev.starts_with("///") || prev.starts_with("//!") {
+            return true;
+        }
+
+        // 如果是其他代码行, 说明没有文档注释
+        return false;
+    }
+
+    false
+}
+
+/// 验证 Rust 代码质量 — 详细版, 返回结构化问题列表 (Session 115)
+///
+/// 在 `validate_rust_code_quality` 的基础上, 新增:
+/// - `unsafe` 块/函数/实现检测
+/// - 公共 API (`pub fn`/`pub struct`/`pub enum`/`pub trait`/`pub mod`) 缺少文档注释检测
+/// - 每个问题的自动修复建议
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{validate_rust_code_quality_detailed, IssueType};
+///
+/// // 无问题
+/// assert!(validate_rust_code_quality_detailed("fn main() { let x = 42; }").is_empty());
+///
+/// // unsafe 块检测
+/// let issues = validate_rust_code_quality_detailed("fn foo() { unsafe { let x = 42; } }");
+/// assert!(issues.iter().any(|i| i.issue_type == IssueType::UnsafeBlock));
+///
+/// // 公共 API 缺少文档注释
+/// let issues = validate_rust_code_quality_detailed("pub fn foo() {}");
+/// assert!(issues.iter().any(|i| i.issue_type == IssueType::MissingDoc));
+/// ```
+pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
     let mut issues = Vec::new();
 
-    // 检测是否在 #[cfg(test)] 模块内 (简单行级检测)
-    // 遇到 "#[cfg(test)]" 后, 后续代码视为测试代码, 直到遇到匹配的 "}"
     let lines: Vec<&str> = content.lines().collect();
     let mut in_test_module = false;
     let mut test_module_brace_depth = 0i32;
@@ -619,7 +898,7 @@ pub fn validate_rust_code_quality(content: &str) -> Vec<String> {
         // 检测 #[cfg(test)] 标记
         if trimmed.contains("#[cfg(test)]") {
             in_test_module = true;
-            test_module_brace_depth = 0; // 重置, 等待 {
+            test_module_brace_depth = 0;
         }
 
         // 跟踪测试模块的大括号深度
@@ -643,67 +922,122 @@ pub fn validate_rust_code_quality(content: &str) -> Vec<String> {
 
         // 在非测试代码中检查禁止模式
         if !in_test_module {
-            // 检查 .unwrap() — 排除注释中的
+            // 检查 .unwrap()
             if contains_pattern_outside_comment(trimmed, ".unwrap()") {
-                issues.push(format!(
-                    "行 {}: 使用 .unwrap() — 应使用 ? 或 match 处理错误",
-                    line_num + 1
-                ));
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Unwrap,
+                    message: "使用 .unwrap() — 应使用 ? 或 match 处理错误".to_string(),
+                    suggestion: Some(
+                        "将 `.unwrap()` 替换为 `?` 操作符, 或使用 `match` 处理 Ok/Err 分支"
+                            .to_string(),
+                    ),
+                });
             }
 
-            // 检查 .expect( — 排除注释中的
+            // 检查 .expect()
             if contains_pattern_outside_comment(trimmed, ".expect(") {
-                issues.push(format!(
-                    "行 {}: 使用 .expect() — 应使用 ? 或 match 处理错误",
-                    line_num + 1
-                ));
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Expect,
+                    message: "使用 .expect() — 应使用 ? 或 match 处理错误".to_string(),
+                    suggestion: Some(
+                        "将 `.expect(\"...\")` 替换为 `?` 操作符, 或使用 `match` 处理 Ok/Err 分支"
+                            .to_string(),
+                    ),
+                });
             }
 
-            // 检查 todo!() 宏
+            // 检查 todo!()
             if contains_pattern_outside_comment(trimmed, "todo!()")
                 || contains_pattern_outside_comment(trimmed, "todo!(")
             {
-                issues.push(format!(
-                    "行 {}: 使用 todo!() 宏 — 未实现的占位代码",
-                    line_num + 1
-                ));
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Todo,
+                    message: "使用 todo!() 宏 — 未实现的占位代码".to_string(),
+                    suggestion: Some(
+                        "实现此函数的功能, 或返回 `Err(anyhow!(\"未实现\"))`".to_string(),
+                    ),
+                });
             }
 
-            // 检查 unimplemented!() 宏
+            // 检查 unimplemented!()
             if contains_pattern_outside_comment(trimmed, "unimplemented!()")
                 || contains_pattern_outside_comment(trimmed, "unimplemented!(")
             {
-                issues.push(format!(
-                    "行 {}: 使用 unimplemented!() 宏 — 未实现的占位代码",
-                    line_num + 1
-                ));
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Unimplemented,
+                    message: "使用 unimplemented!() 宏 — 未实现的占位代码".to_string(),
+                    suggestion: Some(
+                        "实现此函数的功能, 或返回 `Err(anyhow!(\"未实现\"))`".to_string(),
+                    ),
+                });
             }
 
-            // 检查 panic!() 宏 — 排除 main 函数中的合法 panic
+            // 检查 panic!()
             if (contains_pattern_outside_comment(trimmed, "panic!()")
                 || contains_pattern_outside_comment(trimmed, "panic!("))
                 && !trimmed.starts_with("//")
             {
-                issues.push(format!(
-                    "行 {}: 使用 panic!() — 非测试代码不应直接 panic",
-                    line_num + 1
-                ));
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Panic,
+                    message: "使用 panic!() — 非测试代码不应直接 panic".to_string(),
+                    suggestion: Some(
+                        "返回 `Result` 类型: `Err(anyhow!(\"...\"))` 而非 panic".to_string(),
+                    ),
+                });
+            }
+
+            // Session 115: 检查 unsafe 块/函数/实现
+            if let Some(unsafe_kind) = detect_unsafe_keyword(trimmed) {
+                let (issue_type, message, suggestion) = match unsafe_kind {
+                    "block" => (
+                        IssueType::UnsafeBlock,
+                        "使用 unsafe 块 — 应避免 unsafe, 寻找安全替代方案".to_string(),
+                        "使用安全 API 替代; 如必须使用 unsafe, 添加 `// SAFETY: ...` 注释说明不变量"
+                            .to_string(),
+                    ),
+                    "fn" => (
+                        IssueType::UnsafeFn,
+                        "使用 unsafe fn — 应避免 unsafe 函数".to_string(),
+                        "使用安全 API 封装 unsafe 操作, 或添加 `// SAFETY: ...` 注释".to_string(),
+                    ),
+                    "impl" => (
+                        IssueType::UnsafeImpl,
+                        "使用 unsafe impl — 应避免 unsafe 实现".to_string(),
+                        "确保实现的安全性, 添加 `// SAFETY: ...` 注释说明为何实现是安全的"
+                            .to_string(),
+                    ),
+                    _ => unreachable!(),
+                };
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type,
+                    message,
+                    suggestion: Some(suggestion),
+                });
+            }
+
+            // Session 115: 检查公共 API 缺少文档注释
+            if is_public_api_declaration(trimmed) && !has_doc_comment(&lines, line_num) {
+                let item_desc = extract_public_item_type(trimmed);
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::MissingDoc,
+                    message: format!("公共 API `{}` 缺少 `///` 文档注释", item_desc),
+                    suggestion: Some(format!(
+                        "在 `{}` 上方添加 `///` 文档注释, 说明其用途、参数和返回值",
+                        item_desc
+                    )),
+                });
             }
         }
     }
 
     issues
-}
-
-/// 检查行中是否包含模式 (排除注释部分)
-fn contains_pattern_outside_comment(line: &str, pattern: &str) -> bool {
-    // 找到 // 注释的位置 (简化处理: 不考虑字符串中的 //)
-    let code_part = if let Some(pos) = line.find("//") {
-        &line[..pos]
-    } else {
-        line
-    };
-    code_part.contains(pattern)
 }
 
 fn guess_language_from_path(path: &str) -> String {
@@ -1685,5 +2019,524 @@ fn foo() -> Result<i32, String> {
         }];
         // 不应 panic — 质量检查仅输出 warn 日志
         validate_extracted_files(&files);
+    }
+
+    // ===== Session 115: detect_unsafe_keyword 测试 =====
+
+    #[test]
+    fn test_detect_unsafe_keyword_block() {
+        assert_eq!(
+            detect_unsafe_keyword("unsafe { let x = 42; }"),
+            Some("block")
+        );
+        assert_eq!(detect_unsafe_keyword("    unsafe {"), Some("block"));
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_fn() {
+        assert_eq!(
+            detect_unsafe_keyword("unsafe fn foo() -> i32 { 42 }"),
+            Some("fn")
+        );
+        assert_eq!(detect_unsafe_keyword("pub unsafe fn bar() {}"), Some("fn"));
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_impl() {
+        assert_eq!(
+            detect_unsafe_keyword("unsafe impl Foo for Bar { }"),
+            Some("impl")
+        );
+        assert_eq!(
+            detect_unsafe_keyword("unsafe impl Send for *const () {}"),
+            Some("impl")
+        );
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_identifier_not_matched() {
+        // unsafe 作为标识符的一部分不应匹配
+        assert_eq!(detect_unsafe_keyword("let unsafe_value = 42;"), None);
+        assert_eq!(detect_unsafe_keyword("let is_unsafe = true;"), None);
+        assert_eq!(detect_unsafe_keyword("fn unsafe_handler() {}"), None);
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_in_comment_not_matched() {
+        // 注释中的 unsafe 不应匹配
+        assert_eq!(detect_unsafe_keyword("// unsafe { } block"), None);
+        assert_eq!(
+            detect_unsafe_keyword("let x = 42; // unsafe fn not_real"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_none() {
+        // 无 unsafe 的代码
+        assert_eq!(detect_unsafe_keyword("fn main() { let x = 42; }"), None);
+        assert_eq!(detect_unsafe_keyword(""), None);
+    }
+
+    // ===== Session 115: is_public_api_declaration 测试 =====
+
+    #[test]
+    fn test_is_public_api_declaration_fn() {
+        assert!(is_public_api_declaration("pub fn foo() {}"));
+        assert!(is_public_api_declaration("pub async fn foo() {}"));
+        assert!(is_public_api_declaration("pub unsafe fn foo() {}"));
+        assert!(is_public_api_declaration("pub const fn foo() {}"));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_struct() {
+        assert!(is_public_api_declaration("pub struct Foo {}"));
+        assert!(is_public_api_declaration("pub struct Foo;"));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_enum() {
+        assert!(is_public_api_declaration(
+            "pub enum Color { Red, Green, Blue }"
+        ));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_trait() {
+        assert!(is_public_api_declaration(
+            "pub trait Foo { fn bar(&self); }"
+        ));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_mod() {
+        assert!(is_public_api_declaration("pub mod utils;"));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_not_public() {
+        // 非 pub 的不应匹配
+        assert!(!is_public_api_declaration("fn foo() {}"));
+        assert!(!is_public_api_declaration("struct Foo {}"));
+        assert!(!is_public_api_declaration("enum Color {}"));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_pub_crate() {
+        // pub(crate) 不应匹配
+        assert!(!is_public_api_declaration("pub(crate) fn foo() {}"));
+        assert!(!is_public_api_declaration("pub(crate) struct Foo {}"));
+        assert!(!is_public_api_declaration("pub(super) fn foo() {}"));
+    }
+
+    #[test]
+    fn test_is_public_api_declaration_pub_use() {
+        // pub use 不应匹配 (重导出)
+        assert!(!is_public_api_declaration(
+            "pub use std::collections::HashMap;"
+        ));
+        assert!(!is_public_api_declaration("pub use crate::foo;"));
+    }
+
+    // ===== Session 115: skip_modifiers 测试 =====
+
+    #[test]
+    fn test_skip_modifiers_no_modifiers() {
+        assert_eq!(skip_modifiers("fn foo()"), "fn foo()");
+    }
+
+    #[test]
+    fn test_skip_modifiers_unsafe() {
+        assert_eq!(skip_modifiers("unsafe fn foo()"), "fn foo()");
+    }
+
+    #[test]
+    fn test_skip_modifiers_async() {
+        assert_eq!(skip_modifiers("async fn foo()"), "fn foo()");
+    }
+
+    #[test]
+    fn test_skip_modifiers_const() {
+        assert_eq!(skip_modifiers("const fn foo()"), "fn foo()");
+    }
+
+    #[test]
+    fn test_skip_modifiers_multiple() {
+        assert_eq!(skip_modifiers("unsafe async fn foo()"), "fn foo()");
+        assert_eq!(skip_modifiers("async unsafe fn foo()"), "fn foo()");
+        assert_eq!(skip_modifiers("unsafe const fn foo()"), "fn foo()");
+    }
+
+    // ===== Session 115: extract_public_item_type 测试 =====
+
+    #[test]
+    fn test_extract_public_item_type_fn() {
+        assert_eq!(extract_public_item_type("pub fn foo() {}"), "pub fn foo");
+        assert_eq!(
+            extract_public_item_type("pub async fn bar() -> i32 {}"),
+            "pub fn bar"
+        );
+    }
+
+    #[test]
+    fn test_extract_public_item_type_struct() {
+        assert_eq!(
+            extract_public_item_type("pub struct Foo {}"),
+            "pub struct Foo"
+        );
+    }
+
+    #[test]
+    fn test_extract_public_item_type_enum() {
+        assert_eq!(
+            extract_public_item_type("pub enum Color { Red }"),
+            "pub enum Color"
+        );
+    }
+
+    #[test]
+    fn test_extract_public_item_type_trait() {
+        assert_eq!(
+            extract_public_item_type("pub trait Foo { fn bar(&self); }"),
+            "pub trait Foo"
+        );
+    }
+
+    #[test]
+    fn test_extract_public_item_type_with_modifiers() {
+        assert_eq!(
+            extract_public_item_type("pub unsafe fn dangerous() {}"),
+            "pub fn dangerous"
+        );
+        assert_eq!(
+            extract_public_item_type("pub async fn async_fn() {}"),
+            "pub fn async_fn"
+        );
+    }
+
+    // ===== Session 115: has_doc_comment 测试 =====
+
+    #[test]
+    fn test_has_doc_comment_present() {
+        let lines = vec!["/// This is a doc comment", "pub fn foo() {}"];
+        assert!(has_doc_comment(&lines, 1));
+    }
+
+    #[test]
+    fn test_has_doc_comment_absent() {
+        let lines = vec!["let x = 42;", "pub fn foo() {}"];
+        assert!(!has_doc_comment(&lines, 1));
+    }
+
+    #[test]
+    fn test_has_doc_comment_with_attribute() {
+        // 属性 #[...] 应被跳过, 继续向上查找文档注释
+        let lines = vec![
+            "/// This is a doc comment",
+            "#[derive(Debug)]",
+            "pub struct Foo {}",
+        ];
+        assert!(has_doc_comment(&lines, 2));
+    }
+
+    #[test]
+    fn test_has_doc_comment_with_blank_lines() {
+        // 空行应被跳过
+        let lines = vec!["/// Doc comment", "", "", "pub fn foo() {}"];
+        assert!(has_doc_comment(&lines, 3));
+    }
+
+    #[test]
+    fn test_has_doc_comment_inner_doc() {
+        // //! 内部文档注释也应被识别
+        let lines = vec!["//! Module docs", "pub fn foo() {}"];
+        assert!(has_doc_comment(&lines, 1));
+    }
+
+    #[test]
+    fn test_has_doc_comment_first_line() {
+        // 第一行就是 pub 声明 — 没有前一行
+        let lines = vec!["pub fn foo() {}"];
+        assert!(!has_doc_comment(&lines, 0));
+    }
+
+    // ===== Session 115: validate_rust_code_quality_detailed 测试 =====
+
+    #[test]
+    fn test_validate_detailed_clean() {
+        let issues =
+            validate_rust_code_quality_detailed("fn main() { let x = 42; println!(\"{}\", x); }");
+        assert!(issues.is_empty(), "无禁止模式的代码不应报告问题");
+    }
+
+    #[test]
+    fn test_validate_detailed_unwrap() {
+        let issues = validate_rust_code_quality_detailed("fn foo() { let x = bar().unwrap(); }");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::Unwrap);
+        assert!(issues[0].suggestion.is_some());
+        assert!(issues[0].suggestion.as_ref().unwrap().contains("?"));
+    }
+
+    #[test]
+    fn test_validate_detailed_unsafe_block() {
+        let issues = validate_rust_code_quality_detailed("fn foo() { unsafe { let x = 42; } }");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::UnsafeBlock);
+        assert!(issues[0].suggestion.as_ref().unwrap().contains("SAFETY"));
+    }
+
+    #[test]
+    fn test_validate_detailed_unsafe_fn() {
+        let issues = validate_rust_code_quality_detailed("unsafe fn foo() -> i32 { 42 }");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::UnsafeFn);
+    }
+
+    #[test]
+    fn test_validate_detailed_unsafe_impl() {
+        let issues = validate_rust_code_quality_detailed("unsafe impl Send for MyType {}");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::UnsafeImpl);
+    }
+
+    #[test]
+    fn test_validate_detailed_missing_doc_pub_fn() {
+        let issues = validate_rust_code_quality_detailed("pub fn foo() {}");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::MissingDoc);
+        assert!(issues[0].message.contains("pub fn foo"));
+    }
+
+    #[test]
+    fn test_validate_detailed_missing_doc_pub_struct() {
+        let issues = validate_rust_code_quality_detailed("pub struct Foo { x: i32 }");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::MissingDoc);
+        assert!(issues[0].message.contains("pub struct Foo"));
+    }
+
+    #[test]
+    fn test_validate_detailed_has_doc_no_issue() {
+        // 有文档注释的公共 API 不应报告 MissingDoc
+        let code = "/// This is foo.\npub fn foo() {}";
+        let issues = validate_rust_code_quality_detailed(code);
+        let missing_doc_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingDoc)
+            .collect();
+        assert!(
+            missing_doc_issues.is_empty(),
+            "有文档注释不应报告 MissingDoc"
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_doc_with_attribute() {
+        // 文档注释和声明之间有属性 — 不应报告 MissingDoc
+        let code = "/// This is foo.\n#[derive(Debug)]\npub fn foo() {}";
+        let issues = validate_rust_code_quality_detailed(code);
+        let missing_doc_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingDoc)
+            .collect();
+        assert!(missing_doc_issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_detailed_pub_crate_no_missing_doc() {
+        // pub(crate) 不应报告 MissingDoc
+        let issues = validate_rust_code_quality_detailed("pub(crate) fn foo() {}");
+        let missing_doc_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingDoc)
+            .collect();
+        assert!(missing_doc_issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_detailed_pub_use_no_missing_doc() {
+        // pub use 不应报告 MissingDoc
+        let issues = validate_rust_code_quality_detailed("pub use std::collections::HashMap;");
+        let missing_doc_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingDoc)
+            .collect();
+        assert!(missing_doc_issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_detailed_allows_unsafe_in_test() {
+        // 测试模块中的 unsafe 不应报告
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_unsafe() {
+        unsafe { let x = 42; }
+    }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        let unsafe_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::UnsafeBlock)
+            .collect();
+        assert!(unsafe_issues.is_empty(), "测试模块中的 unsafe 不应报告");
+    }
+
+    #[test]
+    fn test_validate_detailed_allows_missing_doc_in_test() {
+        // 测试模块中的 pub fn 不应报告 MissingDoc
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    pub fn helper() {}
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        let missing_doc_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingDoc)
+            .collect();
+        assert!(missing_doc_issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_detailed_multiple_issue_types() {
+        // 同时包含 unwrap + unsafe + missing doc
+        let code = r#"
+pub fn foo() {
+    let x = bar().unwrap();
+    unsafe { let y = x; }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        // 应有 3 个问题: MissingDoc (pub fn foo) + Unwrap + UnsafeBlock
+        assert_eq!(issues.len(), 3, "应有 3 个问题, got: {:?}", issues);
+        assert!(issues.iter().any(|i| i.issue_type == IssueType::MissingDoc));
+        assert!(issues.iter().any(|i| i.issue_type == IssueType::Unwrap));
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::UnsafeBlock));
+    }
+
+    #[test]
+    fn test_validate_detailed_all_have_suggestions() {
+        // 所有问题都应有建议
+        let code = r#"
+pub fn foo() {
+    bar().unwrap();
+    panic!("oops");
+    unsafe { }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(!issues.is_empty());
+        for issue in &issues {
+            assert!(
+                issue.suggestion.is_some(),
+                "问题 {:?} 应有修复建议",
+                issue.issue_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_quality_backward_compat() {
+        // 验证 validate_rust_code_quality (字符串版) 与 detailed 版的一致性
+        let code = "fn foo() { bar().unwrap(); }";
+        let str_issues = validate_rust_code_quality(code);
+        let detailed_issues = validate_rust_code_quality_detailed(code);
+        assert_eq!(str_issues.len(), detailed_issues.len());
+        // 字符串版应包含行号和消息
+        assert!(str_issues[0].contains("行 1"));
+        assert!(str_issues[0].contains("unwrap"));
+        // 字符串版应包含建议
+        assert!(str_issues[0].contains("建议"));
+    }
+
+    // ===== Session 115: validate_rust_braces const generics 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_const_generic_struct() {
+        let code = "pub struct Foo<const N: usize> { data: [i32; N] }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const generic 结构体应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_generic_fn() {
+        let code = "fn foo<const N: usize>() { let arr = [0; N]; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const generic 函数应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_generic_impl() {
+        let code = "impl<const N: usize> Foo<N> for Bar { fn baz(&self) {} }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const generic impl 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_generic_trait() {
+        let code = r#"
+trait Foo: Sized {
+    fn bar<const N: usize>(&self) -> [i32; N];
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const generic trait 方法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_eval_block() {
+        // const 表达式中的 {} 块
+        let code = "const X: usize = { let x = 42; x + 1 };";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const 表达式中的块应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_attribute_with_string_brackets() {
+        // 属性中包含 {} 的字符串
+        let code = r#"
+#[doc = "this { has } brackets"]
+pub fn foo() {}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "属性字符串中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_where_clause() {
+        let code = r#"
+fn foo<T>(x: T) -> i32 where T: Sized {
+    42
+}
+"#;
+        assert!(validate_rust_braces(code).is_none(), "where 子句应通过验证");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_nested_generics() {
+        let code = "fn foo() { let x: Vec<HashMap<String, Vec<i32>>> = Vec::new(); }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "嵌套泛型应通过验证 (>> 不影响计数)"
+        );
     }
 }
