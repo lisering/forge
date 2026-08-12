@@ -41,6 +41,45 @@ fn make_cdp_response(node_count: usize) -> Value {
     json!({"result": {"axTree": nodes}})
 }
 
+/// 生成带 nodeId/parentId 的 CDP 响应 (树结构, 用于深度计算基准)
+fn make_tree_cdp_response(depth: usize, branching: usize) -> Value {
+    let mut nodes = Vec::new();
+    let mut next_id = 1usize;
+
+    // BFS 生成树
+    let mut current_level: Vec<usize> = vec![]; // node IDs at current level
+    for d in 0..depth {
+        let mut next_level = Vec::new();
+        let count = if d == 0 {
+            1 // 根节点
+        } else {
+            current_level.len() * branching
+        };
+        for _ in 0..count {
+            let node_id = next_id.to_string();
+            next_id += 1;
+            let parent_id = if d == 0 {
+                Value::Null
+            } else {
+                let parent = current_level[next_level.len() / branching];
+                json!(parent.to_string())
+            };
+            let role = if d == 0 { "WebArea" } else { "group" };
+            nodes.push(json!({
+                "nodeId": node_id,
+                "parentId": parent_id,
+                "role": {"value": role},
+                "name": {"value": format!("Node {}", next_id - 1)},
+                "backendDOMNodeId": next_id - 1,
+            }));
+            next_level.push(next_id - 1);
+        }
+        current_level = next_level;
+    }
+
+    json!({"result": {"axTree": nodes}})
+}
+
 // ============================================================================
 //  基准测试 1: role_classification
 // ============================================================================
@@ -449,6 +488,79 @@ fn bench_snapshot_to_text(c: &mut Criterion) {
 }
 
 // ============================================================================
+//  基准测试 6: depth_computation (Session 110)
+// ============================================================================
+
+fn bench_depth_computation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("depth_computation");
+
+    // 不同深度的线性链 (每层 1 个子节点)
+    for &depth in &[3usize, 5, 10, 50, 100] {
+        let response = make_tree_cdp_response(depth, 1);
+        group.bench_with_input(
+            BenchmarkId::new("linear_chain", depth),
+            &response,
+            |b, response| {
+                b.iter(|| {
+                    let snapshot = AxSnapshot::from_cdp_response(black_box(response));
+                    if !snapshot.nodes.is_empty() {
+                        let max_depth = snapshot.nodes.iter().map(|n| n.depth).max().unwrap();
+                        black_box(max_depth);
+                    }
+                    black_box(snapshot);
+                })
+            },
+        );
+    }
+
+    // 分支树 (3 层 × 3 分支 = 40 节点)
+    let tree_response = make_tree_cdp_response(3, 3);
+    group.bench_function("tree_3x3", |b| {
+        b.iter(|| {
+            let snapshot = AxSnapshot::from_cdp_response(black_box(&tree_response));
+            black_box(snapshot);
+        })
+    });
+
+    // 分支树 (4 层 × 2 分支 = 31 节点)
+    let tree_4x2 = make_tree_cdp_response(4, 2);
+    group.bench_function("tree_4x2", |b| {
+        b.iter(|| {
+            let snapshot = AxSnapshot::from_cdp_response(black_box(&tree_4x2));
+            black_box(snapshot);
+        })
+    });
+
+    // 无 nodeId/parentId 的响应 (向后兼容)
+    let flat_response = make_cdp_response(100);
+    group.bench_function("flat_no_parent_ids_100", |b| {
+        b.iter(|| {
+            let snapshot = AxSnapshot::from_cdp_response(black_box(&flat_response));
+            let all_zero = snapshot.nodes.iter().all(|n| n.depth == 0);
+            black_box(all_zero);
+            black_box(snapshot);
+        })
+    });
+
+    // 孤儿节点 (parentId 指向不存在的节点)
+    let orphan_response = json!({
+        "result": {
+            "axTree": [
+                {"nodeId": "1", "parentId": "999", "role": {"value": "button"}, "name": {"value": "Orphan"}, "backendDOMNodeId": 1}
+            ]
+        }
+    });
+    group.bench_function("orphan_parent", |b| {
+        b.iter(|| {
+            let snapshot = AxSnapshot::from_cdp_response(black_box(&orphan_response));
+            black_box(snapshot);
+        })
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 //  配置 & 入口
 // ============================================================================
 
@@ -470,6 +582,7 @@ criterion_group! {
         bench_snapshot_from_cdp,
         bench_snapshot_queries,
         bench_snapshot_to_text,
+        bench_depth_computation,
 }
 
 criterion_main!(ax_snapshot_benches);

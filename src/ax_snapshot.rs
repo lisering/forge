@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// 交互式角色 — 可以点击/输入的元素
 pub const INTERACTIVE_ROLES: &[&str] = &[
@@ -143,24 +145,24 @@ impl AxNode {
     }
 
     /// 是否为交互式元素
+    ///
+    /// 委托给 [`is_interactive_role`] (HashSet O(1) 查找)。
     pub fn is_interactive(&self) -> bool {
-        INTERACTIVE_ROLES
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&self.role))
+        is_interactive_role(&self.role)
     }
 
     /// 是否为内容元素
+    ///
+    /// 委托给 [`is_content_role`] (HashSet O(1) 查找)。
     pub fn is_content(&self) -> bool {
-        CONTENT_ROLES
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&self.role))
+        is_content_role(&self.role)
     }
 
     /// 是否为结构元素
+    ///
+    /// 委托给 [`is_structural_role`] (HashSet O(1) 查找)。
     pub fn is_structural(&self) -> bool {
-        STRUCTURAL_ROLES
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&self.role))
+        is_structural_role(&self.role)
     }
 
     /// 是否有引用 ID (可操作)
@@ -195,21 +197,67 @@ pub struct AxSnapshot {
 
 impl AxSnapshot {
     /// 从 CDP `Accessibility.getFullAXTree` 响应构建快照
+    ///
+    /// 解析所有 AX 节点并构建父子关系:
+    /// - 利用 `nodeId`/`parentId` 字段计算 `depth`、`parent_idx`、`children`
+    /// - 单次遍历解析 + 单次遍历计算深度 + 单次遍历填充 children = O(N) 总复杂度
+    /// - CDP AX 树通常按前序排列 (父节点在子节点前), 深度计算依赖此顺序
     pub fn from_cdp_response(response: &Value) -> Self {
         let mut nodes = Vec::new();
         let mut ref_map = std::collections::HashMap::new();
+
+        // nodeId → 节点索引 映射 (用于父子关系建立)
+        let mut node_id_map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // 每个节点的 parent_node_id (按索引存储)
+        let mut parent_ids: Vec<Option<String>> = Vec::new();
 
         if let Some(axes) = response
             .get("result")
             .and_then(|r| r.get("axTree"))
             .and_then(|t| t.as_array())
         {
+            // 第一遍: 解析所有节点, 构建 nodeId→index 映射, 记录 parentId
             for (idx, ax_value) in axes.iter().enumerate() {
                 let node = parse_ax_node(ax_value, idx);
+
+                // 解析 nodeId 和 parentId (CDP AX Tree 字段)
+                let node_id = ax_value.get("nodeId").and_then(|v| v.as_str());
+                let parent_id = ax_value
+                    .get("parentId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(nid) = node_id {
+                    node_id_map.insert(nid.to_string(), idx);
+                }
+                parent_ids.push(parent_id);
+
                 if let Some(ref_id) = &node.ref_id {
                     ref_map.insert(ref_id.clone(), idx);
                 }
                 nodes.push(node);
+            }
+
+            // 第二遍: 计算 depth 和 parent_idx (依赖前序排列: 父节点 depth 已计算)
+            for (idx, parent_id) in parent_ids.iter().enumerate() {
+                if let Some(pid) = parent_id {
+                    if let Some(&parent_idx) = node_id_map.get(pid) {
+                        let parent_depth = nodes[parent_idx].depth;
+                        nodes[idx].depth = parent_depth + 1;
+                        nodes[idx].parent_idx = Some(parent_idx);
+                    }
+                }
+                // 无 parentId 或 parentId 未找到 → depth 保持 0 (根节点)
+            }
+
+            // 第三遍: 填充 children 列表 (分离以避免借用冲突)
+            for (idx, parent_id) in parent_ids.iter().enumerate() {
+                if let Some(pid) = parent_id {
+                    if let Some(&parent_idx) = node_id_map.get(pid) {
+                        nodes[parent_idx].children.push(idx);
+                    }
+                }
             }
         }
 
@@ -393,29 +441,102 @@ pub fn build_snapshot_js() -> String {
 }
 
 // ============================================================================
-//  纯函数 — 角色分类和匹配
+//  纯函数 — 角色分类和匹配 (HashSet O(1) 查找)
 // ============================================================================
 
+/// 交互式角色 HashSet (惰性初始化, 小写存储用于大小写无关查找)
+static INTERACTIVE_ROLES_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+/// 内容角色 HashSet (惰性初始化, 小写存储)
+static CONTENT_ROLES_SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+
+/// 结构角色 HashSet (惰性初始化, 运行时小写化存储, 因 STRUCTURAL_ROLES 含大写)
+static STRUCTURAL_ROLES_SET: OnceLock<HashSet<String>> = OnceLock::new();
+
+/// 获取交互式角色 HashSet, 首次调用时初始化
+fn interactive_roles_set() -> &'static HashSet<&'static str> {
+    INTERACTIVE_ROLES_SET.get_or_init(|| INTERACTIVE_ROLES.iter().copied().collect::<HashSet<_>>())
+}
+
+/// 获取内容角色 HashSet, 首次调用时初始化
+fn content_roles_set() -> &'static HashSet<&'static str> {
+    CONTENT_ROLES_SET.get_or_init(|| CONTENT_ROLES.iter().copied().collect::<HashSet<_>>())
+}
+
+/// 获取结构角色 HashSet, 首次调用时初始化
+///
+/// STRUCTURAL_ROLES 含大写条目 ("WebArea", "RootWebArea"),
+/// 需运行时小写化后存入 HashSet<String>, 查找时也用小写。
+fn structural_roles_set() -> &'static HashSet<String> {
+    STRUCTURAL_ROLES_SET.get_or_init(|| {
+        STRUCTURAL_ROLES
+            .iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect()
+    })
+}
+
 /// 判断角色是否为交互式
+///
+/// 使用 HashSet O(1) 查找替代线性扫描 O(R)。
+/// 大小写无关: 将输入转为 ASCII 小写后查找。
+///
+/// # 示例
+///
+/// ```
+/// use forge::ax_snapshot::is_interactive_role;
+/// assert!(is_interactive_role("button"));
+/// assert!(is_interactive_role("BUTTON")); // 大小写无关
+/// assert!(!is_interactive_role("heading"));
+/// ```
 pub fn is_interactive_role(role: &str) -> bool {
-    INTERACTIVE_ROLES
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(role))
+    interactive_roles_set().contains(role.to_ascii_lowercase().as_str())
 }
 
 /// 判断角色是否为内容
+///
+/// 使用 HashSet O(1) 查找替代线性扫描 O(R)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::ax_snapshot::is_content_role;
+/// assert!(is_content_role("heading"));
+/// assert!(is_content_role("HEADING")); // 大小写无关
+/// assert!(!is_content_role("button"));
+/// ```
 pub fn is_content_role(role: &str) -> bool {
-    CONTENT_ROLES.iter().any(|r| r.eq_ignore_ascii_case(role))
+    content_roles_set().contains(role.to_ascii_lowercase().as_str())
 }
 
 /// 判断角色是否为结构
+///
+/// 使用 HashSet O(1) 查找替代线性扫描 O(R)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::ax_snapshot::is_structural_role;
+/// assert!(is_structural_role("group"));
+/// assert!(is_structural_role("GROUP")); // 大小写无关
+/// assert!(!is_structural_role("button"));
+/// ```
 pub fn is_structural_role(role: &str) -> bool {
-    STRUCTURAL_ROLES
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(role))
+    structural_roles_set().contains(role.to_ascii_lowercase().as_str())
 }
 
 /// 判断角色是否已知 (在三个列表之一中)
+///
+/// 使用 HashSet O(1) 查找, 短路返回。
+///
+/// # 示例
+///
+/// ```
+/// use forge::ax_snapshot::is_known_role;
+/// assert!(is_known_role("button"));
+/// assert!(is_known_role("heading"));
+/// assert!(!is_known_role("unknown_role"));
+/// ```
 pub fn is_known_role(role: &str) -> bool {
     is_interactive_role(role) || is_content_role(role) || is_structural_role(role)
 }
@@ -684,5 +805,223 @@ mod tests {
     fn test_build_snapshot_js_returns_json() {
         let js = build_snapshot_js();
         assert!(js.contains("JSON.stringify"));
+    }
+
+    // ===== 深度计算测试 (Session 110) =====
+
+    #[test]
+    fn test_snapshot_depth_computation() {
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "role": {"value": "WebArea"}, "name": {"value": "Root"}},
+                    {"nodeId": "2", "parentId": "1", "role": {"value": "group"}, "name": {"value": "Container"}},
+                    {"nodeId": "3", "parentId": "2", "role": {"value": "button"}, "name": {"value": "Deep"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        assert_eq!(snapshot.nodes[0].depth, 0); // 根节点
+        assert_eq!(snapshot.nodes[1].depth, 1); // 第一层
+        assert_eq!(snapshot.nodes[2].depth, 2); // 第二层
+    }
+
+    #[test]
+    fn test_snapshot_depth_root_nodes() {
+        // 无 parentId 的节点都是根节点, depth = 0
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "role": {"value": "WebArea"}, "name": {"value": "A"}},
+                    {"nodeId": "2", "role": {"value": "WebArea"}, "name": {"value": "B"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        assert_eq!(snapshot.nodes[0].depth, 0);
+        assert_eq!(snapshot.nodes[1].depth, 0);
+    }
+
+    #[test]
+    fn test_snapshot_depth_no_node_ids() {
+        // 无 nodeId/parentId 的响应 (向后兼容), 所有 depth = 0
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"role": {"value": "button"}, "name": {"value": "A"}, "backendDOMNodeId": 1},
+                    {"role": {"value": "textbox"}, "name": {"value": "B"}, "backendDOMNodeId": 2}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        assert_eq!(snapshot.nodes[0].depth, 0);
+        assert_eq!(snapshot.nodes[1].depth, 0);
+    }
+
+    #[test]
+    fn test_snapshot_parent_idx_computation() {
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "role": {"value": "WebArea"}, "name": {"value": "Root"}},
+                    {"nodeId": "2", "parentId": "1", "role": {"value": "button"}, "name": {"value": "Child"}},
+                    {"nodeId": "3", "parentId": "1", "role": {"value": "link"}, "name": {"value": "Sibling"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        assert!(snapshot.nodes[0].parent_idx.is_none()); // 根节点无父
+        assert_eq!(snapshot.nodes[1].parent_idx, Some(0));
+        assert_eq!(snapshot.nodes[2].parent_idx, Some(0));
+    }
+
+    #[test]
+    fn test_snapshot_children_population() {
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "role": {"value": "WebArea"}, "name": {"value": "Root"}},
+                    {"nodeId": "2", "parentId": "1", "role": {"value": "button"}, "name": {"value": "A"}},
+                    {"nodeId": "3", "parentId": "1", "role": {"value": "link"}, "name": {"value": "B"}},
+                    {"nodeId": "4", "parentId": "2", "role": {"value": "textbox"}, "name": {"value": "C"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        // 根节点有两个子节点
+        assert_eq!(snapshot.nodes[0].children, vec![1, 2]);
+        // 节点 1 (index=1) 有一个子节点
+        assert_eq!(snapshot.nodes[1].children, vec![3]);
+        // 叶子节点无子节点
+        assert!(snapshot.nodes[2].children.is_empty());
+        assert!(snapshot.nodes[3].children.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_depth_deep_nesting() {
+        // 5 层嵌套
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "role": {"value": "WebArea"}, "name": {"value": "L0"}},
+                    {"nodeId": "2", "parentId": "1", "role": {"value": "group"}, "name": {"value": "L1"}},
+                    {"nodeId": "3", "parentId": "2", "role": {"value": "group"}, "name": {"value": "L2"}},
+                    {"nodeId": "4", "parentId": "3", "role": {"value": "group"}, "name": {"value": "L3"}},
+                    {"nodeId": "5", "parentId": "4", "role": {"value": "button"}, "name": {"value": "L4"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        for (i, node) in snapshot.nodes.iter().enumerate() {
+            assert_eq!(node.depth, i, "Node {} should have depth {}", i, i);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_depth_orphan_parent() {
+        // parentId 指向不存在的节点 → depth 保持 0
+        let response = json!({
+            "result": {
+                "axTree": [
+                    {"nodeId": "1", "parentId": "999", "role": {"value": "button"}, "name": {"value": "Orphan"}}
+                ]
+            }
+        });
+
+        let snapshot = AxSnapshot::from_cdp_response(&response);
+        assert_eq!(snapshot.nodes[0].depth, 0);
+        assert!(snapshot.nodes[0].parent_idx.is_none());
+    }
+
+    // ===== HashSet 角色查找测试 (Session 110) =====
+
+    #[test]
+    fn test_is_structural_role_webarea_case_insensitive() {
+        // WebArea 和 RootWebArea 含大写, 需要正确处理大小写无关查找
+        assert!(is_structural_role("WebArea"));
+        assert!(is_structural_role("webarea"));
+        assert!(is_structural_role("WEBAREA"));
+        assert!(is_structural_role("RootWebArea"));
+        assert!(is_structural_role("rootwebarea"));
+        assert!(is_structural_role("ROOTWEBAREA"));
+    }
+
+    #[test]
+    fn test_is_known_role_all_structural_with_uppercase() {
+        assert!(is_known_role("WebArea"));
+        assert!(is_known_role("RootWebArea"));
+        assert!(is_known_role("webarea"));
+        assert!(is_known_role("rootwebarea"));
+    }
+
+    #[test]
+    fn test_ax_node_is_structural_webarea() {
+        let mut node = AxNode::empty();
+        node.role = "WebArea".to_string();
+        assert!(node.is_structural());
+
+        node.role = "webarea".to_string();
+        assert!(node.is_structural());
+
+        node.role = "ROOTWEBAREA".to_string();
+        assert!(node.is_structural());
+    }
+
+    #[test]
+    fn test_role_classification_consistency() {
+        // 确保所有已知角色都能被正确识别 (回归测试)
+        for &role in INTERACTIVE_ROLES {
+            assert!(
+                is_interactive_role(role),
+                "Failed: {} should be interactive",
+                role
+            );
+            assert!(
+                !is_content_role(role),
+                "Failed: {} should not be content",
+                role
+            );
+            assert!(
+                !is_structural_role(role),
+                "Failed: {} should not be structural",
+                role
+            );
+        }
+        for &role in CONTENT_ROLES {
+            assert!(
+                !is_interactive_role(role),
+                "Failed: {} should not be interactive",
+                role
+            );
+            assert!(is_content_role(role), "Failed: {} should be content", role);
+            assert!(
+                !is_structural_role(role),
+                "Failed: {} should not be structural",
+                role
+            );
+        }
+        for &role in STRUCTURAL_ROLES {
+            assert!(
+                !is_interactive_role(role),
+                "Failed: {} should not be interactive",
+                role
+            );
+            assert!(
+                !is_content_role(role),
+                "Failed: {} should not be content",
+                role
+            );
+            assert!(
+                is_structural_role(role),
+                "Failed: {} should be structural",
+                role
+            );
+        }
     }
 }
