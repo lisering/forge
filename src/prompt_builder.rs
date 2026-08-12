@@ -86,9 +86,9 @@ impl SystemPrompt {
         prompt.push_str("❌ 禁止: 在单元测试中访问真实的外部依赖\n");
         prompt.push_str("❌ 禁止: 大括号/圆括号/方括号不配对 (最常见的 AI 代码生成错误)\n");
         prompt.push_str("❌ 禁止: 使用 todo!()/unimplemented!()/panic!() (非测试代码)\n");
-        prompt.push_str(
-            "❌ 禁止: 使用 unsafe 块/函数/实现 (非必要不使用, 必须时添加 SAFETY 注释)\n\n",
-        );
+        prompt
+            .push_str("❌ 禁止: 使用 unsafe 块/函数/实现 (非必要不使用, 必须时添加 SAFETY 注释)\n");
+        prompt.push_str("❌ 禁止: 使用 unreachable!() 宏 (非测试代码)\n\n");
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -97,7 +97,8 @@ impl SystemPrompt {
         prompt.push_str("✅ 必须: 代码零警告、零 clippy 警告\n");
         prompt.push_str("✅ 必须: 使用 trait 抽象外部依赖，支持无 Chrome 环境测试\n");
         prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n");
-        prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n\n");
+        prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n");
+        prompt.push_str("✅ 必须: 返回 Result/Option/bool 的公共函数添加 #[must_use] 属性\n\n");
 
         prompt.push_str("📎 附件内容 (必须逐条执行):\n");
         prompt.push_str("  1. 前沿技术要求 — 使用最新最前沿的技术\n");
@@ -276,6 +277,30 @@ mod tests {
         assert!(
             prompt.contains("pub fn/struct/enum/trait"),
             "系统 prompt 应明确列出需要文档注释的公共 API 类型"
+        );
+    }
+
+    // ===== Session 116: unreachable!() + #[must_use] 要求测试 =====
+
+    #[test]
+    fn test_build_contains_unreachable_warning() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("unreachable!()"),
+            "系统 prompt 应包含 unreachable!() 禁止项"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_must_use_requirement() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("#[must_use]"),
+            "系统 prompt 应包含 #[must_use] 属性要求"
+        );
+        assert!(
+            prompt.contains("Result/Option/bool"),
+            "系统 prompt 应明确列出需要 #[must_use] 的返回类型"
         );
     }
 }

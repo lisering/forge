@@ -658,6 +658,10 @@ pub enum IssueType {
     UnsafeImpl,
     /// 公共 API 缺少 `///` 文档注释
     MissingDoc,
+    /// 使用 `unreachable!()` 宏 — 不应假设代码不可达 (Session 116)
+    Unreachable,
+    /// 公共函数返回 `Result`/`Option`/`bool` 缺少 `#[must_use]` 属性 (Session 116)
+    MissingMustUse,
 }
 
 /// 代码质量问题 — 包含行号、类型、消息和自动修复建议 (Session 115)
@@ -686,7 +690,46 @@ pub struct QualityIssue {
     pub suggestion: Option<String>,
 }
 
-/// 检测行中是否包含 `unsafe` 关键字 (不是标识符的一部分) (Session 115)
+/// 移除字符串字面量内容, 保留引号标记 (Session 116)
+///
+/// 用于避免字符串中的 `unsafe` 等关键字误报。
+/// 仅处理普通双引号字符串 (含转义), 不处理 raw string (r#"..."#)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::strip_string_content;
+///
+/// assert_eq!(strip_string_content("let s = \"unsafe { }\";"), "let s = \"\";");
+/// assert_eq!(strip_string_content("unsafe { x }"), "unsafe { x }");
+/// ```
+pub fn strip_string_content(line: &str) -> String {
+    let mut result = String::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for c in line.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            result.push('"');
+            continue;
+        }
+        if !in_string {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 检测行中是否包含 `unsafe` 关键字 (不是标识符的一部分) (Session 115, Session 116 增强)
 ///
 /// 返回 unsafe 的类型: `"block"` / `"fn"` / `"impl"`, 或 `None`。
 ///
@@ -698,12 +741,16 @@ pub struct QualityIssue {
 /// - `unsafe_value` → `None` (标识符的一部分)
 /// - `is_unsafe = true` → `None` (标识符的一部分)
 /// - `// unsafe` → `None` (注释)
+/// - `"unsafe { }"` → `None` (字符串内容, Session 116)
 fn detect_unsafe_keyword(line: &str) -> Option<&'static str> {
     let code_part = if let Some(pos) = line.find("//") {
         &line[..pos]
     } else {
         line
     };
+    // Session 116: 移除字符串内容, 避免字符串中的 unsafe 误报
+    let stripped = strip_string_content(code_part);
+    let code_part = stripped.as_str();
 
     let mut search_start = 0;
     while let Some(pos) = code_part[search_start..].find("unsafe") {
@@ -862,12 +909,60 @@ fn has_doc_comment(lines: &[&str], line_num: usize) -> bool {
     false
 }
 
-/// 验证 Rust 代码质量 — 详细版, 返回结构化问题列表 (Session 115)
+/// 检查函数签名是否返回需要 `#[must_use]` 的类型 (Session 116)
+///
+/// 检测返回 `Result`、`Option`、`bool` 等不应被忽略的类型的公共函数。
+/// 仅检查同一行内包含 `->` 的函数签名。
+fn returns_must_use_type(line: &str) -> bool {
+    // 必须包含 fn 关键字和返回类型箭头
+    if !line.contains("fn ") {
+        return false;
+    }
+    let Some(arrow_pos) = line.find("->") else {
+        return false;
+    };
+    let return_part = &line[arrow_pos + 2..];
+    let return_type = return_part.trim();
+    return_type.starts_with("Result")
+        || return_type.starts_with("Option")
+        || return_type.starts_with("bool")
+        || return_type.starts_with("impl Iterator")
+        || return_type.starts_with("impl IntoIterator")
+}
+
+/// 检查函数声明前是否有 `#[must_use]` 属性 (Session 116)
+///
+/// 从当前行向上查找, 跳过空行、文档注释和其他属性, 检查是否有 `#[must_use]`。
+fn has_must_use_attribute(lines: &[&str], line_num: usize) -> bool {
+    let mut i = line_num;
+    while i > 0 {
+        i -= 1;
+        let prev = lines[i].trim();
+        if prev.is_empty() {
+            continue;
+        }
+        if prev.starts_with("#[must_use") {
+            return true;
+        }
+        // 其他属性和文档注释 — 继续向上查找
+        if prev.starts_with("#[") || prev.starts_with("///") || prev.starts_with("//!") {
+            continue;
+        }
+        // 非属性、非文档行 — 停止查找
+        return false;
+    }
+    false
+}
+
+/// 验证 Rust 代码质量 — 详细版, 返回结构化问题列表 (Session 115, Session 116 增强)
 ///
 /// 在 `validate_rust_code_quality` 的基础上, 新增:
 /// - `unsafe` 块/函数/实现检测
 /// - 公共 API (`pub fn`/`pub struct`/`pub enum`/`pub trait`/`pub mod`) 缺少文档注释检测
 /// - 每个问题的自动修复建议
+/// - `unreachable!()` 宏检测 (Session 116)
+/// - 公共函数返回 `Result`/`Option`/`bool` 缺少 `#[must_use]` 属性检测 (Session 116)
+/// - `unsafe` 在字符串中的误报排除 (Session 116)
 ///
 /// # 示例
 ///
@@ -1034,10 +1129,163 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                     )),
                 });
             }
+
+            // Session 116: 检查 unreachable!() 宏
+            if contains_pattern_outside_comment(trimmed, "unreachable!()")
+                || contains_pattern_outside_comment(trimmed, "unreachable!(")
+            {
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::Unreachable,
+                    message: "使用 unreachable!() 宏 — 不应假设代码不可达".to_string(),
+                    suggestion: Some(
+                        "返回 `Result` 类型: `Err(anyhow!(\"不应到达此处\"))` 或使用 `match` 处理所有分支"
+                            .to_string(),
+                    ),
+                });
+            }
+
+            // Session 116: 检查公共函数返回 Result/Option/bool 缺少 #[must_use]
+            if is_public_api_declaration(trimmed)
+                && returns_must_use_type(trimmed)
+                && !has_must_use_attribute(&lines, line_num)
+            {
+                let item_desc = extract_public_item_type(trimmed);
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::MissingMustUse,
+                    message: format!(
+                        "公共函数 `{}` 返回 Result/Option/bool 但缺少 #[must_use] 属性",
+                        item_desc
+                    ),
+                    suggestion: Some(format!(
+                        "在 `{}` 上方添加 `#[must_use]` 属性, 确保调用者不会忽略返回值",
+                        item_desc
+                    )),
+                });
+            }
         }
     }
 
     issues
+}
+
+/// 为质量问题生成自动修复代码 (Session 116)
+///
+/// 接收 `QualityIssue` 和原始行内容, 返回修复后的行内容 (如果有自动修复)。
+///
+/// # 支持的自动修复
+///
+/// - `Unwrap`: `.unwrap()` → `?`
+/// - `Expect`: `.expect("...")` → `?`
+/// - `Todo`: `todo!()` → `Err(anyhow!("未实现"))`
+/// - `Unimplemented`: `unimplemented!()` → `Err(anyhow!("未实现"))`
+/// - `Panic`: `panic!("msg")` → `return Err(anyhow!("msg"))`
+/// - `Unreachable`: `unreachable!()` → `return Err(anyhow!("不应到达此处"))`
+/// - `UnsafeBlock`/`UnsafeFn`/`UnsafeImpl`: 添加 `// SAFETY:` 注释
+/// - `MissingDoc`: 添加 `/// TODO:` 文档注释占位符
+/// - `MissingMustUse`: 添加 `#[must_use]` 属性
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{generate_fix, IssueType, QualityIssue};
+///
+/// let issue = QualityIssue {
+///     line: 1,
+///     issue_type: IssueType::Unwrap,
+///     message: "使用 .unwrap()".to_string(),
+///     suggestion: None,
+/// };
+/// let original = "let x = foo().unwrap();";
+/// let fixed = generate_fix(&issue, original);
+/// assert!(fixed.is_some());
+/// assert!(fixed.unwrap().contains('?'));
+/// ```
+pub fn generate_fix(issue: &QualityIssue, original_line: &str) -> Option<String> {
+    match issue.issue_type {
+        IssueType::Unwrap => {
+            if original_line.contains(".unwrap()") {
+                Some(original_line.replace(".unwrap()", "?"))
+            } else {
+                None
+            }
+        }
+        IssueType::Expect => {
+            if let Some(start) = original_line.find(".expect(") {
+                let rest = &original_line[start..];
+                if let Some(close) = rest.find(')') {
+                    let before = &original_line[..start];
+                    let after = &original_line[start + close + 1..];
+                    Some(format!("{}?{}", before, after))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        IssueType::Todo => {
+            if original_line.contains("todo!()") {
+                Some(original_line.replace("todo!()", r#"Err(anyhow!("未实现"))"#))
+            } else if original_line.contains("todo!(") {
+                Some(original_line.replace("todo!(", "Err(anyhow!("))
+            } else {
+                None
+            }
+        }
+        IssueType::Unimplemented => {
+            if original_line.contains("unimplemented!()") {
+                Some(original_line.replace("unimplemented!()", r#"Err(anyhow!("未实现"))"#))
+            } else if original_line.contains("unimplemented!(") {
+                Some(original_line.replace("unimplemented!(", "Err(anyhow!("))
+            } else {
+                None
+            }
+        }
+        IssueType::Panic => {
+            if original_line.contains("panic!()") {
+                Some(original_line.replace("panic!()", r#"return Err(anyhow!("panic"))"#))
+            } else if original_line.contains("panic!(") {
+                Some(original_line.replace("panic!(", "return Err(anyhow!("))
+            } else {
+                None
+            }
+        }
+        IssueType::Unreachable => {
+            if original_line.contains("unreachable!()") {
+                Some(
+                    original_line
+                        .replace("unreachable!()", r#"return Err(anyhow!("不应到达此处"))"#),
+                )
+            } else if original_line.contains("unreachable!(") {
+                Some(original_line.replace("unreachable!(", "return Err(anyhow!("))
+            } else {
+                None
+            }
+        }
+        IssueType::UnsafeBlock | IssueType::UnsafeFn | IssueType::UnsafeImpl => {
+            let indent_len = original_line.len() - original_line.trim_start().len();
+            let indent_str = &original_line[..indent_len];
+            Some(format!(
+                "{}// SAFETY: 需要说明为何此 unsafe 操作是安全的\n{}",
+                indent_str, original_line
+            ))
+        }
+        IssueType::MissingDoc => {
+            let indent_len = original_line.len() - original_line.trim_start().len();
+            let indent_str = &original_line[..indent_len];
+            Some(format!(
+                "{}/// TODO: 添加文档注释\n{}",
+                indent_str, original_line
+            ))
+        }
+        IssueType::MissingMustUse => {
+            let indent_len = original_line.len() - original_line.trim_start().len();
+            let indent_str = &original_line[..indent_len];
+            Some(format!("{}#[must_use]\n{}", indent_str, original_line))
+        }
+    }
 }
 
 fn guess_language_from_path(path: &str) -> String {
@@ -2538,5 +2786,515 @@ fn foo<T>(x: T) -> i32 where T: Sized {
             validate_rust_braces(code).is_none(),
             "嵌套泛型应通过验证 (>> 不影响计数)"
         );
+    }
+
+    // ===== Session 116: strip_string_content 测试 =====
+
+    #[test]
+    fn test_strip_string_content_basic() {
+        assert_eq!(
+            strip_string_content(r#"let s = "unsafe { }";"#),
+            r#"let s = "";"#
+        );
+        assert_eq!(
+            strip_string_content(r#"let s = "hello world";"#),
+            r#"let s = "";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_with_escape() {
+        // 转义引号不影响字符串结束判断
+        assert_eq!(
+            strip_string_content(r#"let s = "he said \"hello\"";"#),
+            r#"let s = "";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_no_strings() {
+        assert_eq!(
+            strip_string_content("fn foo() { let x = 42; }"),
+            "fn foo() { let x = 42; }"
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_multiple_strings() {
+        assert_eq!(
+            strip_string_content(r#"let a = "first"; let b = "second";"#),
+            r#"let a = ""; let b = "";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_unterminated() {
+        // 未终止字符串 — 全部当作字符串内容
+        let result = strip_string_content(r#"let s = "unterminated"#);
+        assert!(result.starts_with("let s = \""));
+    }
+
+    // ===== Session 116: detect_unsafe_keyword 字符串感知测试 =====
+
+    #[test]
+    fn test_detect_unsafe_keyword_in_string_no_false_positive() {
+        // 字符串中的 unsafe 不应匹配
+        assert_eq!(
+            detect_unsafe_keyword(r#"let s = "unsafe { } block";"#),
+            None
+        );
+        assert_eq!(
+            detect_unsafe_keyword(r#"let msg = "unsafe fn not_real";"#),
+            None
+        );
+        assert_eq!(
+            detect_unsafe_keyword(r#"let desc = "unsafe impl Send";"#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_real_unsafe_still_detected() {
+        // 真正的 unsafe 仍应被检测到
+        assert_eq!(
+            detect_unsafe_keyword("unsafe { let x = 42; }"),
+            Some("block")
+        );
+        assert_eq!(
+            detect_unsafe_keyword("unsafe fn foo() -> i32 { 42 }"),
+            Some("fn")
+        );
+    }
+
+    #[test]
+    fn test_detect_unsafe_keyword_mixed_string_and_code() {
+        // 同一行有字符串和真正的 unsafe
+        assert_eq!(
+            detect_unsafe_keyword(r#"let s = "safe"; unsafe { let x = 42; }"#),
+            Some("block")
+        );
+    }
+
+    // ===== Session 116: returns_must_use_type 测试 =====
+
+    #[test]
+    fn test_returns_must_use_type_result() {
+        assert!(returns_must_use_type(
+            "pub fn foo() -> Result<i32, String> {"
+        ));
+        assert!(returns_must_use_type(
+            "pub async fn bar() -> Result<(), Error> {"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_option() {
+        assert!(returns_must_use_type("pub fn foo() -> Option<i32> {"));
+        assert!(returns_must_use_type("fn bar() -> Option<String> {"));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_bool() {
+        assert!(returns_must_use_type("pub fn is_valid() -> bool {"));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_not_matching() {
+        assert!(!returns_must_use_type("pub fn foo() -> i32 {"));
+        assert!(!returns_must_use_type("pub fn foo() -> String {"));
+        assert!(!returns_must_use_type("pub fn foo() {}"));
+        assert!(!returns_must_use_type("pub struct Foo {"));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_impl_iterator() {
+        assert!(returns_must_use_type(
+            "pub fn iter() -> impl Iterator<Item = i32> {"
+        ));
+    }
+
+    // ===== Session 116: has_must_use_attribute 测试 =====
+
+    #[test]
+    fn test_has_must_use_attribute_present() {
+        let lines = vec!["#[must_use]", "pub fn foo() -> bool { true }"];
+        assert!(has_must_use_attribute(&lines, 1));
+    }
+
+    #[test]
+    fn test_has_must_use_attribute_absent() {
+        let lines = vec!["/// doc comment", "pub fn foo() -> bool { true }"];
+        assert!(!has_must_use_attribute(&lines, 1));
+    }
+
+    #[test]
+    fn test_has_must_use_attribute_with_other_attributes() {
+        // #[must_use] 在其他属性之间
+        let lines = vec![
+            "/// doc comment",
+            "#[derive(Debug)]",
+            "#[must_use]",
+            "pub fn foo() -> bool { true }",
+        ];
+        assert!(has_must_use_attribute(&lines, 3));
+    }
+
+    #[test]
+    fn test_has_must_use_attribute_with_blank_lines() {
+        let lines = vec!["#[must_use]", "", "pub fn foo() -> bool { true }"];
+        assert!(has_must_use_attribute(&lines, 2));
+    }
+
+    #[test]
+    fn test_has_must_use_attribute_first_line() {
+        let lines = vec!["pub fn foo() -> bool { true }"];
+        assert!(!has_must_use_attribute(&lines, 0));
+    }
+
+    // ===== Session 116: validate_rust_code_quality_detailed 新增检测测试 =====
+
+    #[test]
+    fn test_validate_detailed_unreachable() {
+        let issues = validate_rust_code_quality_detailed("fn foo() -> i32 { unreachable!() }");
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::Unreachable);
+        assert!(issues[0].suggestion.is_some());
+    }
+
+    #[test]
+    fn test_validate_detailed_unreachable_with_message() {
+        let issues =
+            validate_rust_code_quality_detailed(r#"fn foo() { unreachable!("not here"); }"#);
+        assert!(!issues.is_empty());
+        assert_eq!(issues[0].issue_type, IssueType::Unreachable);
+    }
+
+    #[test]
+    fn test_validate_detailed_missing_must_use_result() {
+        let code = "/// Doc.\npub fn foo() -> Result<i32, String> { Ok(42) }";
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "应检测到缺少 #[must_use], got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_missing_must_use_option() {
+        let code = "/// Doc.\npub fn find() -> Option<i32> { Some(42) }";
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "应检测到缺少 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_missing_must_use_bool() {
+        let code = "/// Doc.\npub fn is_valid() -> bool { true }";
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "应检测到缺少 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_has_must_use_no_issue() {
+        let code = "/// Doc.\n#[must_use]\npub fn foo() -> Result<i32, String> { Ok(42) }";
+        let issues = validate_rust_code_quality_detailed(code);
+        let must_use_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingMustUse)
+            .collect();
+        assert!(
+            must_use_issues.is_empty(),
+            "有 #[must_use] 不应报告 MissingMustUse"
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_must_use_not_required_for_int() {
+        // 返回 i32 的函数不需要 #[must_use]
+        let code = "/// Doc.\npub fn foo() -> i32 { 42 }";
+        let issues = validate_rust_code_quality_detailed(code);
+        let must_use_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::MissingMustUse)
+            .collect();
+        assert!(must_use_issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_detailed_unsafe_in_string_no_false_positive() {
+        // 字符串中的 unsafe 不应误报
+        let code = r#"fn foo() { let s = "unsafe { } block"; }"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        let unsafe_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.issue_type == IssueType::UnsafeBlock
+                    || i.issue_type == IssueType::UnsafeFn
+                    || i.issue_type == IssueType::UnsafeImpl
+            })
+            .collect();
+        assert!(
+            unsafe_issues.is_empty(),
+            "字符串中的 unsafe 不应误报, got: {:?}",
+            unsafe_issues
+        );
+    }
+
+    #[test]
+    fn test_validate_detailed_allows_unreachable_in_test() {
+        // 测试模块中的 unreachable!() 不应报告
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        unreachable!()
+    }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        let unreachable_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.issue_type == IssueType::Unreachable)
+            .collect();
+        assert!(unreachable_issues.is_empty());
+    }
+
+    // ===== Session 116: generate_fix 测试 =====
+
+    #[test]
+    fn test_generate_fix_unwrap() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Unwrap,
+            message: "使用 .unwrap()".to_string(),
+            suggestion: None,
+        };
+        let original = "let x = foo().unwrap();";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains('?'));
+        assert!(!fixed.as_ref().unwrap().contains(".unwrap()"));
+    }
+
+    #[test]
+    fn test_generate_fix_expect() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Expect,
+            message: "使用 .expect()".to_string(),
+            suggestion: None,
+        };
+        let original = r#"let x = foo().expect("msg");"#;
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains('?'));
+        assert!(!fixed.as_ref().unwrap().contains(".expect("));
+    }
+
+    #[test]
+    fn test_generate_fix_todo() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Todo,
+            message: "使用 todo!()".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() -> i32 { todo!() }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("Err(anyhow!"));
+        assert!(!fixed.as_ref().unwrap().contains("todo!"));
+    }
+
+    #[test]
+    fn test_generate_fix_unimplemented() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Unimplemented,
+            message: "使用 unimplemented!()".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() -> i32 { unimplemented!() }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("Err(anyhow!"));
+    }
+
+    #[test]
+    fn test_generate_fix_panic() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Panic,
+            message: "使用 panic!()".to_string(),
+            suggestion: None,
+        };
+        let original = r#"fn foo() { panic!("oops"); }"#;
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("return Err(anyhow!"));
+        assert!(!fixed.as_ref().unwrap().contains("panic!("));
+    }
+
+    #[test]
+    fn test_generate_fix_unreachable() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Unreachable,
+            message: "使用 unreachable!()".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() -> i32 { unreachable!() }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("return Err(anyhow!"));
+        assert!(!fixed.as_ref().unwrap().contains("unreachable!"));
+    }
+
+    #[test]
+    fn test_generate_fix_unsafe_block() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::UnsafeBlock,
+            message: "使用 unsafe 块".to_string(),
+            suggestion: None,
+        };
+        let original = "    unsafe { let x = 42; }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("SAFETY:"));
+        assert!(fixed.as_ref().unwrap().contains("unsafe {"));
+    }
+
+    #[test]
+    fn test_generate_fix_missing_doc() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingDoc,
+            message: "缺少文档注释".to_string(),
+            suggestion: None,
+        };
+        let original = "pub fn foo() {}";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("/// TODO:"));
+        assert!(fixed.as_ref().unwrap().contains("pub fn foo()"));
+    }
+
+    #[test]
+    fn test_generate_fix_missing_must_use() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingMustUse,
+            message: "缺少 #[must_use]".to_string(),
+            suggestion: None,
+        };
+        let original = "pub fn foo() -> bool { true }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("#[must_use]"));
+        assert!(fixed.as_ref().unwrap().contains("pub fn foo()"));
+    }
+
+    #[test]
+    fn test_generate_fix_preserves_indentation() {
+        // 验证缩进保留
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingDoc,
+            message: "缺少文档注释".to_string(),
+            suggestion: None,
+        };
+        let original = "    pub fn foo() {}";
+        let fixed = generate_fix(&issue, original).unwrap();
+        assert!(fixed.starts_with("    /// TODO:"));
+    }
+
+    #[test]
+    fn test_generate_fix_expect_no_match() {
+        // 行中不包含 .expect( 时返回 None
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::Expect,
+            message: "使用 .expect()".to_string(),
+            suggestion: None,
+        };
+        let original = "let x = 42;";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_none());
+    }
+
+    // ===== Session 116: validate_rust_braces let else / let chains 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_let_else() {
+        // let-else 语法 (Rust 1.65+)
+        let code = r#"
+fn foo(x: Option<i32>) -> i32 {
+    let Some(v) = x else {
+        return 0;
+    };
+    v + 1
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "let-else 语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_let_else_complex() {
+        // 复杂的 let-else
+        let code = r#"
+fn foo(s: &str) -> i32 {
+    let Ok(n) = s.parse::<i32>() else {
+        eprintln!("parse failed");
+        return 0;
+    };
+    n * 2
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "复杂 let-else 语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_let_chains() {
+        // let chains 语法 (Rust 1.88+, unstable)
+        // if let Some(x) = opt && x > 0 { ... }
+        let code = r#"
+fn foo(x: Option<i32>) {
+    if let Some(v) = x && v > 0 {
+        println!("positive: {}", v);
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "let chains 语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_let_else_missing_brace() {
+        // let-else 缺少闭合大括号
+        let code = "fn foo(x: Option<i32>) -> i32 { let Some(v) = x else { return 0;";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "缺少闭合大括号的 let-else 应报告问题");
     }
 }

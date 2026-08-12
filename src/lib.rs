@@ -207,8 +207,9 @@ pub use evaluator_synergy::{
     ScoreTrend, EVALUATOR_SYNERGY_HISTORY_FILENAME, MAX_SYNERGY_HISTORY_SESSIONS,
 };
 pub use extract::{
-    extract_files, validate_rust_braces, validate_rust_code_quality,
-    validate_rust_code_quality_detailed, DefaultExtractor, IssueType, QualityIssue,
+    extract_files, generate_fix, strip_string_content, validate_rust_braces,
+    validate_rust_code_quality, validate_rust_code_quality_detailed, DefaultExtractor, IssueType,
+    QualityIssue,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
