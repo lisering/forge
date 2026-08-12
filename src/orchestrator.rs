@@ -723,6 +723,12 @@ where
     /// `apply_fixes` 修复质量问题 (unwrap → ?, 添加 #[must_use], 文档注释等),
     /// 并打印修复摘要。默认 false (向后兼容)。
     pub auto_fix_enabled: bool,
+
+    /// clippy 检查开关 — 代码写入后自动运行 cargo clippy (Session 120)
+    ///
+    /// 启用后, 在代码写入工作区后自动运行 `cargo clippy`,
+    /// 打印 clippy 警告和错误。默认 false (向后兼容)。
+    pub clippy_check_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -776,6 +782,7 @@ where
             memory_evaluator: None,
             joint_decision_engine: None,
             auto_fix_enabled: false,
+            clippy_check_enabled: false,
         }
     }
 }
@@ -845,6 +852,7 @@ where
             memory_evaluator: self.memory_evaluator,
             joint_decision_engine: self.joint_decision_engine,
             auto_fix_enabled: self.auto_fix_enabled,
+            clippy_check_enabled: self.clippy_check_enabled,
         }
     }
 
@@ -1153,6 +1161,40 @@ where
     pub fn with_auto_fix(mut self, enabled: bool) -> Self {
         self.auto_fix_enabled = enabled;
         self
+    }
+
+    /// 启用/禁用 clippy 检查 (Session 120)
+    ///
+    /// 启用后, 在代码写入工作区后自动运行 `cargo clippy`,
+    /// 打印 clippy 警告和错误, 帮助及早发现代码质量问题。
+    pub fn with_clippy_check(mut self, enabled: bool) -> Self {
+        self.clippy_check_enabled = enabled;
+        self
+    }
+
+    /// 对项目运行 clippy 检查并打印结果 (Session 120)
+    ///
+    /// 在代码写入工作区后调用, 如果 clippy 发现问题则打印警告和错误。
+    /// 此方法不会因 clippy 失败而中断流程, 仅打印信息供参考。
+    fn run_clippy_on_project(&self) {
+        use crate::extract::run_clippy_check;
+
+        let project_dir = self.workspace.root.to_str().unwrap_or(".");
+        match run_clippy_check(project_dir, false) {
+            Ok(messages) => {
+                if messages.is_empty() {
+                    println!("    ✅ clippy 检查通过, 无警告");
+                } else {
+                    println!("    ⚠️  clippy 发现 {} 个问题:", messages.len());
+                    for msg in &messages {
+                        println!("      {}", msg);
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("clippy 检查跳过: {}", e);
+            }
+        }
     }
 
     /// 对提取的文件应用自动修复 (Session 118)
@@ -4551,6 +4593,11 @@ where
                 .into_iter()
                 .filter(|f| !f.starts_with("target/"))
                 .collect();
+
+            // === clippy 检查: 代码写入后自动运行 cargo clippy (Session 120) ===
+            if self.clippy_check_enabled {
+                self.run_clippy_on_project();
+            }
 
             // 编译检查 (DIP: 通过 TestRunner trait)
             println!("    运行 cargo check...");
@@ -10468,6 +10515,52 @@ mod tests {
         let fixed = orch.apply_auto_fixes_to_files(files);
         assert_eq!(fixed[0].path, "src/utils/helper.rs", "路径应保留");
         assert_eq!(fixed[0].language, "rust", "语言应保留");
+    }
+
+    // ===== Session 120: clippy 检查集成测试 =====
+
+    #[test]
+    fn test_clippy_check_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(
+            !orch.clippy_check_enabled,
+            "clippy_check_enabled 应默认为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_clippy_check_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_clippy_check(true);
+        assert!(
+            orch.clippy_check_enabled,
+            "with_clippy_check(true) 应设置 clippy_check_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_clippy_check_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_clippy_check(false);
+        assert!(
+            !orch.clippy_check_enabled,
+            "with_clippy_check(false) 应设置 clippy_check_enabled 为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_clippy_check_and_auto_fix_combined() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_clippy_check(true);
+        assert!(orch.auto_fix_enabled, "auto_fix 应启用");
+        assert!(orch.clippy_check_enabled, "clippy_check 应启用");
     }
 }
 

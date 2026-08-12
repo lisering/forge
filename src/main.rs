@@ -299,6 +299,14 @@ enum Commands {
         #[arg(long)]
         auto_fix: bool,
 
+        /// 启用 clippy 检查 — 代码写入后自动运行 cargo clippy (Session 120)
+        ///
+        /// 启用后, 在代码写入工作区后自动运行 cargo clippy,
+        /// 打印 clippy 警告和错误, 帮助及早发现代码质量问题。
+        /// 默认禁用。
+        #[arg(long)]
+        clippy_check: bool,
+
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
         /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
@@ -864,6 +872,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             memory_context,
             web_tool: enable_web_tool,
             auto_fix,
+            clippy_check,
             profile: _,
             profile_output: _,
         } => {
@@ -1057,6 +1066,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         memory_context,
                         web_tool,
                         auto_fix,
+                        clippy_check,
                     )
                     .await?;
 
@@ -1090,6 +1100,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         memory_context,
                         web_tool,
                         auto_fix,
+                        clippy_check,
                     )
                     .await?;
 
@@ -1141,6 +1152,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         memory_context,
                         web_tool,
                         auto_fix,
+                        clippy_check,
                     )
                     .await?;
                 } else {
@@ -1171,6 +1183,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         memory_context,
                         web_tool,
                         auto_fix,
+                        clippy_check,
                     )
                     .await?;
                 }
@@ -1288,6 +1301,7 @@ async fn run_with_clarifier<C, Q>(
     memory_context: usize,
     web_tool: Option<Box<dyn WebTool>>,
     auto_fix: bool,
+    clippy_check: bool,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1318,6 +1332,11 @@ where
     // Session 118: 自动修复
     if auto_fix {
         orch = orch.with_auto_fix(true);
+    }
+
+    // Session 120: clippy 检查
+    if clippy_check {
+        orch = orch.with_clippy_check(true);
     }
 
     // Session 113: Web 工具集成

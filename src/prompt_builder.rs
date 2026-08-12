@@ -91,7 +91,10 @@ impl SystemPrompt {
         prompt.push_str("❌ 禁止: 使用 unreachable!() 宏 (非测试代码)\n");
         prompt
             .push_str("❌ 禁止: 滥用 unwrap_or()/unwrap_or_default() 掩盖错误 (确认是否应传播)\n");
-        prompt.push_str("❌ 禁止: 使用 ? 操作符的函数不返回 Result/Option 类型 (Session 119)\n\n");
+        prompt.push_str("❌ 禁止: 使用 ? 操作符的函数不返回 Result/Option 类型 (Session 119)\n");
+        prompt.push_str(
+            "❌ 禁止: 修改函数返回类型为 Result 后遗漏 use anyhow::Result; 导入 (Session 120)\n\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -368,6 +371,15 @@ mod tests {
         assert!(
             prompt.contains("? 操作符的函数不返回 Result/Option"),
             "系统 prompt 应包含 ? 操作符函数必须返回 Result/Option 的约束"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_anyhow_import_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("use anyhow::Result;"),
+            "系统 prompt 应包含 use anyhow::Result 导入约束 (Session 120)"
         );
     }
 }

@@ -1911,6 +1911,33 @@ pub fn apply_fixes(content: &str) -> String {
     result_lines.join("\n")
 }
 
+/// 批量自动修复 + 自动导入 — 修复问题并添加缺失的 `use anyhow::Result;` 导入 (Session 120)
+///
+/// 在 `apply_fixes` 的基础上, 自动检查修复后的代码是否需要 `use anyhow::Result;` 导入。
+/// 当 `MissingResultReturn` 修复将函数签名改为 `Result<T, anyhow::Error>` 后,
+/// 此函数确保文件顶部有对应的导入语句。
+///
+/// # 工作流程
+///
+/// 1. 调用 `apply_fixes` 修复所有问题
+/// 2. 调用 `ensure_anyhow_import` 添加缺失的导入
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_fixes_with_imports;
+///
+/// // 函数使用 ? 但未返回 Result, 修复后需要导入
+/// let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
+/// let fixed = apply_fixes_with_imports(code);
+/// assert!(fixed.contains("Result<"), "应修改返回类型");
+/// assert!(fixed.contains("use anyhow::Result;"), "应添加导入");
+/// ```
+pub fn apply_fixes_with_imports(content: &str) -> String {
+    let fixed = apply_fixes(content);
+    ensure_anyhow_import(&fixed)
+}
+
 /// 修复预览 — dry-run 模式的返回值 (Session 118)
 ///
 /// 包含原始内容、修复后内容、检测到的问题列表和修复统计,
@@ -2113,7 +2140,308 @@ pub fn apply_fixes_dry_run_filtered(content: &str, filter: &[IssueType]) -> FixP
     }
 }
 
-/// 幂等性验证结果 — 包含详细差异信息 (Session 119)
+/// 批量自动修复 (排除模式) — 修复除指定类型外的所有问题 (Session 120)
+///
+/// 与 `apply_fixes_filtered` 互补: 不是"只修复指定类型", 而是"修复除了指定类型外的所有类型"。
+/// 适用于: 先排除低优先级修复 (如 MissingDoc), 集中修复高优先级问题 (unwrap/expect/panic 等)。
+///
+/// # 参数
+///
+/// - `content`: 原始代码内容
+/// - `exclude`: 要排除的 `IssueType` 列表 (这些类型不会被修复)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{apply_fixes_except, IssueType};
+///
+/// let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+/// // 排除 MissingDoc 和 MissingMustUse, 只修复 Unwrap
+/// let exclude = [IssueType::MissingDoc, IssueType::MissingMustUse];
+/// let fixed = apply_fixes_except(code, &exclude);
+/// assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+/// assert!(!fixed.contains("/// TODO:"), "不应添加文档注释 (已排除)");
+/// ```
+pub fn apply_fixes_except(content: &str, exclude: &[IssueType]) -> String {
+    let all_issues = validate_rust_code_quality_detailed(content);
+    let issues: Vec<QualityIssue> = all_issues
+        .into_iter()
+        .filter(|issue| !exclude.contains(&issue.issue_type))
+        .collect();
+
+    if issues.is_empty() {
+        return content.to_string();
+    }
+
+    let mut result_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    // 按行号降序排列 (从底向顶处理), 同一行按优先级升序
+    let mut sorted_issues = issues;
+    sorted_issues.sort_by(|a, b| {
+        b.line
+            .cmp(&a.line)
+            .then(fix_priority(&a.issue_type).cmp(&fix_priority(&b.issue_type)))
+    });
+
+    for issue in &sorted_issues {
+        if issue.line == 0 || issue.line > result_lines.len() {
+            continue;
+        }
+        let line_idx = issue.line - 1;
+        let original_line = result_lines[line_idx].clone();
+        if let Some(fixed) = generate_fix(issue, &original_line) {
+            let fixed_lines: Vec<String> = fixed.lines().map(|s| s.to_string()).collect();
+            result_lines.splice(line_idx..=line_idx, fixed_lines);
+        }
+    }
+
+    result_lines.join("\n")
+}
+
+/// 批量自动修复 dry-run 模式 (排除模式) — 预览除指定类型外的修复 (Session 120)
+///
+/// 与 `apply_fixes_dry_run_filtered` 互补: 修复除了 `exclude` 中列出的类型外的所有问题。
+/// `issues` 字段仍包含所有检测到的问题 (不论是否被排除),
+/// `fixes_applied` 只统计未被排除且实际应用的修复数量。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{apply_fixes_dry_run_except, IssueType};
+///
+/// let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+/// // 排除 MissingDoc, 修复其他所有问题
+/// let exclude = [IssueType::MissingDoc];
+/// let preview = apply_fixes_dry_run_except(code, &exclude);
+/// assert!(preview.is_changed, "应有变化");
+/// assert!(preview.fixes_applied > 0, "应有修复");
+/// assert!(!preview.fixed_content.contains(".unwrap()"), "unwrap 应被修复");
+/// assert!(preview.issues.len() >= 2, "应检测到所有问题 (包括被排除的)");
+/// ```
+pub fn apply_fixes_dry_run_except(content: &str, exclude: &[IssueType]) -> FixPreview {
+    let issues = validate_rust_code_quality_detailed(content);
+    let fixed_content = apply_fixes_except(content, exclude);
+    let fixes_applied = if fixed_content != content {
+        issues
+            .iter()
+            .filter(|issue| {
+                if exclude.contains(&issue.issue_type) {
+                    return false;
+                }
+                let lines: Vec<&str> = content.lines().collect();
+                if issue.line == 0 || issue.line > lines.len() {
+                    return false;
+                }
+                generate_fix(issue, lines[issue.line - 1]).is_some()
+            })
+            .count()
+    } else {
+        0
+    };
+
+    FixPreview {
+        is_changed: fixed_content != content,
+        original_content: content.to_string(),
+        fixed_content,
+        issues,
+        fixes_applied,
+    }
+}
+
+/// 行级别变更类型 (Session 120)
+///
+/// 描述两行之间的变更关系。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LineDiffType {
+    /// 行被修改 (内容变化但行号相同)
+    Modified,
+    /// 行被添加 (修复后新增的行)
+    Added,
+    /// 行被删除 (修复后移除的行)
+    Removed,
+}
+
+/// 行级别差异 — 描述两行之间的变更 (Session 120)
+///
+/// 由 `compute_line_diff` 返回, 提供 `apply_fixes` 前后逐行比较的差异信息。
+///
+/// # 字段
+///
+/// - `line_number`: 行号 (1-based, 基于原始内容)
+/// - `diff_type`: 变更类型 (Modified/Added/Removed)
+/// - `original_line`: 原始行内容 (Removed/Modified 时有值, Added 时为 None)
+/// - `fixed_line`: 修复后行内容 (Added/Modified 时有值, Removed 时为 None)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff, LineDiffType};
+///
+/// let original = "fn foo() { bar().unwrap(); }";
+/// let fixed = "fn foo() { bar()?; }";
+/// let diffs = compute_line_diff(original, fixed);
+/// assert!(!diffs.is_empty(), "应有差异");
+/// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Modified), "应有修改行");
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LineDiff {
+    /// 行号 (1-based, 基于原始内容)
+    pub line_number: usize,
+    /// 变更类型
+    pub diff_type: LineDiffType,
+    /// 原始行内容 (Removed/Modified 时有值, Added 时为 None)
+    pub original_line: Option<String>,
+    /// 修复后行内容 (Added/Modified 时有值, Removed 时为 None)
+    pub fixed_line: Option<String>,
+}
+
+/// 计算两段文本之间的行级别差异 (Session 120)
+///
+/// 逐行比较原始内容和修复后内容, 返回所有有变化的行的差异信息。
+/// 用于 `verify_idempotent_detailed` 中提供行级别的 diff, 而非仅问题列表。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff, LineDiffType};
+///
+/// // 无差异
+/// let diffs = compute_line_diff("fn foo() {}", "fn foo() {}");
+/// assert!(diffs.is_empty());
+///
+/// // 有差异
+/// let diffs = compute_line_diff("let x = 1;", "let x = 2;");
+/// assert_eq!(diffs.len(), 1);
+/// assert_eq!(diffs[0].diff_type, LineDiffType::Modified);
+/// ```
+pub fn compute_line_diff(original: &str, fixed: &str) -> Vec<LineDiff> {
+    let original_lines: Vec<&str> = original.lines().collect();
+    let fixed_lines: Vec<&str> = fixed.lines().collect();
+    let mut diffs = Vec::new();
+
+    let max_len = original_lines.len().max(fixed_lines.len());
+
+    for i in 0..max_len {
+        let line_number = i + 1;
+        match (original_lines.get(i), fixed_lines.get(i)) {
+            (Some(orig), Some(fix)) => {
+                if orig != fix {
+                    diffs.push(LineDiff {
+                        line_number,
+                        diff_type: LineDiffType::Modified,
+                        original_line: Some(orig.to_string()),
+                        fixed_line: Some(fix.to_string()),
+                    });
+                }
+            }
+            (Some(orig), None) => {
+                diffs.push(LineDiff {
+                    line_number,
+                    diff_type: LineDiffType::Removed,
+                    original_line: Some(orig.to_string()),
+                    fixed_line: None,
+                });
+            }
+            (None, Some(fix)) => {
+                diffs.push(LineDiff {
+                    line_number,
+                    diff_type: LineDiffType::Added,
+                    original_line: None,
+                    fixed_line: Some(fix.to_string()),
+                });
+            }
+            (None, None) => {}
+        }
+    }
+
+    diffs
+}
+
+/// 确保代码包含 `use anyhow::Result;` 导入 (Session 120)
+///
+/// 当 `apply_fixes` 将函数签名修改为返回 `Result<T, anyhow::Error>` 后,
+/// 需要确保文件顶部有 `use anyhow::Result;` (或等价的 `use anyhow::Error;`) 导入。
+/// 此函数检查并添加缺失的导入。
+///
+/// # 规则
+///
+/// 1. 如果代码不包含 `anyhow::Error` 或 `anyhow::Result`, 不需要添加导入, 返回原内容
+/// 2. 如果已有 `use anyhow::Result;` / `use anyhow::Error;` / `use anyhow::*;` 等导入, 不重复添加
+/// 3. 否则在文件第一个非注释/非属性行前插入 `use anyhow::Result;`
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::ensure_anyhow_import;
+///
+/// // 已有导入, 不修改
+/// let code = "use anyhow::Result;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+/// assert_eq!(ensure_anyhow_import(code), code);
+///
+/// // 需要添加导入
+/// let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+/// let result = ensure_anyhow_import(code);
+/// assert!(result.contains("use anyhow::Result;"), "应添加导入");
+/// ```
+pub fn ensure_anyhow_import(content: &str) -> String {
+    // 如果不包含 anyhow::Error 或 anyhow::Result, 不需要添加
+    if !content.contains("anyhow::Error") && !content.contains("anyhow::Result") {
+        return content.to_string();
+    }
+
+    // 检查是否已有 anyhow 导入
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("use anyhow::Result;")
+            || trimmed.starts_with("use anyhow::Error;")
+            || trimmed.starts_with("use anyhow::*;")
+            || trimmed.contains("use anyhow::{")
+                && trimmed.contains("Result")
+                && trimmed.contains("Error")
+        {
+            return content.to_string();
+        }
+    }
+
+    // 找到插入位置: 第一个非注释、非属性、非空白行之前
+    let lines: Vec<&str> = content.lines().collect();
+    let mut insert_pos = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*")
+            || trimmed.starts_with("#![")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("///")
+        {
+            continue;
+        }
+        // 找到第一个代码行, 在它前面插入
+        insert_pos = i;
+        break;
+    }
+
+    // 如果全是注释/空白, 在末尾插入
+    if insert_pos == 0 && !lines.is_empty() {
+        // 检查是否全是注释
+        let all_comments = lines
+            .iter()
+            .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+        if all_comments {
+            insert_pos = lines.len();
+        }
+    }
+
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    result_lines.insert(insert_pos, "use anyhow::Result;".to_string());
+
+    result_lines.join("\n")
+}
+
+/// 幂等性验证结果 — 包含详细差异信息 (Session 119, Session 120 增强)
 ///
 /// 当 `apply_fixes` 不满足幂等性时, 通过此结构体可以查看具体的差异,
 /// 包括第一次修复后剩余的问题和第二次修复后新增的问题。
@@ -2124,6 +2452,8 @@ pub fn apply_fixes_dry_run_filtered(content: &str, filter: &[IssueType]) -> FixP
 /// - `first_pass_issues`: 第一次修复后检测到的问题
 /// - `second_pass_issues`: 第二次修复后检测到的问题
 /// - `new_issues_in_second_pass`: 第二次修复后新增的问题 (不在第一次结果中)
+/// - `first_pass_diff`: 原始内容与第一次修复之间的行级别差异 (Session 120)
+/// - `second_pass_diff`: 第一次修复与第二次修复之间的行级别差异 (Session 120)
 ///
 /// # 示例
 ///
@@ -2145,6 +2475,10 @@ pub struct IdempotencyResult {
     pub second_pass_issues: Vec<QualityIssue>,
     /// 第二次修复后新增的问题 (不在第一次结果中)
     pub new_issues_in_second_pass: Vec<QualityIssue>,
+    /// 原始内容与第一次修复之间的行级别差异 (Session 120)
+    pub first_pass_diff: Vec<LineDiff>,
+    /// 第一次修复与第二次修复之间的行级别差异 (Session 120)
+    pub second_pass_diff: Vec<LineDiff>,
 }
 
 /// 验证 apply_fixes 的幂等性 — 返回详细差异 (Session 119)
@@ -2182,11 +2516,17 @@ pub fn verify_idempotent_detailed(content: &str) -> IdempotencyResult {
         .cloned()
         .collect();
 
+    // 计算行级别差异 (Session 120)
+    let first_pass_diff = compute_line_diff(content, &first_pass);
+    let second_pass_diff = compute_line_diff(&first_pass, &second_pass);
+
     IdempotencyResult {
         is_idempotent: first_pass == second_pass,
         first_pass_issues,
         second_pass_issues,
         new_issues_in_second_pass,
+        first_pass_diff,
+        second_pass_diff,
     }
 }
 
@@ -5354,5 +5694,307 @@ fn foo(
         let result = run_clippy_check("/nonexistent/path", false);
         assert!(result.is_err(), "不存在的目录应返回错误");
         assert!(result.unwrap_err().contains("Cargo.toml"));
+    }
+
+    // ===== Session 120: apply_fixes_except 测试 =====
+
+    #[test]
+    fn test_apply_fixes_except_unwrap() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        // 排除 MissingDoc 和 MissingMustUse, 只修复 Unwrap
+        let exclude = [IssueType::MissingDoc, IssueType::MissingMustUse];
+        let fixed = apply_fixes_except(code, &exclude);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(!fixed.contains("/// TODO:"), "不应添加文档注释 (已排除)");
+        assert!(
+            !fixed.contains("#[must_use]"),
+            "不应添加 #[must_use] (已排除)"
+        );
+    }
+
+    #[test]
+    fn test_apply_fixes_except_empty_exclude() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        // 空排除列表 = 修复所有问题 = 与 apply_fixes 相同
+        let fixed = apply_fixes_except(code, &[]);
+        let all_fixed = apply_fixes(code);
+        assert_eq!(fixed, all_fixed, "空排除列表应等同于 apply_fixes");
+    }
+
+    #[test]
+    fn test_apply_fixes_except_all_excluded() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        // 排除所有可能的问题类型
+        let exclude = [
+            IssueType::Unwrap,
+            IssueType::Expect,
+            IssueType::Todo,
+            IssueType::Unimplemented,
+            IssueType::Panic,
+            IssueType::UnsafeBlock,
+            IssueType::UnsafeFn,
+            IssueType::UnsafeImpl,
+            IssueType::MissingDoc,
+            IssueType::Unreachable,
+            IssueType::MissingMustUse,
+            IssueType::UnwrapOr,
+            IssueType::UnwrapOrDefault,
+            IssueType::MissingResultReturn,
+        ];
+        let fixed = apply_fixes_except(code, &exclude);
+        assert_eq!(fixed, code, "排除所有类型不应修改代码");
+    }
+
+    #[test]
+    fn test_apply_fixes_except_only_missing_doc() {
+        let code = "pub fn foo() -> bool { true }";
+        // 排除除 MissingDoc 外的所有类型
+        let exclude = [
+            IssueType::Unwrap,
+            IssueType::MissingMustUse,
+            IssueType::MissingResultReturn,
+        ];
+        let fixed = apply_fixes_except(code, &exclude);
+        assert!(fixed.contains("/// TODO:"), "应添加文档注释 (未排除)");
+    }
+
+    #[test]
+    fn test_apply_fixes_except_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let exclude = [IssueType::Unwrap];
+        let fixed = apply_fixes_except(code, &exclude);
+        assert_eq!(fixed, code, "无问题代码不应修改");
+    }
+
+    // ===== Session 120: apply_fixes_dry_run_except 测试 =====
+
+    #[test]
+    fn test_apply_fixes_dry_run_except_unwrap() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        let exclude = [IssueType::MissingDoc];
+        let preview = apply_fixes_dry_run_except(code, &exclude);
+        assert!(preview.is_changed, "应有变化");
+        assert!(preview.fixes_applied > 0, "应有修复");
+        assert!(
+            !preview.fixed_content.contains(".unwrap()"),
+            "unwrap 应被修复"
+        );
+        assert!(preview.issues.len() >= 2, "应检测到所有问题 (包括被排除的)");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_except_empty_exclude() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_fixes_dry_run_except(code, &[]);
+        assert!(preview.is_changed, "空排除应修复所有问题");
+        assert!(preview.fixes_applied > 0, "应有修复");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_except_all_excluded() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let exclude = [
+            IssueType::Unwrap,
+            IssueType::MissingResultReturn,
+            IssueType::MissingDoc,
+            IssueType::MissingMustUse,
+        ];
+        let preview = apply_fixes_dry_run_except(code, &exclude);
+        assert!(!preview.is_changed, "排除所有不应有变化");
+        assert_eq!(preview.fixes_applied, 0, "无修复");
+    }
+
+    // ===== Session 120: compute_line_diff 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_no_change() {
+        let code = "fn foo() {}\nfn bar() {}";
+        let diffs = compute_line_diff(code, code);
+        assert!(diffs.is_empty(), "无变化应返回空列表");
+    }
+
+    #[test]
+    fn test_compute_line_diff_modified() {
+        let original = "let x = 1;";
+        let fixed = "let x = 2;";
+        let diffs = compute_line_diff(original, fixed);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].diff_type, LineDiffType::Modified);
+        assert_eq!(diffs[0].line_number, 1);
+        assert_eq!(diffs[0].original_line.as_deref(), Some("let x = 1;"));
+        assert_eq!(diffs[0].fixed_line.as_deref(), Some("let x = 2;"));
+    }
+
+    #[test]
+    fn test_compute_line_diff_added() {
+        let original = "fn foo() {}";
+        let fixed = "fn foo() {}\nfn bar() {}";
+        let diffs = compute_line_diff(original, fixed);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].diff_type, LineDiffType::Added);
+        assert_eq!(diffs[0].line_number, 2);
+        assert!(diffs[0].original_line.is_none());
+        assert_eq!(diffs[0].fixed_line.as_deref(), Some("fn bar() {}"));
+    }
+
+    #[test]
+    fn test_compute_line_diff_removed() {
+        let original = "fn foo() {}\nfn bar() {}";
+        let fixed = "fn foo() {}";
+        let diffs = compute_line_diff(original, fixed);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].diff_type, LineDiffType::Removed);
+        assert_eq!(diffs[0].line_number, 2);
+        assert_eq!(diffs[0].original_line.as_deref(), Some("fn bar() {}"));
+        assert!(diffs[0].fixed_line.is_none());
+    }
+
+    #[test]
+    fn test_compute_line_diff_multiple_changes() {
+        let original = "let a = 1;\nlet b = 2;\nlet c = 3;";
+        let fixed = "let a = 1;\nlet b = 99;\nlet c = 3;\nlet d = 4;";
+        let diffs = compute_line_diff(original, fixed);
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[0].diff_type, LineDiffType::Modified);
+        assert_eq!(diffs[0].line_number, 2);
+        assert_eq!(diffs[1].diff_type, LineDiffType::Added);
+        assert_eq!(diffs[1].line_number, 4);
+    }
+
+    #[test]
+    fn test_compute_line_diff_empty_strings() {
+        let diffs = compute_line_diff("", "");
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn test_compute_line_diff_serde() {
+        let diff = LineDiff {
+            line_number: 5,
+            diff_type: LineDiffType::Modified,
+            original_line: Some("old".to_string()),
+            fixed_line: Some("new".to_string()),
+        };
+        let json = serde_json::to_string(&diff).expect("序列化失败");
+        let deserialized: LineDiff = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(deserialized.line_number, 5);
+        assert_eq!(deserialized.diff_type, LineDiffType::Modified);
+    }
+
+    // ===== Session 120: ensure_anyhow_import 测试 =====
+
+    #[test]
+    fn test_ensure_anyhow_import_no_need() {
+        let code = "fn foo() -> i32 { 42 }";
+        assert_eq!(ensure_anyhow_import(code), code, "不需要导入时不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_already_has_import() {
+        let code = "use anyhow::Result;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        assert_eq!(ensure_anyhow_import(code), code, "已有导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_already_has_error_import() {
+        let code = "use anyhow::Error;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        assert_eq!(ensure_anyhow_import(code), code, "已有 Error 导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_already_has_wildcard() {
+        let code = "use anyhow::*;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        assert_eq!(ensure_anyhow_import(code), code, "已有通配导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_needs_import() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_import(code);
+        assert!(result.contains("use anyhow::Result;"), "应添加导入");
+        assert!(
+            result.starts_with("use anyhow::Result;"),
+            "导入应在文件开头"
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_with_comments() {
+        let code = "//! Module docs\n// comment\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_import(code);
+        assert!(result.contains("use anyhow::Result;"), "应添加导入");
+        // 导入应在注释之后, 代码之前
+        let import_pos = result.find("use anyhow::Result;").unwrap();
+        let fn_pos = result.find("fn foo()").unwrap();
+        assert!(import_pos < fn_pos, "导入应在函数之前");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_import_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let first = ensure_anyhow_import(code);
+        let second = ensure_anyhow_import(&first);
+        assert_eq!(first, second, "二次调用不应有变化 (幂等)");
+    }
+
+    // ===== Session 120: apply_fixes_with_imports 测试 =====
+
+    #[test]
+    fn test_apply_fixes_with_imports_no_change() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = apply_fixes_with_imports(code);
+        assert_eq!(result, code, "无问题代码不应修改");
+    }
+
+    #[test]
+    fn test_apply_fixes_with_imports_adds_import() {
+        // 函数使用 ? 但未返回 Result
+        let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
+        let result = apply_fixes_with_imports(code);
+        assert!(result.contains("Result<"), "应修改返回类型为 Result");
+        assert!(result.contains("use anyhow::Result;"), "应添加 anyhow 导入");
+    }
+
+    #[test]
+    fn test_apply_fixes_with_imports_already_has_import() {
+        let code = "use anyhow::Result;\nfn foo() { let x = bar().unwrap(); }";
+        let result = apply_fixes_with_imports(code);
+        // 应只有一次 use anyhow::Result;
+        let count = result.matches("use anyhow::Result;").count();
+        assert_eq!(count, 1, "不应重复添加导入");
+    }
+
+    // ===== Session 120: verify_idempotent_detailed 增强 (行级别 diff) 测试 =====
+
+    #[test]
+    fn test_verify_idempotent_detailed_with_diff_clean_code() {
+        let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+        assert!(result.is_idempotent);
+        assert!(result.first_pass_diff.is_empty(), "无问题代码不应有 diff");
+        assert!(result.second_pass_diff.is_empty(), "无问题代码不应有 diff");
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_with_diff_has_changes() {
+        let result = verify_idempotent_detailed("fn foo() { let x = bar().unwrap(); }");
+        assert!(
+            !result.first_pass_diff.is_empty(),
+            "有问题的代码第一次修复应有 diff"
+        );
+        assert!(
+            result.second_pass_diff.is_empty(),
+            "幂等修复第二次不应有 diff"
+        );
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_diff_serde() {
+        let result = verify_idempotent_detailed("fn foo() { let x = bar().unwrap(); }");
+        let json = serde_json::to_string(&result).expect("序列化失败");
+        let deserialized: IdempotencyResult = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(
+            deserialized.first_pass_diff.len(),
+            result.first_pass_diff.len()
+        );
     }
 }
