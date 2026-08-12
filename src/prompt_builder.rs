@@ -88,7 +88,10 @@ impl SystemPrompt {
         prompt.push_str("❌ 禁止: 使用 todo!()/unimplemented!()/panic!() (非测试代码)\n");
         prompt
             .push_str("❌ 禁止: 使用 unsafe 块/函数/实现 (非必要不使用, 必须时添加 SAFETY 注释)\n");
-        prompt.push_str("❌ 禁止: 使用 unreachable!() 宏 (非测试代码)\n\n");
+        prompt.push_str("❌ 禁止: 使用 unreachable!() 宏 (非测试代码)\n");
+        prompt.push_str(
+            "❌ 禁止: 滥用 unwrap_or()/unwrap_or_default() 掩盖错误 (确认是否应传播)\n\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -98,7 +101,9 @@ impl SystemPrompt {
         prompt.push_str("✅ 必须: 使用 trait 抽象外部依赖，支持无 Chrome 环境测试\n");
         prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n");
         prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n");
-        prompt.push_str("✅ 必须: 返回 Result/Option/bool 的公共函数添加 #[must_use] 属性\n\n");
+        prompt.push_str(
+            "✅ 必须: 返回 Result/Option/bool/Vec/String/&str 的公共函数添加 #[must_use] 属性\n\n",
+        );
 
         prompt.push_str("📎 附件内容 (必须逐条执行):\n");
         prompt.push_str("  1. 前沿技术要求 — 使用最新最前沿的技术\n");
@@ -301,6 +306,38 @@ mod tests {
         assert!(
             prompt.contains("Result/Option/bool"),
             "系统 prompt 应明确列出需要 #[must_use] 的返回类型"
+        );
+    }
+
+    // ===== Session 117: unwrap_or + 扩展 must_use 类型测试 =====
+
+    #[test]
+    fn test_build_contains_unwrap_or_warning() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("unwrap_or"),
+            "系统 prompt 应包含 unwrap_or() 滥用警告"
+        );
+        assert!(
+            prompt.contains("unwrap_or_default"),
+            "系统 prompt 应包含 unwrap_or_default() 滥用警告"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_expanded_must_use_types() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Vec"),
+            "系统 prompt 应在 #[must_use] 要求中包含 Vec 类型"
+        );
+        assert!(
+            prompt.contains("String"),
+            "系统 prompt 应在 #[must_use] 要求中包含 String 类型"
+        );
+        assert!(
+            prompt.contains("&str"),
+            "系统 prompt 应在 #[must_use] 要求中包含 &str 类型"
         );
     }
 }

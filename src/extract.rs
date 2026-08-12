@@ -662,6 +662,10 @@ pub enum IssueType {
     Unreachable,
     /// 公共函数返回 `Result`/`Option`/`bool` 缺少 `#[must_use]` 属性 (Session 116)
     MissingMustUse,
+    /// 使用 `.unwrap_or()` — 可能掩盖错误 (Session 117)
+    UnwrapOr,
+    /// 使用 `.unwrap_or_default()` — 可能掩盖错误 (Session 117)
+    UnwrapOrDefault,
 }
 
 /// 代码质量问题 — 包含行号、类型、消息和自动修复建议 (Session 115)
@@ -690,10 +694,14 @@ pub struct QualityIssue {
     pub suggestion: Option<String>,
 }
 
-/// 移除字符串字面量内容, 保留引号标记 (Session 116)
+/// 移除字符串字面量内容, 保留引号标记 (Session 116, Session 117 增强)
 ///
 /// 用于避免字符串中的 `unsafe` 等关键字误报。
-/// 仅处理普通双引号字符串 (含转义), 不处理 raw string (r#"..."#)。
+/// 支持以下字符串类型 (Session 117 新增 raw string 和字节字符串):
+/// - 普通双引号字符串 `"..."` (含转义)
+/// - Raw string `r"..."`, `r#"..."#`, `r##"..."##` 等
+/// - 字节字符串 `b"..."` (含转义)
+/// - Raw 字节字符串 `br"..."`, `br#"..."#` 等
 ///
 /// # 示例
 ///
@@ -702,31 +710,128 @@ pub struct QualityIssue {
 ///
 /// assert_eq!(strip_string_content("let s = \"unsafe { }\";"), "let s = \"\";");
 /// assert_eq!(strip_string_content("unsafe { x }"), "unsafe { x }");
+/// // Session 117: raw string
+/// assert_eq!(strip_string_content(r#"let s = r"unsafe";"#), r#"let s = r"";"#);
+/// assert_eq!(strip_string_content(r##"let s = r#"unsafe"#"##), r##"let s = r#""#"##);
+/// // Session 117: byte string
+/// assert_eq!(strip_string_content(r#"let s = b"unsafe";"#), r#"let s = b"";"#);
 /// ```
 pub fn strip_string_content(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut result = String::new();
-    let mut in_string = false;
-    let mut escape = false;
+    let mut i = 0;
 
-    for c in line.chars() {
-        if escape {
-            escape = false;
-            continue;
+    while i < chars.len() {
+        // 检测 raw string / byte string 前缀: r, b, br, rb
+        if chars[i] == 'r' || chars[i] == 'b' {
+            if let Some((prefix_len, hash_count, _is_raw)) = detect_string_prefix(&chars, i) {
+                result.extend(chars[i..i + prefix_len].iter());
+                i += prefix_len;
+                // 跳过内容直到闭合引号 + hash
+                if let Some(end) = find_string_end(&chars, i, hash_count) {
+                    // 保留闭合引号和 hash 标记
+                    result.push('"');
+                    for _ in 0..hash_count {
+                        result.push('#');
+                    }
+                    i = end + 1 + hash_count;
+                } else {
+                    // 未闭合 — 保留剩余部分
+                    result.extend(chars[i..].iter());
+                    break;
+                }
+                continue;
+            }
         }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
+
+        // 普通双引号字符串
+        if chars[i] == '"' {
             result.push('"');
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2; // 跳过转义字符
+                    continue;
+                }
+                if chars[i] == '"' {
+                    result.push('"');
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
             continue;
         }
-        if !in_string {
-            result.push(c);
-        }
+
+        result.push(chars[i]);
+        i += 1;
     }
     result
+}
+
+/// 检测 raw string / byte string 前缀 (Session 117)
+///
+/// 返回 `Some((prefix_len, hash_count, is_raw))` 其中:
+/// - `prefix_len`: 前缀长度 (含引号, 不含 # 标记)
+/// - `hash_count`: # 的数量
+/// - `is_raw`: 是否为 raw string (无转义)
+fn detect_string_prefix(chars: &[char], start: usize) -> Option<(usize, usize, bool)> {
+    let mut pos = start;
+    let mut is_raw = false;
+
+    // 检测前缀: r, b, br, rb
+    if chars[pos] == 'r' {
+        is_raw = true;
+        pos += 1;
+        if pos < chars.len() && chars[pos] == 'b' {
+            pos += 1; // rb (raw byte)
+        }
+    } else if chars[pos] == 'b' {
+        pos += 1;
+        if pos < chars.len() && chars[pos] == 'r' {
+            is_raw = true;
+            pos += 1; // br (byte raw)
+        }
+    }
+
+    // 检测 # 标记
+    let hash_start = pos;
+    while pos < chars.len() && chars[pos] == '#' {
+        pos += 1;
+    }
+    let hash_count = pos - hash_start;
+
+    // 必须有引号
+    if pos < chars.len() && chars[pos] == '"' {
+        let prefix_len = pos + 1 - start; // 包含引号
+        Some((prefix_len, hash_count, is_raw))
+    } else {
+        None
+    }
+}
+
+/// 查找 raw string 的内容结束位置 (Session 117)
+///
+/// 从引号后开始搜索 `"` 后跟 `hash_count` 个 `#` 的位置。
+/// 返回引号的索引 (不含)。
+fn find_string_end(chars: &[char], content_start: usize, hash_count: usize) -> Option<usize> {
+    let mut i = content_start;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            // 检查后面是否有足够数量的 #
+            let mut j = i + 1;
+            let mut found_hashes = 0;
+            while j < chars.len() && chars[j] == '#' && found_hashes < hash_count {
+                found_hashes += 1;
+                j += 1;
+            }
+            if found_hashes == hash_count {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// 检测行中是否包含 `unsafe` 关键字 (不是标识符的一部分) (Session 115, Session 116 增强)
@@ -909,9 +1014,29 @@ fn has_doc_comment(lines: &[&str], line_num: usize) -> bool {
     false
 }
 
-/// 检查函数签名是否返回需要 `#[must_use]` 的类型 (Session 116)
+/// 检查返回类型字符串是否是需要 `#[must_use]` 的类型 (Session 117)
 ///
-/// 检测返回 `Result`、`Option`、`bool` 等不应被忽略的类型的公共函数。
+/// 纯函数: 检测返回类型是否属于不应被忽略的类型。
+fn is_must_use_return_type(return_type: &str) -> bool {
+    return_type.starts_with("Result")
+        || return_type.starts_with("Option")
+        || return_type.starts_with("bool")
+        || return_type.starts_with("impl Iterator")
+        || return_type.starts_with("impl IntoIterator")
+        || return_type.starts_with("impl Display")
+        || return_type.starts_with("impl Debug")
+        || return_type.starts_with("&str")
+        || return_type.starts_with("String")
+        || return_type.starts_with("Vec<")
+        || return_type.starts_with("HashMap<")
+        || return_type.starts_with("HashSet<")
+        || return_type.starts_with("BTreeMap<")
+        || return_type.starts_with("BTreeSet<")
+}
+
+/// 检查函数签名是否返回需要 `#[must_use]` 的类型 (Session 116, Session 117 增强)
+///
+/// 检测返回 `Result`、`Option`、`bool`、`&str`、`String`、`Vec` 等不应被忽略的类型的公共函数。
 /// 仅检查同一行内包含 `->` 的函数签名。
 fn returns_must_use_type(line: &str) -> bool {
     // 必须包含 fn 关键字和返回类型箭头
@@ -923,11 +1048,41 @@ fn returns_must_use_type(line: &str) -> bool {
     };
     let return_part = &line[arrow_pos + 2..];
     let return_type = return_part.trim();
-    return_type.starts_with("Result")
-        || return_type.starts_with("Option")
-        || return_type.starts_with("bool")
-        || return_type.starts_with("impl Iterator")
-        || return_type.starts_with("impl IntoIterator")
+    is_must_use_return_type(return_type)
+}
+
+/// 检查多行函数签名是否返回需要 `#[must_use]` 的类型 (Session 117)
+///
+/// 当函数签名跨越多行时 (如 `->` 在下一行), 向下查找返回类型。
+/// 最多查找 5 行, 遇到 `{` 则认为函数体已开始, 无返回类型。
+fn returns_must_use_type_multiline(lines: &[&str], line_num: usize) -> bool {
+    // 如果当前行已能检测到, 直接返回
+    if returns_must_use_type(lines[line_num]) {
+        return true;
+    }
+    // 如果当前行有 fn 但没有 ->, 向下查找
+    if !lines[line_num].contains("fn ") {
+        return false;
+    }
+    if lines[line_num].contains("->") {
+        return false; // 单行有 -> 但未被检测到, 说明不是 must_use 类型
+    }
+    // 向下查找 -> (最多 5 行)
+    for i in 1..=5 {
+        if line_num + i >= lines.len() {
+            break;
+        }
+        let next_line = lines[line_num + i].trim();
+        if let Some(arrow_pos) = next_line.find("->") {
+            let return_type = next_line[arrow_pos + 2..].trim();
+            return is_must_use_return_type(return_type);
+        }
+        // 如果遇到 { 说明函数体开始, 没有返回类型
+        if next_line.contains('{') {
+            return false;
+        }
+    }
+    false
 }
 
 /// 检查函数声明前是否有 `#[must_use]` 属性 (Session 116)
@@ -1043,6 +1198,33 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                 });
             }
 
+            // Session 117: 检查 .unwrap_or()
+            if contains_pattern_outside_comment(trimmed, ".unwrap_or(") {
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::UnwrapOr,
+                    message: "使用 .unwrap_or() — 可能掩盖错误, 确认是否应传播错误".to_string(),
+                    suggestion: Some(
+                        "如果操作可能失败, 使用 `?` 传播错误; 如果有合理默认值, 添加注释说明原因"
+                            .to_string(),
+                    ),
+                });
+            }
+
+            // Session 117: 检查 .unwrap_or_default()
+            if contains_pattern_outside_comment(trimmed, ".unwrap_or_default()") {
+                issues.push(QualityIssue {
+                    line: line_num + 1,
+                    issue_type: IssueType::UnwrapOrDefault,
+                    message: "使用 .unwrap_or_default() — 可能掩盖错误, 确认是否应传播错误"
+                        .to_string(),
+                    suggestion: Some(
+                        "如果操作可能失败, 使用 `?` 传播错误; 如果默认值合理, 添加注释说明原因"
+                            .to_string(),
+                    ),
+                });
+            }
+
             // 检查 todo!()
             if contains_pattern_outside_comment(trimmed, "todo!()")
                 || contains_pattern_outside_comment(trimmed, "todo!(")
@@ -1145,9 +1327,9 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                 });
             }
 
-            // Session 116: 检查公共函数返回 Result/Option/bool 缺少 #[must_use]
+            // Session 116/117: 检查公共函数返回 Result/Option/bool 缺少 #[must_use]
             if is_public_api_declaration(trimmed)
-                && returns_must_use_type(trimmed)
+                && returns_must_use_type_multiline(&lines, line_num)
                 && !has_must_use_attribute(&lines, line_num)
             {
                 let item_desc = extract_public_item_type(trimmed);
@@ -1185,6 +1367,8 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
 /// - `UnsafeBlock`/`UnsafeFn`/`UnsafeImpl`: 添加 `// SAFETY:` 注释
 /// - `MissingDoc`: 添加 `/// TODO:` 文档注释占位符
 /// - `MissingMustUse`: 添加 `#[must_use]` 属性
+/// - `UnwrapOr`: 添加 `// REVIEW:` 注释 (Session 117)
+/// - `UnwrapOrDefault`: 添加 `// REVIEW:` 注释 (Session 117)
 ///
 /// # 示例
 ///
@@ -1285,7 +1469,95 @@ pub fn generate_fix(issue: &QualityIssue, original_line: &str) -> Option<String>
             let indent_str = &original_line[..indent_len];
             Some(format!("{}#[must_use]\n{}", indent_str, original_line))
         }
+        IssueType::UnwrapOr => {
+            let indent_len = original_line.len() - original_line.trim_start().len();
+            let indent_str = &original_line[..indent_len];
+            Some(format!(
+                "{}// REVIEW: 确认 unwrap_or 是否应改为 ? 传播错误\n{}",
+                indent_str, original_line
+            ))
+        }
+        IssueType::UnwrapOrDefault => {
+            let indent_len = original_line.len() - original_line.trim_start().len();
+            let indent_str = &original_line[..indent_len];
+            Some(format!(
+                "{}// REVIEW: 确认 unwrap_or_default 是否应改为 ? 传播错误\n{}",
+                indent_str, original_line
+            ))
+        }
     }
+}
+
+/// 获取修复优先级 — 同一行的多个问题按优先级排序 (Session 117)
+///
+/// 优先级 0: 原地修复 (修改行内容, 不改变行数)
+/// 优先级 1: 前缀修复 (在行前添加注释/属性)
+/// 优先级 2: 文档注释前缀 (应在属性之后, 代码之前)
+fn fix_priority(issue_type: &IssueType) -> u8 {
+    match issue_type {
+        IssueType::Unwrap
+        | IssueType::Expect
+        | IssueType::Todo
+        | IssueType::Unimplemented
+        | IssueType::Panic
+        | IssueType::Unreachable => 0,
+        IssueType::UnsafeBlock
+        | IssueType::UnsafeFn
+        | IssueType::UnsafeImpl
+        | IssueType::UnwrapOr
+        | IssueType::UnwrapOrDefault
+        | IssueType::MissingMustUse => 1,
+        IssueType::MissingDoc => 2,
+    }
+}
+
+/// 批量自动修复 — 对整个文件内容应用所有可修复的质量问题 (Session 117)
+///
+/// 调用 `validate_rust_code_quality_detailed` 检测所有问题,
+/// 然后对每个问题调用 `generate_fix` 生成修复, 合并后返回修复后的完整内容。
+///
+/// 处理顺序: 从最后一行向第一行处理 (避免行号偏移),
+/// 同一行内按优先级处理 (原地修复 → 前缀修复 → 文档注释)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_fixes;
+///
+/// let code = "fn foo() { let x = bar().unwrap(); }";
+/// let fixed = apply_fixes(code);
+/// assert!(!fixed.contains(".unwrap()"));
+/// assert!(fixed.contains('?'));
+/// ```
+pub fn apply_fixes(content: &str) -> String {
+    let issues = validate_rust_code_quality_detailed(content);
+    if issues.is_empty() {
+        return content.to_string();
+    }
+
+    let mut result_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    // 按行号降序排列 (从底向顶处理), 同一行按优先级升序 (原地修复先于前缀修复)
+    let mut sorted_issues = issues;
+    sorted_issues.sort_by(|a, b| {
+        b.line
+            .cmp(&a.line)
+            .then(fix_priority(&a.issue_type).cmp(&fix_priority(&b.issue_type)))
+    });
+
+    for issue in &sorted_issues {
+        if issue.line == 0 || issue.line > result_lines.len() {
+            continue;
+        }
+        let line_idx = issue.line - 1; // 转为 0-based
+        let original_line = result_lines[line_idx].clone();
+        if let Some(fixed) = generate_fix(issue, &original_line) {
+            let fixed_lines: Vec<String> = fixed.lines().map(|s| s.to_string()).collect();
+            result_lines.splice(line_idx..=line_idx, fixed_lines);
+        }
+    }
+
+    result_lines.join("\n")
 }
 
 fn guess_language_from_path(path: &str) -> String {
@@ -2901,7 +3173,7 @@ fn foo<T>(x: T) -> i32 where T: Sized {
     #[test]
     fn test_returns_must_use_type_not_matching() {
         assert!(!returns_must_use_type("pub fn foo() -> i32 {"));
-        assert!(!returns_must_use_type("pub fn foo() -> String {"));
+        assert!(!returns_must_use_type("pub fn foo() -> u64 {"));
         assert!(!returns_must_use_type("pub fn foo() {}"));
         assert!(!returns_must_use_type("pub struct Foo {"));
     }
@@ -3296,5 +3568,500 @@ fn foo(x: Option<i32>) {
         let code = "fn foo(x: Option<i32>) -> i32 { let Some(v) = x else { return 0;";
         let result = validate_rust_braces(code);
         assert!(result.is_some(), "缺少闭合大括号的 let-else 应报告问题");
+    }
+
+    // ===== Session 117: strip_string_content raw string / byte string 测试 =====
+
+    #[test]
+    fn test_strip_string_content_raw_string_basic() {
+        // r"..." — raw string
+        assert_eq!(
+            strip_string_content(r#"let s = r"unsafe { }";"#),
+            r#"let s = r"";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_raw_string_with_hash() {
+        // r#"..."# — raw string with one hash
+        assert_eq!(
+            strip_string_content(r##"let s = r#"unsafe { }"#;"##),
+            r##"let s = r#""#;"##
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_raw_string_with_double_hash() {
+        // r##"..."## — raw string with two hashes
+        let input = r###"let s = r##"unsafe"##;"###;
+        let expected = r###"let s = r##""##;"###;
+        assert_eq!(strip_string_content(input), expected);
+    }
+
+    #[test]
+    fn test_strip_string_content_byte_string() {
+        // b"..." — byte string
+        assert_eq!(
+            strip_string_content(r#"let s = b"unsafe { }";"#),
+            r#"let s = b"";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_raw_byte_string() {
+        // br"..." — raw byte string
+        assert_eq!(
+            strip_string_content(r#"let s = br"unsafe { }";"#),
+            r#"let s = br"";"#
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_raw_byte_string_with_hash() {
+        // br#"..."# — raw byte string with hash
+        assert_eq!(
+            strip_string_content(r##"let s = br#"unsafe"#;"##),
+            r##"let s = br#""#;"##
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_mixed_strings() {
+        // 混合: 普通字符串 + raw string + 字节字符串
+        let input = r#"let a = "x"; let b = r"y"; let c = b"z";"#;
+        let result = strip_string_content(input);
+        assert_eq!(result, r#"let a = ""; let b = r""; let c = b"";"#);
+    }
+
+    #[test]
+    fn test_strip_string_content_raw_string_with_inner_quotes() {
+        // raw string 内部包含引号 — 全部内容应被移除
+        let input = r##"let s = r#"inner "quote" unsafe"#;"##;
+        let result = strip_string_content(input);
+        assert_eq!(result, r##"let s = r#""#;"##);
+    }
+
+    #[test]
+    fn test_strip_string_content_not_string_prefix() {
+        // return / break 不应被误认为字符串前缀
+        assert_eq!(strip_string_content("return 42;"), "return 42;");
+        assert_eq!(strip_string_content("break;"), "break;");
+        assert_eq!(strip_string_content("let r = 5;"), "let r = 5;");
+        assert_eq!(strip_string_content("let b = 3;"), "let b = 3;");
+    }
+
+    #[test]
+    fn test_strip_string_content_unsafe_in_raw_string_not_flagged() {
+        // raw string 中的 unsafe 不应出现在 strip 后的结果中
+        let input = r#"let s = r"unsafe { } block";"#;
+        let stripped = strip_string_content(input);
+        assert!(
+            !stripped.contains("unsafe { }"),
+            "raw string 内容应被移除, 不含 unsafe"
+        );
+    }
+
+    #[test]
+    fn test_strip_string_content_unsafe_in_byte_string_not_flagged() {
+        // 字节字符串中的 unsafe 不应出现在 strip 后的结果中
+        let input = r#"let s = b"unsafe block";"#;
+        let stripped = strip_string_content(input);
+        assert!(!stripped.contains("unsafe block"), "字节字符串内容应被移除");
+    }
+
+    #[test]
+    fn test_strip_string_content_regular_string_still_works() {
+        // 确保原有功能不受影响
+        assert_eq!(
+            strip_string_content(r#"let s = "hello \"world\"";"#),
+            r#"let s = "";"#
+        );
+    }
+
+    // ===== Session 117: is_must_use_return_type 测试 =====
+
+    #[test]
+    fn test_is_must_use_return_type_result() {
+        assert!(is_must_use_return_type("Result<i32, Error>"));
+        assert!(is_must_use_return_type("Result<(), Error>"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_option() {
+        assert!(is_must_use_return_type("Option<i32>"));
+        assert!(is_must_use_return_type("Option<&str>"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_bool() {
+        assert!(is_must_use_return_type("bool"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_string_types() {
+        assert!(is_must_use_return_type("&str"));
+        assert!(is_must_use_return_type("String"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_collections() {
+        assert!(is_must_use_return_type("Vec<i32>"));
+        assert!(is_must_use_return_type("HashMap<String, i32>"));
+        assert!(is_must_use_return_type("HashSet<i32>"));
+        assert!(is_must_use_return_type("BTreeMap<String, i32>"));
+        assert!(is_must_use_return_type("BTreeSet<i32>"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_impl_traits() {
+        assert!(is_must_use_return_type("impl Iterator<Item = i32>"));
+        assert!(is_must_use_return_type("impl IntoIterator"));
+        assert!(is_must_use_return_type("impl Display"));
+        assert!(is_must_use_return_type("impl Debug"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_non_must_use() {
+        assert!(!is_must_use_return_type("i32"));
+        assert!(!is_must_use_return_type("()"));
+        assert!(!is_must_use_return_type("u64"));
+        assert!(!is_must_use_return_type("Vec")); // 无泛型参数
+    }
+
+    // ===== Session 117: returns_must_use_type 扩展类型测试 =====
+
+    #[test]
+    fn test_returns_must_use_type_string() {
+        assert!(returns_must_use_type("pub fn name() -> &str { \"\" }"));
+        assert!(returns_must_use_type(
+            "pub fn name() -> String { String::new() }"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_vec() {
+        assert!(returns_must_use_type(
+            "pub fn items() -> Vec<i32> { vec![] }"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_hashmap() {
+        assert!(returns_must_use_type(
+            "pub fn map() -> HashMap<String, i32> { HashMap::new() }"
+        ));
+    }
+
+    // ===== Session 117: returns_must_use_type_multiline 测试 =====
+
+    #[test]
+    fn test_returns_must_use_type_multiline_single_line() {
+        let lines = vec!["pub fn foo() -> Result<i32, Error> { Ok(42) }"];
+        assert!(returns_must_use_type_multiline(&lines, 0));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_multiline_next_line() {
+        let lines = vec![
+            "pub fn foo()",
+            "    -> Result<i32, Error> {",
+            "    Ok(42)",
+            "}",
+        ];
+        assert!(returns_must_use_type_multiline(&lines, 0));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_multiline_two_lines_below() {
+        let lines = vec![
+            "pub fn foo(",
+            "    x: i32,",
+            ") -> Option<i32> {",
+            "    Some(x)",
+            "}",
+        ];
+        assert!(returns_must_use_type_multiline(&lines, 0));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_multiline_brace_before_arrow() {
+        // 函数体开始前没有返回类型
+        let lines = vec!["pub fn foo() {", "    let x = 42;", "}"];
+        assert!(!returns_must_use_type_multiline(&lines, 0));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_multiline_non_fn() {
+        let lines = vec!["let x = 42;"];
+        assert!(!returns_must_use_type_multiline(&lines, 0));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_multiline_non_must_use_type() {
+        let lines = vec!["pub fn foo() -> i32 { 42 }"];
+        assert!(!returns_must_use_type_multiline(&lines, 0));
+    }
+
+    // ===== Session 117: validate_rust_code_quality_detailed unwrap_or/unwrap_or_default =====
+
+    #[test]
+    fn test_validate_quality_detects_unwrap_or() {
+        let issues =
+            validate_rust_code_quality_detailed("fn foo() { let x = bar().unwrap_or(0); }");
+        assert!(
+            issues.iter().any(|i| i.issue_type == IssueType::UnwrapOr),
+            "应检测 .unwrap_or()"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_detects_unwrap_or_default() {
+        let issues =
+            validate_rust_code_quality_detailed("fn foo() { let x = bar().unwrap_or_default(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::UnwrapOrDefault),
+            "应检测 .unwrap_or_default()"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_unwrap_or_in_test_module_allowed() {
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        let x: Option<i32> = None;
+        let v = x.unwrap_or(0);
+        assert_eq!(v, 0);
+    }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            !issues.iter().any(|i| i.issue_type == IssueType::UnwrapOr),
+            "测试模块中的 unwrap_or 不应报告"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_unwrap_or_default_in_test_module_allowed() {
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        let x: Option<i32> = None;
+        let v = x.unwrap_or_default();
+        assert_eq!(v, 0);
+    }
+}
+"#;
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::UnwrapOrDefault),
+            "测试模块中的 unwrap_or_default 不应报告"
+        );
+    }
+
+    // ===== Session 117: generate_fix unwrap_or / unwrap_or_default 测试 =====
+
+    #[test]
+    fn test_generate_fix_unwrap_or() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::UnwrapOr,
+            message: "使用 .unwrap_or()".to_string(),
+            suggestion: None,
+        };
+        let original = "let x = foo().unwrap_or(0);";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("REVIEW:"));
+        assert!(fixed.as_ref().unwrap().contains("unwrap_or"));
+    }
+
+    #[test]
+    fn test_generate_fix_unwrap_or_default() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::UnwrapOrDefault,
+            message: "使用 .unwrap_or_default()".to_string(),
+            suggestion: None,
+        };
+        let original = "let x = foo().unwrap_or_default();";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed.as_ref().unwrap().contains("REVIEW:"));
+        assert!(fixed.as_ref().unwrap().contains("unwrap_or_default"));
+    }
+
+    #[test]
+    fn test_generate_fix_unwrap_or_preserves_indentation() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::UnwrapOr,
+            message: "使用 .unwrap_or()".to_string(),
+            suggestion: None,
+        };
+        let original = "    let x = foo().unwrap_or(0);";
+        let fixed = generate_fix(&issue, original).unwrap();
+        assert!(fixed.starts_with("    // REVIEW:"));
+    }
+
+    // ===== Session 117: apply_fixes 测试 =====
+
+    #[test]
+    fn test_apply_fixes_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let fixed = apply_fixes(code);
+        assert_eq!(fixed, code);
+    }
+
+    #[test]
+    fn test_apply_fixes_single_unwrap() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains(".unwrap()"));
+        assert!(fixed.contains('?'));
+    }
+
+    #[test]
+    fn test_apply_fixes_multiple_different_lines() {
+        let code = "fn foo() {\n    let x = a().unwrap();\n    let y = b().unwrap();\n}";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains(".unwrap()"));
+        // 两处都应被修复
+        let q_count = fixed.matches('?').count();
+        assert!(q_count >= 2, "两处 unwrap 都应被修复为 ?, got: {}", fixed);
+    }
+
+    #[test]
+    fn test_apply_fixes_missing_doc_and_must_use_same_line() {
+        // 同一行有 MissingDoc 和 MissingMustUse 两个问题
+        let code = "pub fn foo() -> bool { true }";
+        let fixed = apply_fixes(code);
+        // 应同时添加文档注释和 #[must_use]
+        assert!(fixed.contains("/// TODO:"), "应添加文档注释: {}", fixed);
+        assert!(
+            fixed.contains("#[must_use]"),
+            "应添加 #[must_use]: {}",
+            fixed
+        );
+        // 文档注释应在 #[must_use] 之前
+        let doc_pos = fixed.find("/// TODO:").unwrap();
+        let must_use_pos = fixed.find("#[must_use]").unwrap();
+        assert!(doc_pos < must_use_pos, "文档注释应在 #[must_use] 之前");
+    }
+
+    #[test]
+    fn test_apply_fixes_unwrap_and_missing_doc_same_line() {
+        // 同一行有 unwrap 和 missing_doc
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(fixed.contains("/// TODO:"), "应添加文档注释");
+        assert!(fixed.contains('?'), "应包含 ? 操作符");
+    }
+
+    #[test]
+    fn test_apply_fixes_todo_and_unreachable() {
+        let code = "fn foo() { let x = todo!(); let y = unreachable!(); }";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains("todo!"), "todo! 应被修复");
+        assert!(!fixed.contains("unreachable!"), "unreachable! 应被修复");
+        assert!(fixed.contains("Err(anyhow!"), "应包含 Err(anyhow!(");
+    }
+
+    #[test]
+    fn test_apply_fixes_preserves_code_structure() {
+        let code = "fn foo() {\n    let x = bar().unwrap();\n    println!(\"{}\");\n}";
+        let fixed = apply_fixes(code);
+        let lines: Vec<&str> = fixed.lines().collect();
+        // 基本结构应保留
+        assert!(lines[0].contains("fn foo()"));
+        assert!(lines[lines.len() - 1].contains("}"));
+    }
+
+    #[test]
+    fn test_apply_fixes_unwrap_or_adds_review() {
+        let code = "fn foo() { let x = bar().unwrap_or(0); }";
+        let fixed = apply_fixes(code);
+        assert!(fixed.contains("REVIEW:"), "应添加 REVIEW 注释");
+        assert!(
+            fixed.contains("unwrap_or"),
+            "原始 unwrap_or 应保留 (添加了注释前缀)"
+        );
+    }
+
+    #[test]
+    fn test_apply_fixes_unwrap_or_default_adds_review() {
+        let code = "fn foo() { let x = bar().unwrap_or_default(); }";
+        let fixed = apply_fixes(code);
+        assert!(fixed.contains("REVIEW:"), "应添加 REVIEW 注释");
+    }
+
+    #[test]
+    fn test_apply_fixes_multiline_function() {
+        let code = "pub fn foo(\n    x: i32,\n) -> Vec<i32> {\n    vec![x]\n}";
+        let fixed = apply_fixes(code);
+        // 多行函数签名应检测到 Vec 返回类型需要 #[must_use]
+        assert!(
+            fixed.contains("#[must_use]"),
+            "多行函数签名应检测到 Vec 返回类型需要 #[must_use]: {}",
+            fixed
+        );
+    }
+
+    // ===== Session 117: validate_rust_code_quality_detailed 扩展 must_use 类型 =====
+
+    #[test]
+    fn test_validate_quality_detects_string_missing_must_use() {
+        let issues =
+            validate_rust_code_quality_detailed("pub fn name() -> String { String::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "返回 String 的公共函数应检测到缺少 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_detects_vec_missing_must_use() {
+        let issues = validate_rust_code_quality_detailed("pub fn items() -> Vec<i32> { vec![] }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "返回 Vec 的公共函数应检测到缺少 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_detects_str_ref_missing_must_use() {
+        let issues = validate_rust_code_quality_detailed(r#"pub fn name() -> &str { "" }"#);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "返回 &str 的公共函数应检测到缺少 #[must_use]"
+        );
+    }
+
+    #[test]
+    fn test_validate_quality_multiline_must_use_detection() {
+        let code = "pub fn foo(\n    x: i32,\n) -> Option<i32> {\n    Some(x)\n}";
+        let issues = validate_rust_code_quality_detailed(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "多行函数签名返回 Option 应检测到缺少 #[must_use]"
+        );
     }
 }
