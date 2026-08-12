@@ -107,6 +107,7 @@ pub mod trace_store;
 pub mod traits;
 pub mod watchdog;
 pub mod web_tool;
+pub mod web_tool_client;
 pub mod workspace;
 
 pub use auto_recovery::{
@@ -313,4 +314,5 @@ pub use watchdog::{
     event_priority, should_handle_event, should_trigger_auto_recovery, CaptchaWatchdog,
     ChromeWatchdog, PopupWatchdog, Watchdog, WatchdogRegistry,
 };
+pub use web_tool_client::{url_encode, CdpWebTool, MockWebTool};
 pub use workspace::Workspace;

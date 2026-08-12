@@ -3,13 +3,13 @@
 //! 实现 traits::WebTool trait，使用现有的 web_tool 模块功能
 //! 为 Orchestrator 提供 AI 自主网页搜索/文档查阅能力。
 
+use crate::cancellation_token::CancellationToken;
 use crate::cdp::CdpSession;
 use crate::traits::{WebSearchResult, WebTool};
-use crate::web_tool;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// 基于 CDP 的网页工具客户端
 ///
@@ -36,7 +36,12 @@ impl WebTool for CdpWebTool {
     ///
     /// 如果提供了 URL，直接导航到该 URL 并提取内容；
     /// 如果未提供 URL，构造 Google 搜索 URL 并提取搜索结果。
-    async fn search_web(&self, query: &str, url: Option<&str>) -> Result<WebSearchResult> {
+    async fn search_web(
+        &self,
+        query: &str,
+        url: Option<&str>,
+        _token: Option<&CancellationToken>,
+    ) -> Result<WebSearchResult> {
         let start = Instant::now();
         info!("开始网页搜索: query='{}', url={:?}", query, url);
 
@@ -44,10 +49,10 @@ impl WebTool for CdpWebTool {
             // 直接导航到指定 URL
             debug!("导航到指定 URL: {}", specific_url);
             self.session.navigate_and_wait(specific_url, 30_000).await?;
-            
+
             // 动态滚动以加载所有内容
             let _scroll_result = self.session.scroll_dynamic_page().await?;
-            
+
             // 提取页面内容
             let content = self.session.extract_page_content().await?;
             (specific_url.to_string(), content)
@@ -58,13 +63,13 @@ impl WebTool for CdpWebTool {
                 url_encode(query)
             );
             debug!("执行 Google 搜索: {}", search_url);
-            
+
             // 导航到搜索结果页
             self.session.navigate_and_wait(&search_url, 30_000).await?;
-            
+
             // 动态滚动加载更多结果
             let _scroll_result = self.session.scroll_dynamic_page().await?;
-            
+
             // 提取搜索结果
             let content = self.session.extract_search_results().await?;
             (search_url, content)
@@ -74,7 +79,10 @@ impl WebTool for CdpWebTool {
         info!("网页搜索完成: {}ms, {} 字符", duration_ms, content.len());
 
         // 记录到 DevTrace (如果启用)
-        debug!("网页搜索: query='{}', url='{}', duration={}ms", query, final_url, duration_ms);
+        debug!(
+            "网页搜索: query='{}', url='{}', duration={}ms",
+            query, final_url, duration_ms
+        );
 
         Ok(WebSearchResult {
             content,
@@ -84,32 +92,53 @@ impl WebTool for CdpWebTool {
     }
 
     /// 导航到指定 URL 并提取页面内容
-    async fn navigate_and_extract(&self, url: &str) -> Result<String> {
+    async fn navigate_and_extract(
+        &self,
+        url: &str,
+        _token: Option<&CancellationToken>,
+    ) -> Result<String> {
         info!("导航并提取页面内容: {}", url);
-        
+
         // 导航到页面
         self.session.navigate_and_wait(url, 30_000).await?;
-        
+
         // 动态滚动
         let _scroll_result = self.session.scroll_dynamic_page().await?;
-        
+
         // 提取内容
         let content = self.session.extract_page_content().await?;
-        
+
         info!("页面内容提取完成: {} 字符", content.len());
         Ok(content)
     }
 }
 
 /// URL 编码辅助函数
-fn url_encode(s: &str) -> String {
-    s.chars().map(|c| {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => "+".to_string(),
-            _ => format!("%{:02X}", c as u8),
-        }
-    }).collect()
+///
+/// 将字符串编码为 URL 安全格式 (RFC 3986):
+/// - 字母数字和 `-_.~` 保持不变
+/// - 空格编码为 `+`
+/// - 其他字符编码为 `%XX` (大写十六进制)
+///
+/// # 示例
+///
+/// ```
+/// use forge::web_tool_client::url_encode;
+///
+/// assert_eq!(url_encode("hello world"), "hello+world");
+/// assert_eq!(url_encode("rust-lang"), "rust-lang");
+/// assert_eq!(url_encode("c++"), "c%2B%2B");
+/// ```
+pub fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => "+".to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
 }
 
 /// Mock WebTool 实现 — 用于测试
@@ -129,17 +158,20 @@ impl MockWebTool {
 
     /// 设置预编程的搜索结果
     pub fn with_response(mut self, query: &str, response: &str) -> Self {
-        self.search_responses.insert(query.to_string(), response.to_string());
+        self.search_responses
+            .insert(query.to_string(), response.to_string());
         self
     }
 }
 
 #[async_trait::async_trait]
 impl WebTool for MockWebTool {
-    async fn search_web(&self, query: &str, url: Option<&str>) -> Result<WebSearchResult> {
-        // 模拟网络延迟
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+    async fn search_web(
+        &self,
+        query: &str,
+        url: Option<&str>,
+        _token: Option<&CancellationToken>,
+    ) -> Result<WebSearchResult> {
         let content = if let Some(specific_url) = url {
             format!(
                 "# Mock page content\n\nURL: {}\nQuery: {}\n\nThis is mock content for testing purposes.",
@@ -160,14 +192,15 @@ impl WebTool for MockWebTool {
         Ok(WebSearchResult {
             content,
             query: query.to_string(),
-            duration_ms: 100,
+            duration_ms: 0,
         })
     }
 
-    async fn navigate_and_extract(&self, url: &str) -> Result<String> {
-        // 模拟网络延迟
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        
+    async fn navigate_and_extract(
+        &self,
+        url: &str,
+        _token: Option<&CancellationToken>,
+    ) -> Result<String> {
         Ok(format!(
             "# Mock page content\n\nURL: {}\n\nThis is mock content for testing purposes.",
             url
@@ -189,15 +222,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_web_tool_search() {
-        let tool = MockWebTool::new()
-            .with_response("rust", "# Rust documentation\n\nRust is a systems programming language.");
+        let tool = MockWebTool::new().with_response(
+            "rust",
+            "# Rust documentation\n\nRust is a systems programming language.",
+        );
 
-        let result = tool.search_web("rust", None).await.unwrap();
+        let result = tool.search_web("rust", None, None).await.unwrap();
         assert_eq!(result.query, "rust");
         assert!(result.content.contains("Rust documentation"));
-        assert_eq!(result.duration_ms, 100);
+        assert_eq!(result.duration_ms, 0);
 
-        let result = tool.search_web("unknown", None).await.unwrap();
+        let result = tool.search_web("unknown", None, None).await.unwrap();
         assert!(result.content.contains("Mock search results"));
         assert!(result.content.contains("unknown"));
     }
@@ -206,8 +241,24 @@ mod tests {
     async fn test_mock_web_tool_navigate() {
         let tool = MockWebTool::new();
 
-        let result = tool.navigate_and_extract("https://example.com").await.unwrap();
+        let result = tool
+            .navigate_and_extract("https://example.com", None)
+            .await
+            .unwrap();
         assert!(result.contains("Mock page content"));
         assert!(result.contains("https://example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_web_tool_search_with_url() {
+        let tool = MockWebTool::new();
+
+        let result = tool
+            .search_web("test", Some("https://docs.example.com"), None)
+            .await
+            .unwrap();
+        assert!(result.content.contains("Mock page content"));
+        assert!(result.content.contains("https://docs.example.com"));
+        assert_eq!(result.query, "test");
     }
 }
