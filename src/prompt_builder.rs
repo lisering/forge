@@ -89,9 +89,9 @@ impl SystemPrompt {
         prompt
             .push_str("❌ 禁止: 使用 unsafe 块/函数/实现 (非必要不使用, 必须时添加 SAFETY 注释)\n");
         prompt.push_str("❌ 禁止: 使用 unreachable!() 宏 (非测试代码)\n");
-        prompt.push_str(
-            "❌ 禁止: 滥用 unwrap_or()/unwrap_or_default() 掩盖错误 (确认是否应传播)\n\n",
-        );
+        prompt
+            .push_str("❌ 禁止: 滥用 unwrap_or()/unwrap_or_default() 掩盖错误 (确认是否应传播)\n");
+        prompt.push_str("❌ 禁止: 使用 ? 操作符的函数不返回 Result/Option 类型 (Session 119)\n\n");
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -357,6 +357,17 @@ mod tests {
         assert!(
             prompt.contains("PathBuf"),
             "系统 prompt 应在 #[must_use] 要求中包含 PathBuf 类型"
+        );
+    }
+
+    // ===== Session 119: ? 操作符返回类型约束测试 =====
+
+    #[test]
+    fn test_build_contains_question_mark_result_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("? 操作符的函数不返回 Result/Option"),
+            "系统 prompt 应包含 ? 操作符函数必须返回 Result/Option 的约束"
         );
     }
 }

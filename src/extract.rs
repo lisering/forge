@@ -666,6 +666,8 @@ pub enum IssueType {
     UnwrapOr,
     /// 使用 `.unwrap_or_default()` — 可能掩盖错误 (Session 117)
     UnwrapOrDefault,
+    /// 函数使用 `?` 操作符但未返回 `Result` 类型 (Session 119)
+    MissingResultReturn,
 }
 
 /// 代码质量问题 — 包含行号、类型、消息和自动修复建议 (Session 115)
@@ -1409,10 +1411,251 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
         }
     }
 
+    // Session 119: 检测使用 ? 操作符但未返回 Result 的函数
+    issues.extend(detect_missing_result_returns(content));
+
     issues
 }
 
-/// 为质量问题生成自动修复代码 (Session 116)
+/// 检测使用 `?` 操作符或将被修复为 `?`/`Err` 的模式但未返回 `Result` 类型的函数 (Session 119)
+///
+/// 扫描代码中所有函数, 当函数体内使用了以下模式但函数签名未返回 `Result` 时,
+/// 报告 `MissingResultReturn` 问题:
+/// - `?` 操作符 (已在使用)
+/// - `.unwrap()` / `.expect()` (将被修复为 `?`)
+/// - `todo!()` / `unimplemented!()` / `panic!()` / `unreachable!()` (将被修复为 `Err`)
+///
+/// 此检测在 `validate_rust_code_quality_detailed` 中调用。
+/// 检测 `.unwrap()` 等模式确保 `apply_fixes` 一次性修复函数签名和函数体, 保持幂等性。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{detect_missing_result_returns, IssueType};
+///
+/// // 函数使用 ? 但不返回 Result
+/// let issues = detect_missing_result_returns("fn foo() { let x = bar()?; }");
+/// assert!(issues.iter().any(|i| i.issue_type == IssueType::MissingResultReturn));
+///
+/// // 函数使用 unwrap 但不返回 Result — 也会被检测 (unwrap 将被修复为 ?)
+/// let issues = detect_missing_result_returns("fn foo() { let x = bar().unwrap(); }");
+/// assert!(issues.iter().any(|i| i.issue_type == IssueType::MissingResultReturn));
+///
+/// // 函数返回 Result — 无问题
+/// let issues = detect_missing_result_returns("fn foo() -> Result<(), Error> { let x = bar()?; Ok(()) }");
+/// assert!(issues.is_empty());
+/// ```
+pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut issues = Vec::new();
+
+    let mut func_start_line: Option<usize> = None;
+    let mut brace_depth: i32 = 0;
+    let mut needs_result = false;
+    let mut returns_result = false;
+    let mut in_test_module = false;
+    let mut test_module_brace_depth = 0i32;
+
+    for (line_num, &line) in lines.iter().enumerate() {
+        let stripped = strip_string_content(line);
+        let trimmed = stripped.trim();
+
+        // 跟踪测试模块
+        if trimmed.starts_with("mod ") && trimmed.contains("test") && stripped.contains('{') {
+            in_test_module = true;
+            let opens = stripped.matches('{').count();
+            let closes = stripped.matches('}').count();
+            test_module_brace_depth = opens as i32 - closes as i32;
+            if test_module_brace_depth <= 0 {
+                in_test_module = false;
+            }
+            continue;
+        }
+        if in_test_module {
+            let opens = stripped.matches('{').count();
+            let closes = stripped.matches('}').count();
+            test_module_brace_depth += opens as i32 - closes as i32;
+            if test_module_brace_depth <= 0 {
+                in_test_module = false;
+            }
+            continue;
+        }
+
+        // 检测函数开始
+        if func_start_line.is_none() {
+            if contains_fn_keyword(&stripped)
+                && !trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+            {
+                func_start_line = Some(line_num);
+                needs_result = false;
+                returns_result = stripped.contains("-> Result")
+                    || stripped.contains("-> Option")
+                    || stripped.contains("-> impl Iterator");
+
+                if stripped.contains('{') {
+                    let opens = stripped.matches('{').count();
+                    let closes = stripped.matches('}').count();
+                    brace_depth = opens as i32 - closes as i32;
+
+                    if contains_result_requiring_pattern(&stripped, line) {
+                        needs_result = true;
+                    }
+
+                    if brace_depth <= 0 {
+                        if needs_result && !returns_result {
+                            push_missing_result_issue(&mut issues, func_start_line.unwrap());
+                        }
+                        func_start_line = None;
+                        brace_depth = 0;
+                    }
+                }
+            }
+        } else if brace_depth == 0 {
+            // 多行签名收集阶段
+            if !returns_result
+                && (stripped.contains("-> Result")
+                    || stripped.contains("-> Option")
+                    || stripped.contains("-> impl Iterator"))
+            {
+                returns_result = true;
+            }
+            if stripped.contains('{') {
+                let opens = stripped.matches('{').count();
+                let closes = stripped.matches('}').count();
+                brace_depth = opens as i32 - closes as i32;
+
+                if !returns_result
+                    && (stripped.contains("-> Result")
+                        || stripped.contains("-> Option")
+                        || stripped.contains("-> impl Iterator"))
+                {
+                    returns_result = true;
+                }
+                if contains_result_requiring_pattern(&stripped, line) {
+                    needs_result = true;
+                }
+
+                if brace_depth <= 0 {
+                    if needs_result && !returns_result {
+                        push_missing_result_issue(&mut issues, func_start_line.unwrap());
+                    }
+                    func_start_line = None;
+                    brace_depth = 0;
+                }
+            }
+        } else {
+            // 函数体内
+            let opens = stripped.matches('{').count();
+            let closes = stripped.matches('}').count();
+            brace_depth += opens as i32 - closes as i32;
+
+            if contains_result_requiring_pattern(&stripped, line) {
+                needs_result = true;
+            }
+
+            if brace_depth <= 0 {
+                if needs_result && !returns_result {
+                    push_missing_result_issue(&mut issues, func_start_line.unwrap());
+                }
+                func_start_line = None;
+                brace_depth = 0;
+            }
+        }
+    }
+
+    issues
+}
+
+/// 检查 stripped 行是否包含 `fn` 关键字 (辅助函数, Session 119)
+fn contains_fn_keyword(stripped: &str) -> bool {
+    // 检查 "fn " 或 "fn\t" 或 "fn{" 或 "fn("
+    stripped.contains("fn ")
+        || stripped.contains("fn\t")
+        || stripped.contains("fn(")
+        || stripped.contains("fn{")
+}
+
+/// 检查行是否包含需要函数返回 Result 的模式 (辅助函数, Session 119)
+///
+/// 以下模式在 `apply_fixes` 后会使用 `?` 或 `Err(anyhow!(...))`:
+/// - `?` 操作符 (已在代码中使用)
+/// - `.unwrap()` → `?`
+/// - `.expect(` → `?`
+/// - `todo!(` → `Err(anyhow!(...))`
+/// - `unimplemented!(` → `Err(anyhow!(...))`
+/// - `panic!(` → `return Err(anyhow!(...))`
+/// - `unreachable!(` → `return Err(anyhow!(...))`
+fn contains_result_requiring_pattern(stripped: &str, original_line: &str) -> bool {
+    // 检查 ? 操作符 (排除注释和字符串)
+    if stripped.contains('?') && !is_in_comment_or_string(original_line, '?') {
+        return true;
+    }
+    // 对其他模式, 使用 contains_pattern_outside_comment 排除注释中的匹配
+    if contains_pattern_outside_comment(stripped, ".unwrap()") {
+        return true;
+    }
+    if contains_pattern_outside_comment(stripped, ".expect(") {
+        return true;
+    }
+    if contains_pattern_outside_comment(stripped, "todo!(") {
+        return true;
+    }
+    if contains_pattern_outside_comment(stripped, "unimplemented!(") {
+        return true;
+    }
+    if contains_pattern_outside_comment(stripped, "panic!(") {
+        return true;
+    }
+    if contains_pattern_outside_comment(stripped, "unreachable!(") {
+        return true;
+    }
+    false
+}
+
+/// 推送 MissingResultReturn 问题 (辅助函数, Session 119)
+fn push_missing_result_issue(issues: &mut Vec<QualityIssue>, line: usize) {
+    issues.push(QualityIssue {
+        line: line + 1,
+        issue_type: IssueType::MissingResultReturn,
+        message: "函数使用 ? 操作符但未返回 Result 类型".to_string(),
+        suggestion: Some("将函数返回类型改为 `Result<T, anyhow::Error>`".to_string()),
+    });
+}
+
+/// 检查字符是否在注释中 (辅助函数, Session 119)
+///
+/// 使用 `strip_string_content` 已移除字符串内容后, 仍需检查 `?` 是否在行注释中。
+/// 返回 `true` 表示字符在注释中 (应跳过), `false` 表示字符在代码中 (应报告)。
+fn is_in_comment_or_string(line: &str, target: char) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_line_comment = false;
+
+    while i < chars.len() {
+        if in_line_comment {
+            return true;
+        }
+        if in_string {
+            if chars[i] == '"' && (i == 0 || chars[i - 1] != '\\') {
+                in_string = false;
+            }
+        } else {
+            if chars[i] == '"' {
+                in_string = true;
+            } else if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+                in_line_comment = true;
+            } else if chars[i] == target {
+                return false;
+            }
+        }
+        i += 1;
+    }
+    true
+}
+
+/// 为质量问题生成自动修复代码 (Session 116, Session 119 增强)
 ///
 /// 接收 `QualityIssue` 和原始行内容, 返回修复后的行内容 (如果有自动修复)。
 ///
@@ -1429,6 +1672,7 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
 /// - `MissingMustUse`: 添加 `#[must_use]` 属性
 /// - `UnwrapOr`: 添加 `// REVIEW:` 注释 (Session 117)
 /// - `UnwrapOrDefault`: 添加 `// REVIEW:` 注释 (Session 117)
+/// - `MissingResultReturn`: 修改函数签名添加 `-> Result<T, anyhow::Error>` (Session 119)
 ///
 /// # 示例
 ///
@@ -1545,6 +1789,52 @@ pub fn generate_fix(issue: &QualityIssue, original_line: &str) -> Option<String>
                 indent_str, original_line
             ))
         }
+        IssueType::MissingResultReturn => {
+            // 函数使用 ? 但未返回 Result — 修改函数签名添加 -> Result<T, anyhow::Error>
+            // 两种情况:
+            // 1. fn foo() -> i32 { → fn foo() -> Result<i32, anyhow::Error> {
+            // 2. fn foo() { → fn foo() -> Result<(), anyhow::Error> {
+            let stripped = strip_string_content(original_line);
+            let trimmed = stripped.trim();
+
+            // 检查是否是函数签名行 (包含 fn 关键字)
+            if !trimmed.contains("fn ") && !trimmed.contains("fn\t") {
+                return None;
+            }
+
+            // 情况 1: 已有返回类型 -> ReturnType {
+            // 找到 -> 和 { 之间的返回类型
+            if let Some(arrow_pos) = stripped.find("->") {
+                // 找到 { 的位置
+                if let Some(brace_pos) = stripped[arrow_pos..].find('{') {
+                    let return_type = stripped[arrow_pos + 2..arrow_pos + brace_pos].trim();
+                    // 如果已经返回 Result, 不需要修复
+                    if return_type.starts_with("Result") {
+                        return None;
+                    }
+                    let before = &original_line[..arrow_pos + 2];
+                    let after = &original_line[arrow_pos + 2 + brace_pos..];
+                    return Some(format!(
+                        "{} Result<{}, anyhow::Error>{}",
+                        before, return_type, after
+                    ));
+                }
+            }
+
+            // 情况 2: 无返回类型 fn foo() {
+            // 在 { 前插入 -> Result<(), anyhow::Error>
+            if let Some(brace_pos) = stripped.find('{') {
+                // 确保这不是一个 struct/enum 定义
+                let before_brace = stripped[..brace_pos].trim();
+                if before_brace.contains("fn ") || before_brace.contains("fn\t") {
+                    let before = &original_line[..brace_pos];
+                    let after = &original_line[brace_pos..];
+                    return Some(format!("{}-> Result<(), anyhow::Error> {}", before, after));
+                }
+            }
+
+            None
+        }
     }
 }
 
@@ -1560,7 +1850,8 @@ fn fix_priority(issue_type: &IssueType) -> u8 {
         | IssueType::Todo
         | IssueType::Unimplemented
         | IssueType::Panic
-        | IssueType::Unreachable => 0,
+        | IssueType::Unreachable
+        | IssueType::MissingResultReturn => 0,
         IssueType::UnsafeBlock
         | IssueType::UnsafeFn
         | IssueType::UnsafeImpl
@@ -1710,6 +2001,272 @@ pub fn apply_fixes_dry_run(content: &str) -> FixPreview {
         issues,
         fixes_applied,
     }
+}
+
+/// 批量自动修复 (带过滤) — 只修复指定类型的问题 (Session 119)
+///
+/// 与 `apply_fixes` 功能相同, 但只对 `filter` 中列出的 `IssueType` 应用修复。
+/// 其他类型的问题会被检测但不修复, 适用于:
+/// - 只修复 unwrap/expect (高优先级安全风险), 不修复 missing_doc (低优先级)
+/// - 分阶段修复: 先修复原地修复类 (unwrap/expect/todo), 再修复前缀类 (doc/must_use)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{apply_fixes_filtered, IssueType};
+///
+/// let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+/// // 只修复 Unwrap, 不修复 MissingDoc / MissingMustUse
+/// let filter = [IssueType::Unwrap];
+/// let fixed = apply_fixes_filtered(code, &filter);
+/// assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+/// assert!(fixed.contains("pub fn foo()"), "函数签名应保留");
+/// ```
+pub fn apply_fixes_filtered(content: &str, filter: &[IssueType]) -> String {
+    if filter.is_empty() {
+        return content.to_string();
+    }
+
+    let all_issues = validate_rust_code_quality_detailed(content);
+    let issues: Vec<QualityIssue> = all_issues
+        .into_iter()
+        .filter(|issue| filter.contains(&issue.issue_type))
+        .collect();
+
+    if issues.is_empty() {
+        return content.to_string();
+    }
+
+    let mut result_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    // 按行号降序排列 (从底向顶处理), 同一行按优先级升序
+    let mut sorted_issues = issues;
+    sorted_issues.sort_by(|a, b| {
+        b.line
+            .cmp(&a.line)
+            .then(fix_priority(&a.issue_type).cmp(&fix_priority(&b.issue_type)))
+    });
+
+    for issue in &sorted_issues {
+        if issue.line == 0 || issue.line > result_lines.len() {
+            continue;
+        }
+        let line_idx = issue.line - 1;
+        let original_line = result_lines[line_idx].clone();
+        if let Some(fixed) = generate_fix(issue, &original_line) {
+            let fixed_lines: Vec<String> = fixed.lines().map(|s| s.to_string()).collect();
+            result_lines.splice(line_idx..=line_idx, fixed_lines);
+        }
+    }
+
+    result_lines.join("\n")
+}
+
+/// 批量自动修复 dry-run 模式 (带过滤) — 预览指定类型的修复 (Session 119)
+///
+/// 与 `apply_fixes_dry_run` 功能相同, 但只对 `filter` 中列出的 `IssueType` 应用修复。
+/// `issues` 字段仍包含所有检测到的问题 (不论是否在过滤列表中),
+/// `fixes_applied` 只统计被过滤后实际应用的修复数量。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{apply_fixes_dry_run_filtered, IssueType};
+///
+/// let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+/// // 只修复 Unwrap
+/// let filter = [IssueType::Unwrap];
+/// let preview = apply_fixes_dry_run_filtered(code, &filter);
+/// assert!(preview.is_changed, "应有变化");
+/// assert!(preview.fixes_applied > 0, "应有修复");
+/// assert!(!preview.fixed_content.contains(".unwrap()"), "unwrap 应被修复");
+/// // MissingDoc 和 MissingMustUse 问题仍应被检测到
+/// assert!(preview.issues.len() >= 2, "应检测到所有问题 (包括未过滤的)");
+/// ```
+pub fn apply_fixes_dry_run_filtered(content: &str, filter: &[IssueType]) -> FixPreview {
+    let issues = validate_rust_code_quality_detailed(content);
+    let fixed_content = apply_fixes_filtered(content, filter);
+    let fixes_applied = if fixed_content != content && !filter.is_empty() {
+        issues
+            .iter()
+            .filter(|issue| {
+                if !filter.contains(&issue.issue_type) {
+                    return false;
+                }
+                let lines: Vec<&str> = content.lines().collect();
+                if issue.line == 0 || issue.line > lines.len() {
+                    return false;
+                }
+                generate_fix(issue, lines[issue.line - 1]).is_some()
+            })
+            .count()
+    } else {
+        0
+    };
+
+    FixPreview {
+        is_changed: fixed_content != content,
+        original_content: content.to_string(),
+        fixed_content,
+        issues,
+        fixes_applied,
+    }
+}
+
+/// 幂等性验证结果 — 包含详细差异信息 (Session 119)
+///
+/// 当 `apply_fixes` 不满足幂等性时, 通过此结构体可以查看具体的差异,
+/// 包括第一次修复后剩余的问题和第二次修复后新增的问题。
+///
+/// # 字段
+///
+/// - `is_idempotent`: 是否幂等 (二次应用无变化)
+/// - `first_pass_issues`: 第一次修复后检测到的问题
+/// - `second_pass_issues`: 第二次修复后检测到的问题
+/// - `new_issues_in_second_pass`: 第二次修复后新增的问题 (不在第一次结果中)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_idempotent_detailed;
+///
+/// let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+/// assert!(result.is_idempotent, "无问题代码应幂等");
+/// assert!(result.first_pass_issues.is_empty());
+/// assert!(result.second_pass_issues.is_empty());
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IdempotencyResult {
+    /// 是否幂等 (二次应用无变化)
+    pub is_idempotent: bool,
+    /// 第一次修复后检测到的问题
+    pub first_pass_issues: Vec<QualityIssue>,
+    /// 第二次修复后检测到的问题
+    pub second_pass_issues: Vec<QualityIssue>,
+    /// 第二次修复后新增的问题 (不在第一次结果中)
+    pub new_issues_in_second_pass: Vec<QualityIssue>,
+}
+
+/// 验证 apply_fixes 的幂等性 — 返回详细差异 (Session 119)
+///
+/// 与 `verify_idempotent` 功能相同, 但返回 `IdempotencyResult` 结构体,
+/// 包含第一次和第二次修复后的具体问题列表, 便于调查非幂等的原因。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_idempotent_detailed;
+///
+/// // 无问题的代码是幂等的
+/// let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+/// assert!(result.is_idempotent);
+///
+/// // 有问题的代码, 修复后应幂等
+/// let result = verify_idempotent_detailed("fn foo() { let x = bar().unwrap(); }");
+/// assert!(result.is_idempotent, "修复后二次应用应无变化");
+/// ```
+pub fn verify_idempotent_detailed(content: &str) -> IdempotencyResult {
+    let first_pass = apply_fixes(content);
+    let first_pass_issues = validate_rust_code_quality_detailed(&first_pass);
+    let second_pass = apply_fixes(&first_pass);
+    let second_pass_issues = validate_rust_code_quality_detailed(&second_pass);
+
+    // 找出第二次修复后新增的问题 (不在第一次结果中)
+    let new_issues_in_second_pass: Vec<QualityIssue> = second_pass_issues
+        .iter()
+        .filter(|s| {
+            !first_pass_issues
+                .iter()
+                .any(|f| f.line == s.line && f.issue_type == s.issue_type)
+        })
+        .cloned()
+        .collect();
+
+    IdempotencyResult {
+        is_idempotent: first_pass == second_pass,
+        first_pass_issues,
+        second_pass_issues,
+        new_issues_in_second_pass,
+    }
+}
+
+/// 运行 clippy 检查 — 对项目目录执行 cargo clippy (Session 119)
+///
+/// 在代码写入工作区后调用, 返回 clippy 的警告和错误。
+/// 此函数需要项目目录中存在 `Cargo.toml` 文件。
+///
+/// # 参数
+///
+/// - `project_dir`: 项目目录路径 (包含 Cargo.toml)
+/// - `fix`: 是否使用 `--fix` 自动修复 (需要 nightly 工具链)
+///
+/// # 返回值
+///
+/// - `Ok(Vec<String>)`: clippy 输出的消息列表 (空列表表示无问题)
+/// - `Err(String)`: clippy 执行失败 (如 Cargo.toml 不存在或 clippy 未安装)
+///
+/// # 示例
+///
+/// ```no_run
+/// use forge::extract::run_clippy_check;
+///
+/// let messages = run_clippy_check("./projects/my-project", false).unwrap();
+/// if messages.is_empty() {
+///     println!("clippy 无警告");
+/// } else {
+///     for msg in &messages {
+///         println!("{}", msg);
+///     }
+/// }
+/// ```
+pub fn run_clippy_check(project_dir: &str, fix: bool) -> Result<Vec<String>, String> {
+    let cargo_toml = std::path::Path::new(project_dir).join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Err(format!("Cargo.toml 不存在于目录: {}", project_dir));
+    }
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.current_dir(project_dir)
+        .arg("clippy")
+        .arg("--message-format=short");
+
+    if fix {
+        cmd.arg("--fix").arg("--allow-dirty").arg("--allow-no-vcs");
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("执行 cargo clippy 失败: {}", e))?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut messages = Vec::new();
+
+    // clippy --message-format=short 输出格式:
+    // path:line:col: message
+    for line in stderr.lines().chain(stdout.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 跳过 cargo 自身的输出 (如 "Compiling...", "Finished...")
+        if trimmed.starts_with("Compiling")
+            || trimmed.starts_with("Finished")
+            || trimmed.starts_with("Downloading")
+            || trimmed.starts_with("Downloaded")
+            || trimmed.starts_with("warning: unused")
+            || trimmed.starts_with("Checking")
+        {
+            continue;
+        }
+        // 只保留 clippy 警告和错误 (包含 "warning:" 或 "error:")
+        if trimmed.contains("warning:") || trimmed.contains("error:") {
+            messages.push(trimmed.to_string());
+        }
+    }
+
+    Ok(messages)
 }
 
 /// 验证 apply_fixes 的幂等性 — 二次应用不应产生变化 (Session 118)
@@ -2499,7 +3056,12 @@ fn foo() -> i32 {
 }
 "#;
         let issues = validate_rust_code_quality(code);
-        assert_eq!(issues.len(), 3, "应检测到 3 个问题, got {}", issues.len());
+        assert_eq!(
+            issues.len(),
+            4,
+            "应检测到 4 个问题 (unwrap + expect + panic + MissingResultReturn), got {}",
+            issues.len()
+        );
     }
 
     #[test]
@@ -2521,11 +3083,11 @@ mod tests {
         let issues = validate_rust_code_quality(code);
         assert_eq!(
             issues.len(),
-            1,
-            "只应报告非测试代码中的 1 个 unwrap, got: {:?}",
+            2,
+            "应报告非测试代码中的 unwrap + MissingResultReturn, got: {:?}",
             issues
         );
-        assert!(issues[0].contains("unwrap"));
+        assert!(issues.iter().any(|i| i.contains("unwrap")));
     }
 
     #[test]
@@ -3113,8 +3675,8 @@ pub fn foo() {
 }
 "#;
         let issues = validate_rust_code_quality_detailed(code);
-        // 应有 3 个问题: MissingDoc (pub fn foo) + Unwrap + UnsafeBlock
-        assert_eq!(issues.len(), 3, "应有 3 个问题, got: {:?}", issues);
+        // 应有 4 个问题: MissingDoc (pub fn foo) + Unwrap + UnsafeBlock + MissingResultReturn
+        assert_eq!(issues.len(), 4, "应有 4 个问题, got: {:?}", issues);
         assert!(issues.iter().any(|i| i.issue_type == IssueType::MissingDoc));
         assert!(issues.iter().any(|i| i.issue_type == IssueType::Unwrap));
         assert!(issues
@@ -4451,5 +5013,346 @@ pub fn process(data: Vec<i32>) -> Option<i32> {
 }
 "#;
         assert!(verify_idempotent(code), "复杂代码修复后二次应用应无变化");
+    }
+
+    // ===== Session 119: apply_fixes_filtered 测试 =====
+
+    #[test]
+    fn test_apply_fixes_filtered_unwrap_only() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        let filter = [IssueType::Unwrap];
+        let fixed = apply_fixes_filtered(code, &filter);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(fixed.contains("pub fn foo()"), "函数签名应保留");
+        assert!(!fixed.contains("/// TODO:"), "不应添加文档注释 (未过滤)");
+    }
+
+    #[test]
+    fn test_apply_fixes_filtered_empty_filter() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let fixed = apply_fixes_filtered(code, &[]);
+        assert_eq!(fixed, code, "空过滤列表不应修改代码");
+    }
+
+    #[test]
+    fn test_apply_fixes_filtered_multiple_types() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        let filter = [IssueType::Unwrap, IssueType::MissingMustUse];
+        let fixed = apply_fixes_filtered(code, &filter);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(fixed.contains("#[must_use]"), "应添加 #[must_use]");
+    }
+
+    #[test]
+    fn test_apply_fixes_filtered_no_matching_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let filter = [IssueType::Unwrap];
+        let fixed = apply_fixes_filtered(code, &filter);
+        assert_eq!(fixed, code, "无匹配问题不应修改代码");
+    }
+
+    #[test]
+    fn test_apply_fixes_filtered_missing_doc_only() {
+        let code = "pub fn foo() -> bool { true }";
+        let filter = [IssueType::MissingDoc];
+        let fixed = apply_fixes_filtered(code, &filter);
+        assert!(fixed.contains("/// TODO:"), "应添加文档注释");
+        assert!(
+            !fixed.contains("#[must_use]"),
+            "不应添加 #[must_use] (未过滤)"
+        );
+    }
+
+    // ===== Session 119: apply_fixes_dry_run_filtered 测试 =====
+
+    #[test]
+    fn test_apply_fixes_dry_run_filtered_unwrap_only() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        let filter = [IssueType::Unwrap];
+        let preview = apply_fixes_dry_run_filtered(code, &filter);
+        assert!(preview.is_changed, "应有变化");
+        assert!(preview.fixes_applied > 0, "应有修复");
+        assert!(
+            !preview.fixed_content.contains(".unwrap()"),
+            "unwrap 应被修复"
+        );
+        assert!(preview.issues.len() >= 2, "应检测到所有问题 (包括未过滤的)");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_filtered_empty_filter() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_fixes_dry_run_filtered(code, &[]);
+        assert!(!preview.is_changed, "空过滤不应有变化");
+        assert_eq!(preview.fixes_applied, 0, "无修复");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_filtered_preserves_issues() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        let filter = [IssueType::Unwrap];
+        let preview = apply_fixes_dry_run_filtered(code, &filter);
+        // 应检测到 MissingDoc 和 MissingMustUse (即使未过滤)
+        assert!(
+            preview
+                .issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingDoc),
+            "应检测到 MissingDoc"
+        );
+        assert!(
+            preview
+                .issues
+                .iter()
+                .any(|i| i.issue_type == IssueType::MissingMustUse),
+            "应检测到 MissingMustUse"
+        );
+    }
+
+    // ===== Session 119: verify_idempotent_detailed 测试 =====
+
+    #[test]
+    fn test_verify_idempotent_detailed_clean_code() {
+        let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+        assert!(result.is_idempotent, "无问题代码应幂等");
+        assert!(result.first_pass_issues.is_empty(), "第一次应无问题");
+        assert!(result.second_pass_issues.is_empty(), "第二次应无问题");
+        assert!(result.new_issues_in_second_pass.is_empty(), "无新增问题");
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_with_unwrap() {
+        let result = verify_idempotent_detailed("fn foo() { let x = bar().unwrap(); }");
+        assert!(result.is_idempotent, "修复后二次应用应无变化");
+        assert!(result.new_issues_in_second_pass.is_empty(), "无新增问题");
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_with_missing_doc() {
+        let result = verify_idempotent_detailed("pub fn foo() {}");
+        assert!(result.is_idempotent, "修复后二次应用应无变化");
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_serde() {
+        let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+        let json = serde_json::to_string(&result).expect("序列化失败");
+        let deserialized: IdempotencyResult = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(deserialized.is_idempotent, result.is_idempotent);
+    }
+
+    // ===== Session 119: detect_missing_result_returns 测试 =====
+
+    #[test]
+    fn test_detect_missing_result_returns_question_mark() {
+        let issues = detect_missing_result_returns("fn foo() { let x = bar()?; }");
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_unwrap() {
+        let issues = detect_missing_result_returns("fn foo() { let x = bar().unwrap(); }");
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_expect() {
+        let issues = detect_missing_result_returns(r#"fn foo() { let x = bar().expect("msg"); }"#);
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_todo() {
+        let issues = detect_missing_result_returns("fn foo() { let x = todo!(); }");
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_panic() {
+        let issues = detect_missing_result_returns(r#"fn foo() { panic!("oops"); }"#);
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_already_result() {
+        let issues = detect_missing_result_returns(
+            "fn foo() -> Result<(), Error> { let x = bar()?; Ok(()) }",
+        );
+        assert!(issues.is_empty(), "返回 Result 的函数不应报告");
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_already_option() {
+        let issues =
+            detect_missing_result_returns("fn foo() -> Option<i32> { let x = bar()?; Some(42) }");
+        assert!(
+            issues.is_empty(),
+            "返回 Option 的函数不应报告 (? 兼容 Option)"
+        );
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_no_pattern() {
+        let issues = detect_missing_result_returns("fn foo() -> i32 { 42 }");
+        assert!(issues.is_empty(), "无 ?/unwrap/todo 的函数不应报告");
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_test_module() {
+        let code = r#"
+fn foo() { let x = bar().unwrap(); }
+
+#[cfg(test)]
+mod tests {
+    fn test_foo() { let x = bar().unwrap(); }
+}
+"#;
+        let issues = detect_missing_result_returns(code);
+        // 只报告 foo, 不报告 test_foo (在测试模块中)
+        assert_eq!(issues.len(), 1, "只应报告 1 个问题 (测试模块中的不报告)");
+        assert_eq!(issues[0].line, 2, "应报告第 2 行的 foo 函数");
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_multiline() {
+        let code = r#"
+fn foo(
+    x: i32,
+) {
+    let y = bar().unwrap();
+}
+"#;
+        let issues = detect_missing_result_returns(code);
+        assert!(issues
+            .iter()
+            .any(|i| i.issue_type == IssueType::MissingResultReturn));
+        assert_eq!(issues[0].line, 2, "应报告函数签名所在行");
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_question_in_comment() {
+        let issues = detect_missing_result_returns("fn foo() { // what?\n }");
+        assert!(issues.is_empty(), "注释中的 ? 不应报告");
+    }
+
+    // ===== Session 119: generate_fix MissingResultReturn 测试 =====
+
+    #[test]
+    fn test_generate_fix_missing_result_return_with_return_type() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingResultReturn,
+            message: "函数使用 ? 但未返回 Result".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() -> i32 { let x = bar()?; }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed
+            .as_ref()
+            .unwrap()
+            .contains("Result<i32, anyhow::Error>"));
+    }
+
+    #[test]
+    fn test_generate_fix_missing_result_return_no_return_type() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingResultReturn,
+            message: "函数使用 ? 但未返回 Result".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() { let x = bar()?; }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_some());
+        assert!(fixed
+            .as_ref()
+            .unwrap()
+            .contains("Result<(), anyhow::Error>"));
+    }
+
+    #[test]
+    fn test_generate_fix_missing_result_return_already_result() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingResultReturn,
+            message: "函数使用 ? 但未返回 Result".to_string(),
+            suggestion: None,
+        };
+        let original = "fn foo() -> Result<i32, Error> { let x = bar()?; }";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_none(), "已返回 Result 不需要修复");
+    }
+
+    #[test]
+    fn test_generate_fix_missing_result_return_not_fn() {
+        let issue = QualityIssue {
+            line: 1,
+            issue_type: IssueType::MissingResultReturn,
+            message: "函数使用 ? 但未返回 Result".to_string(),
+            suggestion: None,
+        };
+        let original = "let x = bar()?;";
+        let fixed = generate_fix(&issue, original);
+        assert!(fixed.is_none(), "非函数签名行不应修复");
+    }
+
+    // ===== Session 119: apply_fixes with MissingResultReturn 测试 =====
+
+    #[test]
+    fn test_apply_fixes_with_missing_result_return() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(
+            fixed.contains("Result<(), anyhow::Error>"),
+            "应添加 Result 返回类型"
+        );
+    }
+
+    #[test]
+    fn test_apply_fixes_with_missing_result_return_and_doc() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let fixed = apply_fixes(code);
+        assert!(!fixed.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(
+            fixed.contains("Result<(), anyhow::Error>"),
+            "应添加 Result 返回类型"
+        );
+        assert!(fixed.contains("/// TODO:"), "应添加文档注释");
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_missing_result_return() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        assert!(verify_idempotent(code), "MissingResultReturn 修复后应幂等");
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_todo_and_missing_result() {
+        let code = "fn foo() { let x = todo!(); }";
+        assert!(
+            verify_idempotent(code),
+            "todo!() + MissingResultReturn 修复后应幂等"
+        );
+    }
+
+    // ===== Session 119: run_clippy_check 测试 =====
+
+    #[test]
+    fn test_run_clippy_check_no_cargo_toml() {
+        let result = run_clippy_check("/nonexistent/path", false);
+        assert!(result.is_err(), "不存在的目录应返回错误");
+        assert!(result.unwrap_err().contains("Cargo.toml"));
     }
 }

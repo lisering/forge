@@ -207,9 +207,11 @@ pub use evaluator_synergy::{
     ScoreTrend, EVALUATOR_SYNERGY_HISTORY_FILENAME, MAX_SYNERGY_HISTORY_SESSIONS,
 };
 pub use extract::{
-    apply_fixes, apply_fixes_dry_run, extract_files, generate_fix, strip_string_content,
-    validate_rust_braces, validate_rust_code_quality, validate_rust_code_quality_detailed,
-    verify_idempotent, DefaultExtractor, FixPreview, IssueType, QualityIssue,
+    apply_fixes, apply_fixes_dry_run, apply_fixes_dry_run_filtered, apply_fixes_filtered,
+    detect_missing_result_returns, extract_files, generate_fix, run_clippy_check,
+    strip_string_content, validate_rust_braces, validate_rust_code_quality,
+    validate_rust_code_quality_detailed, verify_idempotent, verify_idempotent_detailed,
+    DefaultExtractor, FixPreview, IdempotencyResult, IssueType, QualityIssue,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
