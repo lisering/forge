@@ -114,7 +114,10 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Arc/Mutex/RwLock/Cell/RefCell 等类型但未导入 use std::sync::... / use std::cell::... (Session 125)\n",
 );
         prompt.push_str(
-"❌ 禁止: 使用 Command/Instant/Duration/TcpListener 等类型但未导入对应 use std::process::... / use std::time::... / use std::net::... (Session 125)\n\n",
+"❌ 禁止: 使用 Command/Instant/Duration/TcpListener 等类型但未导入对应 use std::process::... / use std::time::... / use std::net::... (Session 125)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 thread/Thread/JoinHandle/PhantomData/Cow/Sender/Receiver/AtomicBool 等类型但未导入对应 use std::thread::... / use std::marker::... / use std::borrow::... / use std::sync::mpsc::... / use std::sync::atomic::... (Session 126)\n\n",
 );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -491,6 +494,42 @@ mod tests {
         assert!(
             prompt.contains("quote!"),
             "系统 prompt 应包含 quote! 宏括号配对约束 (Session 123)"
+        );
+    }
+
+    // ===== Session 126: thread/marker/borrow/mpsc/atomic 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_thread_marker_borrow_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("thread"),
+            "系统 prompt 应包含 thread 导入约束 (Session 126)"
+        );
+        assert!(
+            prompt.contains("PhantomData"),
+            "系统 prompt 应包含 PhantomData 导入约束 (Session 126)"
+        );
+        assert!(
+            prompt.contains("Cow"),
+            "系统 prompt 应包含 Cow 导入约束 (Session 126)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_mpsc_atomic_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Sender"),
+            "系统 prompt 应包含 Sender 导入约束 (Session 126)"
+        );
+        assert!(
+            prompt.contains("AtomicBool"),
+            "系统 prompt 应包含 AtomicBool 导入约束 (Session 126)"
+        );
+        assert!(
+            prompt.contains("std::sync::atomic"),
+            "系统 prompt 应包含 std::sync::atomic 导入约束 (Session 126)"
         );
     }
 }

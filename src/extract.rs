@@ -4601,6 +4601,13 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
 /// - `env` → `use std::env;` (Session 125)
 /// - `Instant` / `Duration` → `use std::time::{Instant, Duration};` (Session 125)
 /// - `TcpListener` / `TcpStream` → `use std::net::{TcpListener, TcpStream};` (Session 125)
+/// - `thread` → `use std::thread;` (Session 126)
+/// - `Thread` / `JoinHandle` → `use std::thread::{Thread, JoinHandle};` (Session 126)
+/// - `PhantomData` → `use std::marker::PhantomData;` (Session 126)
+/// - `Cow` → `use std::borrow::Cow;` (Session 126)
+/// - `Sender` / `Receiver` → `use std::sync::mpsc::{Sender, Receiver};` (Session 126)
+/// - `Condvar` / `Barrier` → `use std::sync::{Condvar, Barrier};` (Session 126)
+/// - `AtomicBool` / `AtomicI32` / `AtomicU32` / ... → `use std::sync::atomic::{...};` (Session 126)
 ///
 /// # 规则
 ///
@@ -4609,6 +4616,7 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
 /// 3. 缺失的导入自动添加, 已有的不重复
 /// 4. 同一模块的多个类型合并为 `use std::module::{Type1, Type2};`
 /// 5. 幂等: 已有导入不重复添加
+/// 6. 同一模块的多个类型按字母序排列 (Session 126)
 ///
 /// # 示例
 ///
@@ -4677,6 +4685,27 @@ pub fn ensure_std_imports(content: &str) -> String {
         // net (Session 125)
         ("TcpListener", "std::net"),
         ("TcpStream", "std::net"),
+        // thread (Session 126)
+        ("thread", "std"),
+        ("Thread", "std::thread"),
+        ("JoinHandle", "std::thread"),
+        // marker (Session 126)
+        ("PhantomData", "std::marker"),
+        // borrow (Session 126)
+        ("Cow", "std::borrow"),
+        // sync::mpsc (Session 126)
+        ("Sender", "std::sync::mpsc"),
+        ("Receiver", "std::sync::mpsc"),
+        // sync additional (Session 126)
+        ("Condvar", "std::sync"),
+        ("Barrier", "std::sync"),
+        // sync::atomic (Session 126)
+        ("AtomicBool", "std::sync::atomic"),
+        ("AtomicI32", "std::sync::atomic"),
+        ("AtomicU32", "std::sync::atomic"),
+        ("AtomicI64", "std::sync::atomic"),
+        ("AtomicU64", "std::sync::atomic"),
+        ("AtomicUsize", "std::sync::atomic"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -4713,14 +4742,16 @@ pub fn ensure_std_imports(content: &str) -> String {
         return content.to_string();
     }
 
-    // 构建导入行
+    // 构建导入行 (Session 126: 同一模块的类型按字母序排列)
     let import_lines: Vec<String> = needed
         .iter()
         .map(|(&module, types)| {
-            if types.len() == 1 {
-                format!("use {}::{};", module, types[0])
+            let mut sorted_types = types.to_vec();
+            sorted_types.sort();
+            if sorted_types.len() == 1 {
+                format!("use {}::{};", module, sorted_types[0])
             } else {
-                format!("use {}::{{{}}};", module, types.join(", "))
+                format!("use {}::{{{}}};", module, sorted_types.join(", "))
             }
         })
         .collect();
@@ -4760,6 +4791,287 @@ pub fn ensure_std_imports(content: &str) -> String {
     }
 
     result_lines.join("\n")
+}
+
+/// ANSI 颜色常量 (Session 126)
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
+
+/// 带颜色的统一 diff 格式输出 (Session 126)
+///
+/// 与 `format_diff_unified_with_options` 功能相同, 但添加 ANSI 颜色:
+/// - `---` / `+++` 文件头 → 粗体黄色
+/// - `@@` hunk 头 → 青色
+/// - `+` 新增行 → 绿色
+/// - `-` 删除行 → 红色
+/// - ` ` 上下文行 → 无颜色
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::format_diff_unified_colored;
+///
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diff = format_diff_unified_colored(original, fixed, "src/main.rs", "src/main.rs", 3);
+/// assert!(!diff.is_empty(), "有差异应有颜色 diff");
+/// assert!(diff.contains("\x1b[32m"), "应包含绿色 ANSI 码");
+/// ```
+pub fn format_diff_unified_colored(
+    original: &str,
+    fixed: &str,
+    original_name: &str,
+    fixed_name: &str,
+    context: usize,
+) -> String {
+    let plain =
+        format_diff_unified_with_options(original, fixed, original_name, fixed_name, context);
+    if plain.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::new();
+    for line in plain.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            result.push_str(ANSI_BOLD_YELLOW);
+            result.push_str(line);
+            result.push_str(ANSI_RESET);
+        } else if line.starts_with("@@") {
+            result.push_str(ANSI_CYAN);
+            result.push_str(line);
+            result.push_str(ANSI_RESET);
+        } else if line.starts_with('+') {
+            result.push_str(ANSI_GREEN);
+            result.push_str(line);
+            result.push_str(ANSI_RESET);
+        } else if line.starts_with('-') {
+            result.push_str(ANSI_RED);
+            result.push_str(line);
+            result.push_str(ANSI_RESET);
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+
+    // 移除末尾多余的换行
+    if result.ends_with('\n') {
+        result.pop();
+    }
+    result
+}
+
+/// 导入问题 — 编译前静态检查发现的缺失导入 (Session 126)
+///
+/// 表示代码中使用了某个类型但缺少对应的 `use` 导入语句。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImportIssue {
+    /// 缺失的类型名 (如 "HashMap", "Result")
+    pub type_name: String,
+    /// 应导入的模块路径 (如 "std::collections", "anyhow")
+    pub module_path: String,
+    /// 使用该类型的行号 (1-based)
+    pub usage_line: usize,
+}
+
+/// 编译前静态检查所有导入是否完整 (Session 126)
+///
+/// 扫描代码中使用的类型, 检查是否有对应的 `use` 导入语句。
+/// 返回所有缺失导入的列表, 每项包含类型名、模块路径和使用行号。
+///
+/// # 检测范围
+///
+/// - `anyhow::Result` / `Result<` → `use anyhow::Result;`
+/// - `anyhow::Error` → `use anyhow::Error;`
+/// - `bail!` / `ensure!` → `use anyhow::{bail, ensure};`
+/// - `anyhow!` → `use anyhow::anyhow;`
+/// - `.context(` / `.with_context(` → `use anyhow::Context;`
+/// - 所有 `ensure_std_imports` 检测的 std 类型
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_imports;
+///
+/// // 使用 HashMap 但未导入
+/// let issues = verify_imports("fn foo() -> HashMap<String, i32> { HashMap::new() }");
+/// assert!(issues.iter().any(|i| i.type_name == "HashMap"), "应检测到 HashMap 缺失导入");
+///
+/// // 已有导入 → 无问题
+/// let issues = verify_imports("use std::collections::HashMap;\nfn foo() -> HashMap<String, i32> { HashMap::new() }");
+/// assert!(!issues.iter().any(|i| i.type_name == "HashMap"), "已有导入不应报告");
+///
+/// // 无类型使用 → 无问题
+/// let issues = verify_imports("fn foo() -> i32 { 42 }");
+/// assert!(issues.is_empty(), "无类型使用不应有问题");
+/// ```
+pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut issues = Vec::new();
+
+    // 检查 anyhow::Result / Result< 的使用
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // 跳过注释行和导入行
+        if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+            continue;
+        }
+
+        // Result<T, ...> 或 anyhow::Result
+        if (trimmed.contains("Result<") || trimmed.contains("anyhow::Result"))
+            && !content.contains("use anyhow::Result")
+            && !content.contains("use anyhow::{")
+        {
+            issues.push(ImportIssue {
+                type_name: "Result".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: i + 1,
+            });
+        }
+
+        // anyhow::Error
+        if trimmed.contains("anyhow::Error")
+            && !content.contains("use anyhow::Error")
+            && !content.contains("use anyhow::{")
+        {
+            issues.push(ImportIssue {
+                type_name: "Error".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: i + 1,
+            });
+        }
+
+        // bail!
+        if trimmed.contains("bail!")
+            && !content.contains("use anyhow::bail")
+            && !content.contains("use anyhow::{")
+        {
+            issues.push(ImportIssue {
+                type_name: "bail".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: i + 1,
+            });
+        }
+
+        // ensure!
+        if trimmed.contains("ensure!")
+            && !content.contains("use anyhow::ensure")
+            && !content.contains("use anyhow::{")
+        {
+            issues.push(ImportIssue {
+                type_name: "ensure".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: i + 1,
+            });
+        }
+
+        // .context( 或 .with_context(
+        if (trimmed.contains(".context(") || trimmed.contains(".with_context("))
+            && !content.contains("use anyhow::Context")
+            && !content.contains("use anyhow::{")
+        {
+            issues.push(ImportIssue {
+                type_name: "Context".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: i + 1,
+            });
+        }
+    }
+
+    // 检查 std 类型 (复用 ensure_std_imports 的类型列表)
+    let type_modules: &[(&str, &str)] = &[
+        ("HashMap", "std::collections"),
+        ("HashSet", "std::collections"),
+        ("BTreeMap", "std::collections"),
+        ("BTreeSet", "std::collections"),
+        ("VecDeque", "std::collections"),
+        ("LinkedList", "std::collections"),
+        ("BinaryHeap", "std::collections"),
+        ("Path", "std::path"),
+        ("PathBuf", "std::path"),
+        ("File", "std::fs"),
+        ("BufReader", "std::io"),
+        ("BufWriter", "std::io"),
+        ("Read", "std::io"),
+        ("Write", "std::io"),
+        ("BufRead", "std::io"),
+        ("Stdin", "std::io"),
+        ("Stdout", "std::io"),
+        ("Stderr", "std::io"),
+        ("Cell", "std::cell"),
+        ("RefCell", "std::cell"),
+        ("OnceCell", "std::cell"),
+        ("Arc", "std::sync"),
+        ("Mutex", "std::sync"),
+        ("RwLock", "std::sync"),
+        ("OnceLock", "std::sync"),
+        ("Rc", "std::rc"),
+        ("Command", "std::process"),
+        ("ExitStatus", "std::process"),
+        ("env", "std"),
+        ("Instant", "std::time"),
+        ("Duration", "std::time"),
+        ("TcpListener", "std::net"),
+        ("TcpStream", "std::net"),
+        ("thread", "std"),
+        ("Thread", "std::thread"),
+        ("JoinHandle", "std::thread"),
+        ("PhantomData", "std::marker"),
+        ("Cow", "std::borrow"),
+        ("Sender", "std::sync::mpsc"),
+        ("Receiver", "std::sync::mpsc"),
+        ("Condvar", "std::sync"),
+        ("Barrier", "std::sync"),
+        ("AtomicBool", "std::sync::atomic"),
+        ("AtomicI32", "std::sync::atomic"),
+        ("AtomicU32", "std::sync::atomic"),
+        ("AtomicI64", "std::sync::atomic"),
+        ("AtomicU64", "std::sync::atomic"),
+        ("AtomicUsize", "std::sync::atomic"),
+    ];
+
+    for &(type_name, module_path) in type_modules {
+        let full_path = format!("{}::{}", module_path, type_name);
+        let bare_usage = contains_type_usage(content, type_name) && !content.contains(&full_path);
+
+        if bare_usage {
+            // 检查是否已有导入
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use {}::{}", module_path, type_name))
+                    || (trimmed.contains(&format!("use {}::{{", module_path))
+                        && contains_type_usage(trimmed, type_name))
+                    || trimmed.starts_with(&format!("use {}::*;", module_path))
+                    || trimmed.starts_with("use std::*;")
+            });
+
+            if !already_imported {
+                // 找到第一个使用该类型的行
+                for (i, line) in lines.iter().enumerate() {
+                    if contains_type_usage(line, type_name) {
+                        issues.push(ImportIssue {
+                            type_name: type_name.to_string(),
+                            module_path: module_path.to_string(),
+                            usage_line: i + 1,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 去重: 同一类型只保留第一个出现的行号
+    let mut seen = std::collections::HashSet::new();
+    issues.retain(|issue| {
+        let key = format!("{}::{}", issue.module_path, issue.type_name);
+        seen.insert(key)
+    });
+
+    issues
 }
 
 #[cfg(test)]
@@ -9941,8 +10253,8 @@ fn foo(
         let code = "fn foo() -> Duration { let start = Instant::now(); start.elapsed() }";
         let result = ensure_std_imports(code);
         assert!(
-            result.contains("use std::time::{Instant, Duration};"),
-            "应添加 time 模块合并导入: {}",
+            result.contains("use std::time::{Duration, Instant};"),
+            "应添加 time 模块合并导入 (字母序): {}",
             result
         );
     }
@@ -10227,5 +10539,396 @@ fn foo(
             result
         );
         assert!(result.contains("});"), "应在末行添加闭合括号: {}", result);
+    }
+
+    // ===== Session 126: ensure_std_imports 新增 thread/marker/borrow/mpsc/atomic 类型 =====
+
+    #[test]
+    fn test_ensure_std_imports_thread_module() {
+        let code = "fn foo() { thread::spawn(|| {}); }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::thread;"),
+            "应添加 thread 模块导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_thread_type() {
+        let code = "fn foo() -> Thread { thread::current() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::thread::Thread;"),
+            "应添加 Thread 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_join_handle() {
+        let code = "fn foo() -> JoinHandle<i32> { thread::spawn(|| 42) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::thread::JoinHandle;"),
+            "应添加 JoinHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_phantom_data() {
+        let code = "fn foo() -> PhantomData<i32> { PhantomData }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::marker::PhantomData;"),
+            "应添加 PhantomData 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_cow() {
+        let code = "fn foo() -> Cow<'static, str> { Cow::Borrowed(\"hi\") }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::borrow::Cow;"),
+            "应添加 Cow 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_mpsc_sender_receiver() {
+        let code = "fn foo() -> (Sender<i32>, Receiver<i32>) { let (s, r) = std::sync::mpsc::channel(); (s, r) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::mpsc::{Receiver, Sender};"),
+            "应合并 msc 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_condvar() {
+        let code = "fn foo() -> Condvar { Condvar::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::Condvar;"),
+            "应添加 Condvar 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_barrier() {
+        let code = "fn foo() -> Barrier { Barrier::new(3) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::Barrier;"),
+            "应添加 Barrier 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_atomic_bool() {
+        let code = "fn foo() -> AtomicBool { AtomicBool::new(true) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::atomic::AtomicBool;"),
+            "应添加 AtomicBool 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_atomic_usize() {
+        let code = "fn foo() -> AtomicUsize { AtomicUsize::new(0) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::atomic::AtomicUsize;"),
+            "应添加 AtomicUsize 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_multiple_atomic_types() {
+        let code = "fn foo() -> (AtomicBool, AtomicUsize) { (AtomicBool::new(true), AtomicUsize::new(0)) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::atomic::{AtomicBool, AtomicUsize};"),
+            "应合并 atomic 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_new_types_idempotent_s126() {
+        let code =
+            "fn foo() -> (AtomicBool, JoinHandle<i32>, PhantomData<u8>) { unimplemented!() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "Session 126 新增类型检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_sorted_alphabetically() {
+        // 使用多个 sync 类型, 验证字母序排列
+        let code = "fn foo() -> (Mutex<i32>, Arc<u8>, RwLock<bool>, Barrier) { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        // 排序后应为 Arc, Barrier, Mutex, RwLock
+        assert!(
+            result.contains("use std::sync::{Arc, Barrier, Mutex, RwLock};"),
+            "应按字母序排列: {}",
+            result
+        );
+    }
+
+    // ===== Session 126: format_diff_unified_colored 测试 =====
+
+    #[test]
+    fn test_format_diff_unified_colored_no_diff() {
+        let diff = format_diff_unified_colored("fn foo() {}", "fn foo() {}", "a", "b", 3);
+        assert!(diff.is_empty(), "无差异应返回空字符串");
+    }
+
+    #[test]
+    fn test_format_diff_unified_colored_contains_green() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diff = format_diff_unified_colored(original, fixed, "a", "b", 3);
+        assert!(
+            diff.contains("\x1b[32m"),
+            "应包含绿色 ANSI 码 (新增行): {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_colored_contains_red() {
+        let original = "fn foo() {\n    let x = 42;\n}\n";
+        let fixed = "fn foo() {\n}\n";
+        let diff = format_diff_unified_colored(original, fixed, "a", "b", 3);
+        assert!(
+            diff.contains("\x1b[31m"),
+            "应包含红色 ANSI 码 (删除行): {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_colored_contains_cyan_hunk_header() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diff = format_diff_unified_colored(original, fixed, "a", "b", 3);
+        assert!(
+            diff.contains("\x1b[36m"),
+            "应包含青色 ANSI 码 (hunk 头): {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_colored_contains_bold_yellow_headers() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diff = format_diff_unified_colored(original, fixed, "src/main.rs", "src/main.rs", 3);
+        assert!(
+            diff.contains("\x1b[1;33m"),
+            "应包含粗体黄色 ANSI 码 (文件头): {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_colored_contains_reset() {
+        let original = "a\n";
+        let fixed = "b\n";
+        let diff = format_diff_unified_colored(original, fixed, "a", "b", 3);
+        assert!(diff.contains("\x1b[0m"), "应包含 ANSI 重置码: {}", diff);
+    }
+
+    // ===== Session 126: verify_imports 测试 =====
+
+    #[test]
+    fn test_verify_imports_hashmap_missing() {
+        let issues = verify_imports("fn foo() -> HashMap<String, i32> { HashMap::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "HashMap" && i.module_path == "std::collections"),
+            "应检测到 HashMap 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_hashmap_present() {
+        let code =
+            "use std::collections::HashMap;\nfn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues.iter().any(|i| i.type_name == "HashMap"),
+            "已有导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_anyhow_result_missing() {
+        let issues = verify_imports("fn foo() -> Result<i32, anyhow::Error> { Ok(42) }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Result" && i.module_path == "anyhow"),
+            "应检测到 Result 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_anyhow_result_present() {
+        let code = "use anyhow::Result;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues.iter().any(|i| i.type_name == "Result"),
+            "已有 Result 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_bail_missing() {
+        let issues = verify_imports("fn foo() { if true { bail!(\"error\"); } }");
+        assert!(
+            issues.iter().any(|i| i.type_name == "bail"),
+            "应检测到 bail! 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_no_issues_plain_code() {
+        let issues = verify_imports("fn foo() -> i32 { 42 }");
+        assert!(issues.is_empty(), "无类型使用不应有问题: {:?}", issues);
+    }
+
+    #[test]
+    fn test_verify_imports_multiple_issues() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "HashMap"),
+            "应检测到 HashMap: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Arc"),
+            "应检测到 Arc: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_context_missing() {
+        let issues = verify_imports("fn foo() { let x = operation().context(\"failed\")?; }");
+        assert!(
+            issues.iter().any(|i| i.type_name == "Context"),
+            "应检测到 Context 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_usage_line_number() {
+        let code = "fn foo() -> i32 { 42 }\nfn bar() -> HashMap<String, i32> { HashMap::new() }";
+        let issues = verify_imports(code);
+        let hashmap_issue = issues.iter().find(|i| i.type_name == "HashMap");
+        assert!(hashmap_issue.is_some(), "应检测到 HashMap: {:?}", issues);
+        assert_eq!(
+            hashmap_issue.unwrap().usage_line,
+            2,
+            "HashMap 使用应在第 2 行"
+        );
+    }
+
+    // ===== Session 126: wrap_return_statements_in_ok if let / while let 测试 =====
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_if_let_single_line() {
+        let code = "fn foo(opt: Option<i32>) -> Result<i32, anyhow::Error> {\n    return if let Some(x) = opt { x } else { 0 };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(if let Some(x) = opt { x } else { 0 });"),
+            "应包装 if let 表达式: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_if_let_multiline() {
+        let code = "fn foo(opt: Option<i32>) -> Result<i32, anyhow::Error> {\n    return if let Some(x) = opt {\n        x + 1\n    } else {\n        0\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(if let Some(x) = opt {"),
+            "应包装多行 if let: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_while_let_single_line() {
+        let code = "fn foo(mut iter: std::slice::Iter<i32>) -> Result<i32, anyhow::Error> {\n    return while let Some(x) = iter.next() { if x > 0 { return x; } };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        // while let 不以 ; 结尾在同一行的话会被多行处理
+        // 但如果以 ; 结尾, 则单行处理
+        assert!(
+            result.contains("return Ok("),
+            "应包装 while let 表达式: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_while_let_multiline() {
+        let code = "fn foo(opt: Option<i32>) -> Result<i32, anyhow::Error> {\n    return while let Some(x) = opt {\n        x\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok("),
+            "应包装多行 while let: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_if_let_already_ok() {
+        let code = "fn foo(opt: Option<i32>) -> Result<i32, anyhow::Error> {\n    return Ok(if let Some(x) = opt { x } else { 0 });\n}";
+        let result = wrap_return_statements_in_ok(code);
+        let ok_count = result.matches("return Ok(").count();
+        assert_eq!(ok_count, 1, "已包装的 if let 不应重复包装: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_if_let_idempotent() {
+        let code = "fn foo(opt: Option<i32>) -> Result<i32, anyhow::Error> {\n    return if let Some(x) = opt {\n        x + 1\n    } else {\n        0\n    };\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "if let 包装应幂等");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_if_let_with_else_if() {
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return if x > 0 {\n        1\n    } else if x < 0 {\n        -1\n    } else {\n        0\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(if x > 0 {"),
+            "应包装 if/else if/else: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合: {}", result);
     }
 }
