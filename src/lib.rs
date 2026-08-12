@@ -206,7 +206,9 @@ pub use evaluator_synergy::{
     EvaluatorSynergySummary, EvaluatorTimelineAction, EvaluatorTimelineEntry, EvaluatorType,
     ScoreTrend, EVALUATOR_SYNERGY_HISTORY_FILENAME, MAX_SYNERGY_HISTORY_SESSIONS,
 };
-pub use extract::{extract_files, validate_rust_braces, DefaultExtractor};
+pub use extract::{
+    extract_files, validate_rust_braces, validate_rust_code_quality, DefaultExtractor,
+};
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
     csv_escape_field, extract_gantt_data, generate_action_stats_csv, generate_action_stats_json,

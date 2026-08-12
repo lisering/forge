@@ -84,7 +84,8 @@ impl SystemPrompt {
         prompt.push_str("❌ 禁止: 生成无效格式的 Cargo.toml\n");
         prompt.push_str("❌ 禁止: 违反 SOLID 原则 (特别是 DIP 依赖倒置)\n");
         prompt.push_str("❌ 禁止: 在单元测试中访问真实的外部依赖\n");
-        prompt.push_str("❌ 禁止: 大括号/圆括号/方括号不配对 (最常见的 AI 代码生成错误)\n\n");
+        prompt.push_str("❌ 禁止: 大括号/圆括号/方括号不配对 (最常见的 AI 代码生成错误)\n");
+        prompt.push_str("❌ 禁止: 使用 todo!()/unimplemented!()/panic!() (非测试代码)\n\n");
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -224,6 +225,25 @@ mod tests {
         assert!(
             prompt.contains("逐个检查"),
             "系统 prompt 应包含输出前逐个检查括号的指令"
+        );
+    }
+
+    // ===== Session 114: 代码质量禁止项测试 =====
+
+    #[test]
+    fn test_build_contains_todo_unimplemented_panic_warning() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("todo!()"),
+            "系统 prompt 应包含 todo!() 禁止项"
+        );
+        assert!(
+            prompt.contains("unimplemented!()"),
+            "系统 prompt 应包含 unimplemented!() 禁止项"
+        );
+        assert!(
+            prompt.contains("panic!()"),
+            "系统 prompt 应包含 panic!() 禁止项"
         );
     }
 }

@@ -173,7 +173,7 @@ fn validate_toml(content: &str) -> Option<String> {
     }
 }
 
-/// 验证 Rust 代码的括号配对 (Session 113)
+/// 验证 Rust 代码的括号配对 (Session 113, Session 114 增强)
 ///
 /// AI 生成的 Rust 代码 (特别是 GLM 模型) 可能存在括号不配对的问题:
 /// - `{` 和 `}` 不配对 (最常见的大括号匹配问题)
@@ -181,6 +181,15 @@ fn validate_toml(content: &str) -> Option<String> {
 /// - `[` 和 `]` 不配对
 ///
 /// 本函数在跳过字符串、字符字面量和注释中的括号后, 检查括号配对。
+///
+/// # 支持的 Rust 语法 (Session 114 增强)
+///
+/// - 嵌套块注释: `/* /* */ */` (Rust 支持嵌套, C 不支持)
+/// - 字节字符串: `b"..."` — 字符串内容不影响计数
+/// - 字节字符: `b'x'` — 字符内容不影响计数
+/// - 原始字节字符串: `br"..."`, `br#"..."#` — 内容不影响计数
+/// - 未终止字符串/注释检测: 字符串或注释未闭合时报告问题
+///
 /// 返回 `Some(warning_message)` 如果检测到问题, `None` 如果格式正常。
 ///
 /// # 示例
@@ -195,6 +204,9 @@ fn validate_toml(content: &str) -> Option<String> {
 /// let result = validate_rust_braces("fn main() { let x = 42;");
 /// assert!(result.is_some());
 /// assert!(result.unwrap().contains("大括号"));
+///
+/// // 嵌套块注释 — 内容不影响计数 (Session 114)
+/// assert!(validate_rust_braces("fn main() { /* /* { } */ */ let x = 42; }").is_none());
 /// ```
 pub fn validate_rust_braces(content: &str) -> Option<String> {
     let mut issues = Vec::new();
@@ -203,10 +215,10 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Code,
-        LineComment,      // // ...
-        BlockComment,     // /* ... */
-        String,           // "..."
-        RawString(usize), // r#"..."# (hash_depth)
+        LineComment,         // // ...
+        BlockComment(usize), // /* ... */ (支持嵌套, depth >= 1)
+        String,              // "..."
+        RawString(usize),    // r#"..."# (hash_depth)
     }
 
     let mut state = State::Code;
@@ -232,7 +244,7 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
             }
             (State::Code, '/', Some('*')) => {
                 i += 1; // 跳过 *
-                State::BlockComment
+                State::BlockComment(1)
             }
             (State::Code, '"', _) => State::String,
             (State::Code, 'r', Some('"')) => {
@@ -307,12 +319,20 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
             (State::LineComment, '\n', _) => State::Code,
             (State::LineComment, _, _) => State::LineComment,
 
-            // === 块注释: 遇到 */ 结束 ===
-            (State::BlockComment, '*', Some('/')) => {
-                i += 1; // 跳过 /
-                State::Code
+            // === 嵌套块注释: /* 增加深度, */ 减少深度 (Session 114) ===
+            (State::BlockComment(depth), '/', Some('*')) => {
+                i += 1; // 跳过 *
+                State::BlockComment(depth + 1)
             }
-            (State::BlockComment, _, _) => State::BlockComment,
+            (State::BlockComment(depth), '*', Some('/')) => {
+                i += 1; // 跳过 /
+                if depth > 1 {
+                    State::BlockComment(depth - 1)
+                } else {
+                    State::Code
+                }
+            }
+            (State::BlockComment(d), _, _) => State::BlockComment(d),
 
             // === 字符串: 遇到 " 结束 (处理转义) ===
             (State::String, '\\', Some(_)) => {
@@ -345,6 +365,23 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
         i += 1;
     }
 
+    // Session 114: 检查未终止的字符串/注释
+    match state {
+        State::String => {
+            issues.push("字符串未终止 (缺少闭合的 \")".to_string());
+        }
+        State::BlockComment(depth) => {
+            issues.push(format!("块注释未终止 (嵌套深度 {depth}, 缺少闭合的 */)"));
+        }
+        State::RawString(depth) => {
+            let hash_str = "#".repeat(depth);
+            issues.push(format!(
+                "Raw 字符串未终止 (hash 深度 {depth}, 缺少闭合的 \"{hash_str})"
+            ));
+        }
+        State::LineComment | State::Code => {}
+    }
+
     // 检查括号配对
     if brace_open != brace_close {
         issues.push(format!(
@@ -373,6 +410,13 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
 }
 
 /// 从文本中提取所有代码文件
+///
+/// 按优先级依次尝试三种提取模式:
+/// 1. 标记代码块: ` ```file:path\n...``` ` 或 ` ```lang:path\n...``` `
+/// 2. 普通代码块: ` ```lang\n...``` ` (无路径, 仅当模式1无结果时)
+/// 3. 文件标记格式: `file:path\n...代码...` (无反引号, 仅当模式1和2均无结果时)
+///
+/// 提取后自动验证 TOML 格式、Rust 括号配对和 Rust 代码质量。
 pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
     // 清理 DeepSeek 等 UI 文本污染 (如 "复制下载" 按钮文本)
     let cleaned = clean_ui_text(text);
@@ -380,10 +424,28 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
     let normalized = normalize_file_markers(&cleaned);
     let text = normalized.as_str();
 
-    let mut files = Vec::new();
+    // 按优先级尝试提取模式
+    let mut files = extract_tagged_files(text);
+    if files.is_empty() {
+        files = extract_plain_code_blocks(text);
+    }
+    if files.is_empty() {
+        files = extract_file_marker_format(text);
+    }
 
-    // 模式1: ```file:path\n...``` 或 ```lang:path\n...```
+    // 去重: 同一路径取最后一个
+    let result = deduplicate_files(files);
+
+    // 验证提取的文件
+    validate_extracted_files(&result);
+
+    result
+}
+
+/// 模式1: 提取标记代码块 ` ```file:path\n...``` ` 或 ` ```lang:path\n...``` `
+fn extract_tagged_files(text: &str) -> Vec<ExtractedFile> {
     let re_tagged = tagged_regex();
+    let mut files = Vec::new();
 
     for cap in re_tagged.captures_iter(text) {
         let path = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
@@ -399,96 +461,249 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
         }
     }
 
-    // 模式2: 普通 ```lang\n...``` 代码块 (无路径)
-    if files.is_empty() {
-        let re_plain = plain_regex();
-        for cap in re_plain.captures_iter(text) {
-            let lang = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let content = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+    files
+}
 
-            if !content.is_empty() && content.len() > 50 {
-                let path = format!("snippet_{}.{}", files.len() + 1, ext_for_lang(lang));
-                files.push(ExtractedFile {
-                    path,
-                    content: content.to_string(),
-                    language: lang.to_string(),
-                });
-            }
+/// 模式2: 提取普通代码块 ` ```lang\n...``` ` (无路径)
+fn extract_plain_code_blocks(text: &str) -> Vec<ExtractedFile> {
+    let re_plain = plain_regex();
+    let mut files = Vec::new();
+
+    for cap in re_plain.captures_iter(text) {
+        let lang = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let content = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+
+        if !content.is_empty() && content.len() > 50 {
+            let path = format!("snippet_{}.{}", files.len() + 1, ext_for_lang(lang));
+            files.push(ExtractedFile {
+                path,
+                content: content.to_string(),
+                language: lang.to_string(),
+            });
         }
     }
 
-    // 模式3: 无反引号 — "file:path\n...代码..." (AI 没用代码块格式时)
-    if files.is_empty() {
-        let re_file_marker = file_marker_regex();
-        let markers: Vec<(usize, String)> = re_file_marker
-            .captures_iter(text)
-            .map(|cap| {
-                let path = cap
-                    .get(1)
-                    .map(|m| m.as_str().trim())
-                    .unwrap_or("")
-                    .to_string();
-                let pos = cap.get(0).unwrap().start();
-                (pos, path)
-            })
-            .collect();
+    files
+}
 
-        for (i, (pos_ref, path)) in markers.iter().enumerate() {
-            let pos = *pos_ref;
-            // 代码从 file:path 行之后开始,到下一个 file: 行或文本结束
-            let line_end = text[pos..]
-                .find('\n')
-                .map(|n| pos + n + 1)
-                .unwrap_or(text.len());
-            let code_start = line_end;
-            let code_end = if i + 1 < markers.len() {
-                markers[i + 1].0
-            } else {
-                text.len()
-            };
-            let content = if code_start < code_end {
-                text[code_start..code_end].trim().to_string()
-            } else {
-                String::new()
-            };
+/// 模式3: 提取文件标记格式 `file:path\n...代码...` (无反引号)
+fn extract_file_marker_format(text: &str) -> Vec<ExtractedFile> {
+    let re_file_marker = file_marker_regex();
+    let markers: Vec<(usize, String)> = re_file_marker
+        .captures_iter(text)
+        .map(|cap| {
+            let path = cap
+                .get(1)
+                .map(|m| m.as_str().trim())
+                .unwrap_or("")
+                .to_string();
+            let pos = cap.get(0).unwrap().start();
+            (pos, path)
+        })
+        .collect();
 
-            if !path.is_empty() && !content.is_empty() {
-                files.push(ExtractedFile {
-                    path: path.clone(),
-                    content,
-                    language: guess_language_from_path(path),
-                });
-            }
+    let mut files = Vec::new();
+
+    for (i, (pos_ref, path)) in markers.iter().enumerate() {
+        let pos = *pos_ref;
+        // 代码从 file:path 行之后开始,到下一个 file: 行或文本结束
+        let line_end = text[pos..]
+            .find('\n')
+            .map(|n| pos + n + 1)
+            .unwrap_or(text.len());
+        let code_start = line_end;
+        let code_end = if i + 1 < markers.len() {
+            markers[i + 1].0
+        } else {
+            text.len()
+        };
+        let content = if code_start < code_end {
+            text[code_start..code_end].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        if !path.is_empty() && !content.is_empty() {
+            files.push(ExtractedFile {
+                path: path.clone(),
+                content,
+                language: guess_language_from_path(path),
+            });
         }
     }
 
-    // 去重: 同一路径取最后一个
+    files
+}
+
+/// 去重: 同一路径取最后一个
+fn deduplicate_files(files: Vec<ExtractedFile>) -> Vec<ExtractedFile> {
     let mut seen: HashMap<String, ExtractedFile> = HashMap::new();
     for f in files {
         seen.insert(f.path.clone(), f);
     }
+    seen.into_values().collect()
+}
 
-    let result: Vec<ExtractedFile> = seen.into_values().collect();
-    if !result.is_empty() {
-        info!("提取到 {} 个文件", result.len());
-        for f in &result {
-            debug!("  {} ({} 字符)", f.path, f.content.len());
-            // 第 39 项改进: 验证 TOML 文件格式
-            if f.path.ends_with(".toml") {
-                if let Some(issue) = validate_toml(&f.content) {
-                    warn!("⚠ TOML 格式验证失败 [{}]: {}", f.path, issue);
+/// 验证提取的文件: TOML 格式、Rust 括号配对、Rust 代码质量
+fn validate_extracted_files(files: &[ExtractedFile]) {
+    if files.is_empty() {
+        return;
+    }
+    info!("提取到 {} 个文件", files.len());
+    for f in files {
+        debug!("  {} ({} 字符)", f.path, f.content.len());
+        // 第 39 项改进: 验证 TOML 文件格式
+        if f.path.ends_with(".toml") {
+            if let Some(issue) = validate_toml(&f.content) {
+                warn!("⚠ TOML 格式验证失败 [{}]: {}", f.path, issue);
+            }
+        }
+        // Session 113: 验证 Rust 代码括号配对
+        if f.path.ends_with(".rs") {
+            if let Some(issue) = validate_rust_braces(&f.content) {
+                warn!("⚠ Rust 代码括号验证失败 [{}]: {}", f.path, issue);
+            }
+        }
+        // Session 114: 验证 Rust 代码质量
+        if f.path.ends_with(".rs") {
+            let quality_issues = validate_rust_code_quality(&f.content);
+            if !quality_issues.is_empty() {
+                warn!(
+                    "⚠ Rust 代码质量警告 [{}]: {}",
+                    f.path,
+                    quality_issues.join("; ")
+                );
+            }
+        }
+    }
+}
+
+/// 验证 Rust 代码质量 — 检查违反约束的常见 AI 代码模式 (Session 114)
+///
+/// AI 生成的 Rust 代码可能包含以下违反开发约束的模式:
+/// - `unwrap()` — 应使用 `?` 或 `match` 处理错误
+/// - `expect()` — 同上
+/// - `todo!()` — 未实现的占位代码
+/// - `unimplemented!()` — 同上
+/// - `panic!()` — 非测试代码中不应使用
+///
+/// 测试代码 (`#[cfg(test)]` 模块内) 中的 `unwrap()`/`expect()` 是允许的。
+///
+/// 返回问题列表 (空列表表示无问题)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::validate_rust_code_quality;
+///
+/// // 无问题
+/// assert!(validate_rust_code_quality("fn main() { let x = 42; }").is_empty());
+///
+/// // 包含 unwrap() — 应报告
+/// let issues = validate_rust_code_quality("fn foo() { let x = bar().unwrap(); }");
+/// assert!(!issues.is_empty());
+/// assert!(issues[0].contains("unwrap"));
+/// ```
+pub fn validate_rust_code_quality(content: &str) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    // 检测是否在 #[cfg(test)] 模块内 (简单行级检测)
+    // 遇到 "#[cfg(test)]" 后, 后续代码视为测试代码, 直到遇到匹配的 "}"
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_test_module = false;
+    let mut test_module_brace_depth = 0i32;
+
+    for (line_num, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // 检测 #[cfg(test)] 标记
+        if trimmed.contains("#[cfg(test)]") {
+            in_test_module = true;
+            test_module_brace_depth = 0; // 重置, 等待 {
+        }
+
+        // 跟踪测试模块的大括号深度
+        if in_test_module {
+            for c in line.chars() {
+                if c == '{' {
+                    test_module_brace_depth += 1;
+                } else if c == '}' {
+                    test_module_brace_depth -= 1;
+                    if test_module_brace_depth <= 0 {
+                        in_test_module = false;
+                    }
                 }
             }
-            // Session 113: 验证 Rust 代码括号配对
-            if f.path.ends_with(".rs") {
-                if let Some(issue) = validate_rust_braces(&f.content) {
-                    warn!("⚠ Rust 代码括号验证失败 [{}]: {}", f.path, issue);
-                }
+        }
+
+        // 跳过注释行
+        if trimmed.starts_with("//") {
+            continue;
+        }
+
+        // 在非测试代码中检查禁止模式
+        if !in_test_module {
+            // 检查 .unwrap() — 排除注释中的
+            if contains_pattern_outside_comment(trimmed, ".unwrap()") {
+                issues.push(format!(
+                    "行 {}: 使用 .unwrap() — 应使用 ? 或 match 处理错误",
+                    line_num + 1
+                ));
+            }
+
+            // 检查 .expect( — 排除注释中的
+            if contains_pattern_outside_comment(trimmed, ".expect(") {
+                issues.push(format!(
+                    "行 {}: 使用 .expect() — 应使用 ? 或 match 处理错误",
+                    line_num + 1
+                ));
+            }
+
+            // 检查 todo!() 宏
+            if contains_pattern_outside_comment(trimmed, "todo!()")
+                || contains_pattern_outside_comment(trimmed, "todo!(")
+            {
+                issues.push(format!(
+                    "行 {}: 使用 todo!() 宏 — 未实现的占位代码",
+                    line_num + 1
+                ));
+            }
+
+            // 检查 unimplemented!() 宏
+            if contains_pattern_outside_comment(trimmed, "unimplemented!()")
+                || contains_pattern_outside_comment(trimmed, "unimplemented!(")
+            {
+                issues.push(format!(
+                    "行 {}: 使用 unimplemented!() 宏 — 未实现的占位代码",
+                    line_num + 1
+                ));
+            }
+
+            // 检查 panic!() 宏 — 排除 main 函数中的合法 panic
+            if (contains_pattern_outside_comment(trimmed, "panic!()")
+                || contains_pattern_outside_comment(trimmed, "panic!("))
+                && !trimmed.starts_with("//")
+            {
+                issues.push(format!(
+                    "行 {}: 使用 panic!() — 非测试代码不应直接 panic",
+                    line_num + 1
+                ));
             }
         }
     }
 
-    result
+    issues
+}
+
+/// 检查行中是否包含模式 (排除注释部分)
+fn contains_pattern_outside_comment(line: &str, pattern: &str) -> bool {
+    // 找到 // 注释的位置 (简化处理: 不考虑字符串中的 //)
+    let code_part = if let Some(pos) = line.find("//") {
+        &line[..pos]
+    } else {
+        line
+    };
+    code_part.contains(pattern)
 }
 
 fn guess_language_from_path(path: &str) -> String {
@@ -984,5 +1199,491 @@ impl Config {
 "#;
         let result = validate_rust_braces(code);
         assert!(result.is_some(), "GLM 截断代码应报告大括号不配对");
+    }
+
+    // ===== validate_rust_braces Session 114 增强: 嵌套块注释 =====
+
+    #[test]
+    fn test_validate_rust_braces_nested_block_comment() {
+        // 嵌套块注释中的括号不应影响计数
+        let code = "fn main() { /* /* { } ( ) [ ] */ */ let x = 42; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "嵌套块注释中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_deeply_nested_block_comment() {
+        // 三层嵌套块注释
+        let code = "fn main() { /* /* /* { } */ ( ) */ [ ] */ let x = 42; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "三层嵌套块注释中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_nested_block_comment_unterminated() {
+        // 嵌套块注释未终止 (只有内层关闭了, 外层未关闭)
+        let code = "fn main() { /* /* { } */ let x = 42; }";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "未终止的嵌套块注释应报告问题");
+        assert!(
+            result.unwrap().contains("块注释未终止"),
+            "应报告块注释未终止"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_unterminated_block_comment() {
+        // 块注释未终止
+        let code = "fn main() { /* comment without end { }";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "未终止的块注释应报告问题");
+        assert!(
+            result.unwrap().contains("块注释未终止"),
+            "应报告块注释未终止"
+        );
+    }
+
+    // ===== validate_rust_braces Session 114 增强: 字节字符串/字符 =====
+
+    #[test]
+    fn test_validate_rust_braces_byte_string() {
+        // 字节字符串 b"..." 中的括号不应影响计数
+        let code = r#"fn main() { let b: &[u8] = b"{ } ( ) [ ]"; }"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字节字符串中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_byte_char() {
+        // 字节字符 b'x' 中的括号不应影响计数
+        let code = "fn main() { let c = b'{'; let d = b'}'; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字节字符中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_raw_byte_string() {
+        // 原始字节字符串 br#"..."# 中的括号不应影响计数
+        let code = r##"fn main() { let b = br#"{ } ( ) [ ]"#; }"##;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "原始字节字符串中的括号不应影响计数"
+        );
+    }
+
+    // ===== validate_rust_braces Session 114 增强: 未终止字符串检测 =====
+
+    #[test]
+    fn test_validate_rust_braces_unterminated_string() {
+        // 字符串未终止
+        let code = r#"fn main() { let s = "hello world; }"#;
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "未终止的字符串应报告问题");
+        assert!(
+            result.unwrap().contains("字符串未终止"),
+            "应报告字符串未终止"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_unterminated_raw_string() {
+        // Raw 字符串未终止
+        let code = r##"fn main() { let s = r#"hello world; }"##;
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "未终止的 raw 字符串应报告问题");
+        assert!(
+            result.unwrap().contains("Raw 字符串未终止"),
+            "应报告 Raw 字符串未终止"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_attributes() {
+        // 属性 #[derive(Debug)] 应正确处理
+        let code = r#"
+#[derive(Debug, Clone)]
+pub struct Foo {
+    x: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        let f = Foo { x: 42 };
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "属性和测试模块应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_closure_with_pipes() {
+        // 闭包 |x| { ... } 中的管道符不应影响计数
+        let code = "fn main() { let f = |x: i32| { x * 2 }; let g = |y| { y + 1 }; }";
+        assert!(validate_rust_braces(code).is_none(), "闭包语法应通过验证");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules() {
+        // macro_rules! 宏定义
+        let code = r#"
+macro_rules! say_hello {
+    () => {
+        println!("hello");
+    };
+    ($name:expr) => {
+        println!("hello, {}", $name);
+    };
+}
+
+fn main() {
+    say_hello!();
+    say_hello!("world");
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "macro_rules! 宏定义应通过验证"
+        );
+    }
+
+    // ===== validate_rust_code_quality 测试 (Session 114) =====
+
+    #[test]
+    fn test_validate_rust_code_quality_clean() {
+        let code = "fn main() { let x = 42; println!(\"{}\", x); }";
+        assert!(
+            validate_rust_code_quality(code).is_empty(),
+            "无禁止模式的代码不应报告问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_unwrap() {
+        let code = "fn foo() -> i32 { let x = bar().unwrap(); x }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到 unwrap()");
+        assert!(issues[0].contains("unwrap"), "应报告 unwrap");
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_expect() {
+        let code = "fn foo() -> i32 { let x = bar().expect(\"failed\"); x }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到 expect()");
+        assert!(issues[0].contains("expect"), "应报告 expect");
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_todo() {
+        let code = "fn foo() -> i32 { todo!() }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到 todo!()");
+        assert!(issues[0].contains("todo"), "应报告 todo!()");
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_unimplemented() {
+        let code = "fn foo() -> i32 { unimplemented!() }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到 unimplemented!()");
+        assert!(
+            issues[0].contains("unimplemented"),
+            "应报告 unimplemented!()"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_panic() {
+        let code = "fn foo() { panic!(\"something went wrong\"); }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到 panic!()");
+        assert!(issues[0].contains("panic"), "应报告 panic!()");
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_allows_unwrap_in_test() {
+        // 测试模块中的 unwrap() 不应报告
+        let code = r#"
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        let x = Some(42).unwrap();
+        assert_eq!(x, 42);
+    }
+}
+"#;
+        let issues = validate_rust_code_quality(code);
+        assert!(
+            issues.is_empty(),
+            "测试模块中的 unwrap() 不应报告问题, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_ignores_comment() {
+        // 注释中的 unwrap() 不应报告
+        let code = "fn foo() { // let x = bar().unwrap();\n let y = 42; }";
+        let issues = validate_rust_code_quality(code);
+        assert!(
+            issues.is_empty(),
+            "注释中的 unwrap() 不应报告问题, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_empty() {
+        assert!(
+            validate_rust_code_quality("").is_empty(),
+            "空内容不应报告问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_multiple_issues() {
+        let code = r#"
+fn foo() -> i32 {
+    let x = bar().unwrap();
+    let y = baz().expect("oops");
+    panic!("done");
+}
+"#;
+        let issues = validate_rust_code_quality(code);
+        assert_eq!(issues.len(), 3, "应检测到 3 个问题, got {}", issues.len());
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_mixed_test_and_non_test() {
+        // 非测试代码有 unwrap, 测试代码也有 unwrap, 只报告非测试的
+        let code = r#"
+fn foo() -> i32 {
+    bar().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_foo() {
+        let x = Some(1).unwrap();
+    }
+}
+"#;
+        let issues = validate_rust_code_quality(code);
+        assert_eq!(
+            issues.len(),
+            1,
+            "只应报告非测试代码中的 1 个 unwrap, got: {:?}",
+            issues
+        );
+        assert!(issues[0].contains("unwrap"));
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_with_result_ok() {
+        // 使用 ? 操作符的代码不应报告
+        let code = r#"
+fn foo() -> Result<i32, String> {
+    let x = bar()?;
+    Ok(x)
+}
+"#;
+        let issues = validate_rust_code_quality(code);
+        assert!(
+            issues.is_empty(),
+            "使用 ? 的代码不应报告问题, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_code_quality_unwrap_with_chain() {
+        // 链式调用中的 unwrap
+        let code = "fn foo() { let x = vec![1, 2, 3].iter().map(|x| x * 2).collect::<Vec<_>>().first().unwrap(); }";
+        let issues = validate_rust_code_quality(code);
+        assert!(!issues.is_empty(), "应检测到链式调用中的 unwrap()");
+    }
+
+    // ===== contains_pattern_outside_comment 测试 =====
+
+    #[test]
+    fn test_contains_pattern_outside_comment_plain() {
+        assert!(contains_pattern_outside_comment(
+            "let x = foo().unwrap();",
+            ".unwrap()"
+        ));
+    }
+
+    #[test]
+    fn test_contains_pattern_outside_comment_in_comment() {
+        // 模式只在注释中
+        assert!(!contains_pattern_outside_comment(
+            "let x = 42; // foo().unwrap()",
+            ".unwrap()"
+        ));
+    }
+
+    #[test]
+    fn test_contains_pattern_outside_comment_mixed() {
+        // 模式在代码和注释中都有
+        assert!(contains_pattern_outside_comment(
+            "let x = foo().unwrap(); // bar().unwrap()",
+            ".unwrap()"
+        ));
+    }
+
+    #[test]
+    fn test_contains_pattern_outside_comment_no_match() {
+        assert!(!contains_pattern_outside_comment(
+            "let x = foo()?;",
+            ".unwrap()"
+        ));
+    }
+
+    // ===== 重构后的提取函数测试 (Session 114) =====
+
+    #[test]
+    fn test_extract_tagged_files_directly() {
+        let text = "```file:src/main.rs\nfn main() {}\n```\n```file:Cargo.toml\n[package]\nname = \"test\"\n```\n";
+        let files = extract_tagged_files(text);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f.path == "src/main.rs"));
+        assert!(files.iter().any(|f| f.path == "Cargo.toml"));
+    }
+
+    #[test]
+    fn test_extract_tagged_files_empty() {
+        assert!(extract_tagged_files("no code blocks here").is_empty());
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_directly() {
+        let text = "```rust\nfn hello() {\n    let x = 42;\n    println!(\"hello world, value is {}\", x);\n}\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.starts_with("snippet_"));
+        assert!(files[0].path.ends_with(".rs"));
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_short_content_skipped() {
+        // 内容长度 <= 50 的代码块应被跳过
+        let text = "```rust\nshort\n```";
+        let files = extract_plain_code_blocks(text);
+        assert!(files.is_empty(), "短内容应被跳过");
+    }
+
+    #[test]
+    fn test_extract_file_marker_format_directly() {
+        let text = "file:src/main.rs\nfn main() {}\nfile:Cargo.toml\n[package]\nname = \"test\"";
+        let files = extract_file_marker_format(text);
+        assert_eq!(files.len(), 2);
+        let main = files.iter().find(|f| f.path == "src/main.rs").unwrap();
+        assert_eq!(main.content, "fn main() {}");
+    }
+
+    #[test]
+    fn test_extract_file_marker_format_no_markers() {
+        assert!(extract_file_marker_format("just some text").is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_files() {
+        let files = vec![
+            ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "version 1".to_string(),
+                language: "rust".to_string(),
+            },
+            ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "version 2".to_string(),
+                language: "rust".to_string(),
+            },
+            ExtractedFile {
+                path: "Cargo.toml".to_string(),
+                content: "[package]".to_string(),
+                language: "toml".to_string(),
+            },
+        ];
+        let result = deduplicate_files(files);
+        assert_eq!(result.len(), 2, "应去重为 2 个文件");
+        let main = result.iter().find(|f| f.path == "src/main.rs").unwrap();
+        assert_eq!(main.content, "version 2", "应保留最后一个版本");
+    }
+
+    #[test]
+    fn test_deduplicate_files_empty() {
+        let result = deduplicate_files(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_deduplicate_files_no_duplicates() {
+        let files = vec![
+            ExtractedFile {
+                path: "a.rs".to_string(),
+                content: "a".to_string(),
+                language: "rust".to_string(),
+            },
+            ExtractedFile {
+                path: "b.rs".to_string(),
+                content: "b".to_string(),
+                language: "rust".to_string(),
+            },
+        ];
+        let result = deduplicate_files(files);
+        assert_eq!(result.len(), 2, "无重复时不应减少文件数");
+    }
+
+    #[test]
+    fn test_validate_extracted_files_no_panic() {
+        // 验证 validate_extracted_files 不会 panic
+        let files = vec![
+            ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "fn main() { let x = 42; }".to_string(),
+                language: "rust".to_string(),
+            },
+            ExtractedFile {
+                path: "Cargo.toml".to_string(),
+                content: "[package]\nname = \"test\"\nversion = \"0.1.0\"\n".to_string(),
+                language: "toml".to_string(),
+            },
+        ];
+        // 不应 panic
+        validate_extracted_files(&files);
+    }
+
+    #[test]
+    fn test_validate_extracted_files_empty() {
+        // 空列表不应 panic
+        validate_extracted_files(&[]);
+    }
+
+    #[test]
+    fn test_validate_extracted_files_with_quality_issues() {
+        // 包含 unwrap() 的 Rust 文件应被质量检查检测到
+        let files = vec![ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn foo() { let x = bar().unwrap(); }".to_string(),
+            language: "rust".to_string(),
+        }];
+        // 不应 panic — 质量检查仅输出 warn 日志
+        validate_extracted_files(&files);
     }
 }
