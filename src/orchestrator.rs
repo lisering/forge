@@ -729,6 +729,16 @@ where
     /// 启用后, 在代码写入工作区后自动运行 `cargo clippy`,
     /// 打印 clippy 警告和错误。默认 false (向后兼容)。
     pub clippy_check_enabled: bool,
+
+    /// 分阶段修复开关 — 按优先级分批修复 (Session 121)
+    ///
+    /// 启用后, 替代 `apply_fixes` 的一次性修复, 改为三阶段:
+    /// 1. 高优先级 (unwrap/expect/todo/panic 等)
+    /// 2. 中优先级 (unsafe/unwrap_or/#[must_use] 等)
+    /// 3. 低优先级 (文档注释)
+    ///
+    /// 默认 false (向后兼容, 使用一次性修复)。
+    pub staged_fix_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -783,6 +793,7 @@ where
             joint_decision_engine: None,
             auto_fix_enabled: false,
             clippy_check_enabled: false,
+            staged_fix_enabled: false,
         }
     }
 }
@@ -853,6 +864,7 @@ where
             joint_decision_engine: self.joint_decision_engine,
             auto_fix_enabled: self.auto_fix_enabled,
             clippy_check_enabled: self.clippy_check_enabled,
+            staged_fix_enabled: self.staged_fix_enabled,
         }
     }
 
@@ -1172,6 +1184,19 @@ where
         self
     }
 
+    /// 启用/禁用分阶段修复 (Session 121)
+    ///
+    /// 启用后, 替代 `apply_fixes` 的一次性修复, 改为三阶段按优先级分批修复:
+    /// 1. 高优先级 (unwrap/expect/todo/panic/unreachable/missing_result_return)
+    /// 2. 中优先级 (unsafe/unwrap_or/#[must_use])
+    /// 3. 低优先级 (文档注释)
+    ///
+    /// 优势: 高优先级修复不会因低优先级修复的行号偏移而错位。
+    pub fn with_staged_fix(mut self, enabled: bool) -> Self {
+        self.staged_fix_enabled = enabled;
+        self
+    }
+
     /// 对项目运行 clippy 检查并打印结果 (Session 120)
     ///
     /// 在代码写入工作区后调用, 如果 clippy 发现问题则打印警告和错误。
@@ -1197,18 +1222,21 @@ where
         }
     }
 
-    /// 对提取的文件应用自动修复 (Session 118)
+    /// 对提取的文件应用自动修复 (Session 118, Session 121 增强分阶段修复)
     ///
-    /// 遍历所有提取的文件, 对 Rust (.rs) 文件调用 `apply_fixes`,
+    /// 遍历所有提取的文件, 对 Rust (.rs) 文件调用 `apply_fixes` 或 `apply_staged_fixes`,
     /// 修复质量问题 (unwrap → ?, 添加 #[must_use], 文档注释等)。
     /// 非 Rust 文件不做处理。
+    ///
+    /// 当 `staged_fix_enabled` 为 true 时, 使用 `apply_staged_fixes` 分阶段修复,
+    /// 否则使用 `apply_fixes` 一次性修复。
     ///
     /// 返回修复后的文件列表, 并打印修复摘要。
     fn apply_auto_fixes_to_files(
         &self,
         files: Vec<crate::extract::ExtractedFile>,
     ) -> Vec<crate::extract::ExtractedFile> {
-        use crate::extract::apply_fixes_dry_run;
+        use crate::extract::{apply_fixes_dry_run, apply_staged_fixes};
 
         let mut fixed_files = Vec::with_capacity(files.len());
         let mut total_fixes = 0usize;
@@ -1216,37 +1244,63 @@ where
 
         for file in files {
             if file.path.ends_with(".rs") {
-                let preview = apply_fixes_dry_run(&file.content);
-                if preview.is_changed {
-                    total_fixes += preview.fixes_applied;
-                    fixed_count += 1;
-                    println!(
-                        "    🔧 自动修复 {}: {} 处修复",
-                        file.path, preview.fixes_applied
-                    );
-                    for issue in &preview.issues {
-                        debug!(
-                            "  {}:{} — {:?}: {}",
-                            file.path, issue.line, issue.issue_type, issue.message
+                // Session 121: 分阶段修复时直接使用 apply_staged_fixes
+                let fixed_content = if self.staged_fix_enabled {
+                    apply_staged_fixes(&file.content)
+                } else {
+                    let preview = apply_fixes_dry_run(&file.content);
+                    if preview.is_changed {
+                        total_fixes += preview.fixes_applied;
+                        fixed_count += 1;
+                        println!(
+                            "    🔧 自动修复 {}: {} 处修复",
+                            file.path, preview.fixes_applied
                         );
+                        for issue in &preview.issues {
+                            debug!(
+                                "  {}:{} — {:?}: {}",
+                                file.path, issue.line, issue.issue_type, issue.message
+                            );
+                        }
+                        preview.fixed_content
+                    } else {
+                        fixed_files.push(file);
+                        continue;
                     }
+                };
+
+                // 分阶段修复模式: 检查是否有变化
+                if self.staged_fix_enabled {
+                    if fixed_content != file.content {
+                        fixed_count += 1;
+                        println!("    🔧 分阶段修复 {} (高→中→低优先级)", file.path);
+                        fixed_files.push(crate::extract::ExtractedFile {
+                            content: fixed_content,
+                            ..file
+                        });
+                    } else {
+                        fixed_files.push(file);
+                    }
+                } else {
                     fixed_files.push(crate::extract::ExtractedFile {
-                        content: preview.fixed_content,
+                        content: fixed_content,
                         ..file
                     });
-                } else {
-                    fixed_files.push(file);
                 }
             } else {
                 fixed_files.push(file);
             }
         }
 
-        if total_fixes > 0 {
-            println!(
-                "    🔧 自动修复摘要: {} 个文件, {} 处修复",
-                fixed_count, total_fixes
-            );
+        if total_fixes > 0 || (self.staged_fix_enabled && fixed_count > 0) {
+            if self.staged_fix_enabled {
+                println!("    🔧 分阶段修复摘要: {} 个文件已修复", fixed_count);
+            } else {
+                println!(
+                    "    🔧 自动修复摘要: {} 个文件, {} 处修复",
+                    fixed_count, total_fixes
+                );
+            }
         }
 
         fixed_files
@@ -10561,6 +10615,80 @@ mod tests {
             .with_clippy_check(true);
         assert!(orch.auto_fix_enabled, "auto_fix 应启用");
         assert!(orch.clippy_check_enabled, "clippy_check 应启用");
+    }
+
+    // ===== Session 121: 分阶段修复测试 =====
+
+    #[test]
+    fn test_staged_fix_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(
+            !orch.staged_fix_enabled,
+            "staged_fix_enabled 应默认为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_staged_fix_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_staged_fix(true);
+        assert!(
+            orch.staged_fix_enabled,
+            "with_staged_fix(true) 应设置 staged_fix_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_staged_fix_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_staged_fix(false);
+        assert!(
+            !orch.staged_fix_enabled,
+            "with_staged_fix(false) 应设置 staged_fix_enabled 为 false"
+        );
+    }
+
+    #[test]
+    fn test_staged_fix_with_auto_fix_combined() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_staged_fix(true)
+            .with_clippy_check(true);
+        assert!(orch.auto_fix_enabled, "auto_fix 应启用");
+        assert!(orch.staged_fix_enabled, "staged_fix 应启用");
+        assert!(orch.clippy_check_enabled, "clippy_check 应启用");
+    }
+
+    #[test]
+    fn test_apply_auto_fixes_staged_mode() {
+        use crate::extract::ExtractedFile;
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_staged_fix(true);
+
+        let files = vec![ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "pub fn foo() { let x = bar().unwrap(); }".to_string(),
+            language: "rust".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert!(
+            !fixed[0].content.contains(".unwrap()"),
+            "分阶段模式应修复 unwrap"
+        );
+        assert!(
+            fixed[0].content.contains("#[must_use]"),
+            "分阶段模式应添加 #[must_use]"
+        );
     }
 }
 

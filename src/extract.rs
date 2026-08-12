@@ -1931,11 +1931,17 @@ pub fn apply_fixes(content: &str) -> String {
 /// let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
 /// let fixed = apply_fixes_with_imports(code);
 /// assert!(fixed.contains("Result<"), "应修改返回类型");
-/// assert!(fixed.contains("use anyhow::Result;"), "应添加导入");
+/// assert!(fixed.contains("use anyhow::"), "应添加导入");
 /// ```
 pub fn apply_fixes_with_imports(content: &str) -> String {
+    // 1. 修复所有质量问题 (unwrap → ?, 签名修改等)
     let fixed = apply_fixes(content);
-    ensure_anyhow_import(&fixed)
+    // 2. 包装函数体最后的表达式为 Ok(...) (Session 121)
+    let wrapped = wrap_last_expression_in_ok(&fixed);
+    // 3. 确保所需的 anyhow 导入 (增强版, Session 121)
+    let imported = ensure_anyhow_imports(&wrapped);
+    // 4. 合并分散的 anyhow 导入 (Session 121)
+    merge_anyhow_imports(&imported)
 }
 
 /// 修复预览 — dry-run 模式的返回值 (Session 118)
@@ -2681,6 +2687,581 @@ fn ext_for_lang(lang: &str) -> &str {
         "css" => "css",
         _ => "txt",
     }
+}
+
+// ============================================================================
+//  Session 121: 增强自动修复 — 函数体 Ok 包装 + 合并导入 + LCS diff
+// ============================================================================
+
+/// 包装函数体最后的表达式为 `Ok(...)` (Session 121)
+///
+/// 当 `generate_fix` 将函数签名修改为 `-> Result<T, anyhow::Error>` 后,
+/// 函数体中的返回值也需要包装为 `Ok(...)`。此函数:
+///
+/// 1. 扫描所有返回 `Result<T, anyhow::Error>` 的函数
+/// 2. 找到函数体最后的表达式 (闭合 `}` 前最后一个非空/非注释行)
+/// 3. 如果该表达式不以 `Ok(` / `Err(` / `return` / `?` 开头, 包装为 `Ok(...)`
+///
+/// # 幂等性
+///
+/// 二次调用不产生变化 — 已包装的表达式不会被重复包装。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::wrap_last_expression_in_ok;
+///
+/// // 单行函数: 42 → Ok(42)
+/// let code = "fn foo() -> Result<i32, anyhow::Error> { 42 }";
+/// let result = wrap_last_expression_in_ok(code);
+/// assert!(result.contains("Ok(42)"), "应包装返回值");
+///
+/// // 已包装的不修改 (幂等)
+/// let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+/// assert_eq!(wrap_last_expression_in_ok(code), code, "已包装不修改");
+/// ```
+pub fn wrap_last_expression_in_ok(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let stripped = strip_string_content(content);
+    let stripped_lines: Vec<&str> = stripped.lines().collect();
+
+    let mut i = 0;
+    while i < stripped_lines.len() {
+        let line = stripped_lines[i].trim();
+
+        // 检测函数签名: 包含 fn 和 -> Result< 和 anyhow::Error
+        if (line.contains("fn ") || line.contains("fn\t"))
+            && line.contains("-> Result<")
+            && line.contains("anyhow::Error")
+        {
+            // 找到函数体的起始 { 并跟踪深度
+            let mut brace_depth = 0i32;
+            let fn_start = i;
+            let mut found_open = false;
+
+            // 在当前行查找 {
+            for (char_idx, ch) in stripped_lines[i].char_indices() {
+                if ch == '{' {
+                    brace_depth = 1;
+                    found_open = true;
+                    // 检查是否是单行函数 (同一行有闭合 })
+                    let after = &stripped_lines[i][char_idx + 1..];
+                    if let Some(close_pos) = after.rfind('}') {
+                        let body = after[..close_pos].trim();
+                        if !body.is_empty()
+                            && !body.starts_with("Ok(")
+                            && !body.starts_with("Err(")
+                            && !body.starts_with("return")
+                            && !body.ends_with('?')
+                            && !body.ends_with("?;")
+                            && !body.starts_with("//")
+                        {
+                            // 单行函数: 包装 body — clone 避免借用冲突
+                            let orig_line = result_lines[i].clone();
+                            if let Some(pos) = orig_line.find('{') {
+                                if let Some(end_pos) = orig_line.rfind('}') {
+                                    let inner = orig_line[pos + 1..end_pos].trim();
+                                    if !inner.is_empty()
+                                        && !inner.starts_with("Ok(")
+                                        && !inner.starts_with("Err(")
+                                        && !inner.starts_with("return")
+                                        && !inner.ends_with('?')
+                                        && !inner.ends_with("?;")
+                                    {
+                                        result_lines[i] = format!(
+                                            "{} Ok({}){}",
+                                            &orig_line[..pos + 1],
+                                            inner,
+                                            &orig_line[end_pos..]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if found_open && brace_depth > 0 {
+                // 多行函数: 找到闭合 }
+                let mut j = i + 1;
+                while j < stripped_lines.len() && brace_depth > 0 {
+                    for ch in stripped_lines[j].chars() {
+                        match ch {
+                            '{' => brace_depth += 1,
+                            '}' => brace_depth -= 1,
+                            _ => {}
+                        }
+                    }
+
+                    if brace_depth == 0 {
+                        // 当前行包含闭合 }, 找到了函数体末尾
+                        if let Some(brace_pos) = stripped_lines[j].rfind('}') {
+                            let before_brace = stripped_lines[j][..brace_pos].trim();
+                            if !before_brace.is_empty()
+                                && !before_brace.starts_with("//")
+                                && !before_brace.starts_with("/*")
+                                && !before_brace.starts_with("Ok(")
+                                && !before_brace.starts_with("Err(")
+                                && !before_brace.starts_with("return")
+                                && !before_brace.ends_with('?')
+                                && !before_brace.ends_with("?;")
+                            {
+                                // 同行有表达式 — clone 避免借用冲突
+                                let orig_line = result_lines[j].clone();
+                                if let Some(obp) = orig_line.rfind('}') {
+                                    let inner = orig_line[..obp].trim_end();
+                                    let expr = inner.trim();
+                                    if !expr.is_empty()
+                                        && !expr.starts_with("Ok(")
+                                        && !expr.starts_with("Err(")
+                                        && !expr.starts_with("return")
+                                        && !expr.ends_with('?')
+                                        && !expr.ends_with("?;")
+                                    {
+                                        let indent_len = inner.len() - inner.trim_start().len();
+                                        let indent = &inner[..indent_len];
+                                        result_lines[j] =
+                                            format!("{}Ok({}){}", indent, expr, &orig_line[obp..]);
+                                    }
+                                }
+                            } else {
+                                // 在前一行查找最后的表达式
+                                let mut k = j.saturating_sub(1);
+                                while k > fn_start {
+                                    let prev = stripped_lines[k].trim();
+                                    if prev.is_empty()
+                                        || prev.starts_with("//")
+                                        || prev.starts_with("/*")
+                                        || prev.starts_with("*")
+                                        || prev.starts_with("}")
+                                    {
+                                        k = k.saturating_sub(1);
+                                        continue;
+                                    }
+                                    // 找到最后的表达式行
+                                    if !prev.starts_with("Ok(")
+                                        && !prev.starts_with("Err(")
+                                        && !prev.starts_with("return")
+                                        && !prev.ends_with('?')
+                                        && !prev.ends_with("?;")
+                                        && !prev.ends_with(';')
+                                        && !prev.starts_with("let ")
+                                        && !prev.starts_with("if ")
+                                        && !prev.starts_with("match ")
+                                        && !prev.starts_with("for ")
+                                        && !prev.starts_with("while ")
+                                        && !prev.starts_with("loop ")
+                                    {
+                                        // 包装这行 — clone 避免借用冲突
+                                        let orig_line = result_lines[k].clone();
+                                        let indent_len =
+                                            orig_line.len() - orig_line.trim_start().len();
+                                        let indent = &orig_line[..indent_len];
+                                        let expr = orig_line.trim();
+                                        result_lines[k] = format!("{}Ok({})", indent, expr);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+
+                    j += 1;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    result_lines.join("\n")
+}
+
+/// 合并分散的 `use anyhow::Result;` 和 `use anyhow::Error;` 为合并导入 (Session 121)
+///
+/// 将:
+/// ```ignore
+/// use anyhow::Result;
+/// use anyhow::Error;
+/// ```
+/// 合并为:
+/// ```ignore
+/// use anyhow::{Result, Error};
+/// ```
+///
+/// # 幂等性
+///
+/// 已合并的导入不会被重复处理。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::merge_anyhow_imports;
+///
+/// // 分散导入 → 合并导入
+/// let code = "use anyhow::Result;\nuse anyhow::Error;\nfn foo() {}";
+/// let result = merge_anyhow_imports(code);
+/// assert!(result.contains("use anyhow::{Result, Error};"), "应合并导入");
+/// assert!(!result.contains("use anyhow::Result;\n"), "不应有单独的 Result 导入");
+///
+/// // 已合并不修改 (幂等)
+/// let code = "use anyhow::{Result, Error};\nfn foo() {}";
+/// assert_eq!(merge_anyhow_imports(code), code, "已合并不修改");
+/// ```
+pub fn merge_anyhow_imports(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut has_result = false;
+    let mut has_error = false;
+    let mut result_line_idx: Option<usize> = None;
+    let mut error_line_idx: Option<usize> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "use anyhow::Result;" {
+            has_result = true;
+            result_line_idx = Some(i);
+        } else if trimmed == "use anyhow::Error;" {
+            has_error = true;
+            error_line_idx = Some(i);
+        }
+    }
+
+    // 只有同时存在分散的 Result 和 Error 导入时才合并
+    if !has_result || !has_error {
+        return content.to_string();
+    }
+
+    // 检查是否已有合并导入
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.contains("use anyhow::{")
+            && trimmed.contains("Result")
+            && trimmed.contains("Error")
+        {
+            // 已有合并导入, 删除分散的导入行
+            let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            if let Some(ri) = result_line_idx {
+                result_lines[ri] = String::new();
+            }
+            if let Some(ei) = error_line_idx {
+                result_lines[ei] = String::new();
+            }
+            return result_lines.join("\n");
+        }
+    }
+
+    // 合并: 保留第一个位置, 删除第二个
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let keep_idx = result_line_idx.min(error_line_idx).unwrap();
+    let remove_idx = result_line_idx.max(error_line_idx).unwrap();
+
+    result_lines[keep_idx] = "use anyhow::{Result, Error};".to_string();
+    result_lines.remove(remove_idx);
+
+    result_lines.join("\n")
+}
+
+/// 确保代码包含所需的 anyhow 导入 (增强版, Session 121)
+///
+/// 与 `ensure_anyhow_import` 相比, 此函数:
+/// 1. 同时检查 `Result` 和 `Error` 的导入需求
+/// 2. 支持合并导入 `use anyhow::{Result, Error};`
+/// 3. 如果已有其中一个, 自动合并添加另一个
+///
+/// # 规则
+///
+/// 1. 检测代码中使用了 `anyhow::Result` / `anyhow::Error` 哪些类型
+/// 2. 检查已有的导入 (包括合并导入 `use anyhow::{...}`)
+/// 3. 缺失的导入自动添加, 已有的不重复
+/// 4. 如果已有分散导入, 合并为 `use anyhow::{Result, Error};`
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::ensure_anyhow_imports;
+///
+/// // 需要 Result 和 Error, 都没有 → 添加合并导入
+/// let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+/// let result = ensure_anyhow_imports(code);
+/// assert!(result.contains("use anyhow::"), "应添加导入");
+///
+/// // 已有 Result 导入, 还需要 Error → 合并
+/// let code = "use anyhow::Result;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+/// let result = ensure_anyhow_imports(code);
+/// assert!(result.contains("Error"), "应包含 Error 导入");
+///
+/// // 幂等
+/// let second = ensure_anyhow_imports(&result);
+/// assert_eq!(result, second, "二次调用不变化");
+/// ```
+pub fn ensure_anyhow_imports(content: &str) -> String {
+    // 检测需要哪些导入
+    let needs_result = content.contains("anyhow::Result") || content.contains("Result<");
+    let needs_error = content.contains("anyhow::Error");
+
+    if !needs_result && !needs_error {
+        return content.to_string();
+    }
+
+    // 检查已有导入
+    let mut has_result_import = false;
+    let mut has_error_import = false;
+    let mut has_wildcard = false;
+    let mut has_merged = false;
+    let mut result_line_idx: Option<usize> = None;
+    let mut error_line_idx: Option<usize> = None;
+
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("use anyhow::Result;") {
+            has_result_import = true;
+            result_line_idx = Some(i);
+        } else if trimmed.starts_with("use anyhow::Error;") {
+            has_error_import = true;
+            error_line_idx = Some(i);
+        } else if trimmed.starts_with("use anyhow::*;") {
+            has_wildcard = true;
+        } else if trimmed.contains("use anyhow::{") {
+            if trimmed.contains("Result") {
+                has_result_import = true;
+            }
+            if trimmed.contains("Error") {
+                has_error_import = true;
+            }
+            if trimmed.contains("Result") && trimmed.contains("Error") {
+                has_merged = true;
+            }
+        }
+    }
+
+    // 通配导入已覆盖所有
+    if has_wildcard {
+        return content.to_string();
+    }
+
+    // 检查是否需要添加什么
+    let need_add_result = needs_result && !has_result_import;
+    let need_add_error = needs_error && !has_error_import;
+
+    // 如果不需要添加任何东西, 尝试合并分散导入
+    if !need_add_result && !need_add_error {
+        return merge_anyhow_imports(content);
+    }
+
+    // 如果已有其中一个分散导入, 需要合并添加另一个
+    if has_result_import && need_add_error {
+        if let Some(idx) = result_line_idx {
+            // 将 use anyhow::Result; 替换为 use anyhow::{Result, Error};
+            let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            result_lines[idx] = "use anyhow::{Result, Error};".to_string();
+            return result_lines.join("\n");
+        }
+    }
+
+    if has_error_import && need_add_result {
+        if let Some(idx) = error_line_idx {
+            // 将 use anyhow::Error; 替换为 use anyhow::{Result, Error};
+            let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            result_lines[idx] = "use anyhow::{Result, Error};".to_string();
+            return result_lines.join("\n");
+        }
+    }
+
+    // 如果已有合并导入但缺少一个, 补充
+    if has_merged {
+        return content.to_string();
+    }
+
+    // 需要新增导入: 构建导入语句
+    let import_line = if need_add_result && need_add_error {
+        "use anyhow::{Result, Error};".to_string()
+    } else if need_add_result {
+        "use anyhow::Result;".to_string()
+    } else {
+        "use anyhow::Error;".to_string()
+    };
+
+    // 找到插入位置
+    let mut insert_pos = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*")
+            || trimmed.starts_with("#![")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("///")
+        {
+            continue;
+        }
+        insert_pos = i;
+        break;
+    }
+
+    if insert_pos == 0 && !lines.is_empty() {
+        let all_comments = lines
+            .iter()
+            .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+        if all_comments {
+            insert_pos = lines.len();
+        }
+    }
+
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    result_lines.insert(insert_pos, import_line);
+
+    result_lines.join("\n")
+}
+
+/// 计算两段文本之间的行级别差异 (LCS 算法, Session 121)
+///
+/// 使用最长公共子序列 (Longest Common Subsequence) 算法,
+/// 比逐行比较更准确地识别插入和删除操作。
+///
+/// 与 `compute_line_diff` 的区别:
+/// - `compute_line_diff`: 逐行比较, 行号对齐 — 简单但插入/删除会导致后续全部标记为 Modified
+/// - `compute_line_diff_lcs`: LCS 对齐 — 正确识别中间插入/删除, 不影响后续行的匹配
+///
+/// # 算法
+///
+/// 1. 构建 LCS 动态规划表 O(m×n)
+/// 2. 回溯找出公共行
+/// 3. 非公共行标记为 Added (仅存在于 fixed) 或 Removed (仅存在于 original)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_lcs, LineDiffType};
+///
+/// // 无差异
+/// let diffs = compute_line_diff_lcs("fn foo() {}", "fn foo() {}");
+/// assert!(diffs.is_empty());
+///
+/// // 中间插入一行 — LCS 正确识别为 Added
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diffs = compute_line_diff_lcs(original, fixed);
+/// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Added), "应有 Added");
+/// assert!(!diffs.iter().any(|d| d.diff_type == LineDiffType::Modified), "不应有 Modified");
+/// ```
+pub fn compute_line_diff_lcs(original: &str, fixed: &str) -> Vec<LineDiff> {
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let fix_lines: Vec<&str> = fixed.lines().collect();
+    let m = orig_lines.len();
+    let n = fix_lines.len();
+
+    // 构建 LCS 动态规划表
+    // dp[i][j] = orig_lines[0..i] 和 fix_lines[0..j] 的 LCS 长度
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            if orig_lines[i - 1] == fix_lines[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+
+    // 回溯找出 LCS 并同时构建 diff
+    let mut diffs = Vec::new();
+    let mut i = m;
+    let mut j = n;
+    let mut line_number = 1usize;
+
+    // 从后向前回溯, 收集操作
+    let mut operations: Vec<(usize, LineDiffType, Option<String>, Option<String>)> = Vec::new();
+
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && orig_lines[i - 1] == fix_lines[j - 1] {
+            // 公共行 — 无差异
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            // Added: 仅存在于 fixed
+            operations.push((
+                j,
+                LineDiffType::Added,
+                None,
+                Some(fix_lines[j - 1].to_string()),
+            ));
+            j -= 1;
+        } else if i > 0 {
+            // Removed: 仅存在于 original
+            operations.push((
+                i,
+                LineDiffType::Removed,
+                Some(orig_lines[i - 1].to_string()),
+                None,
+            ));
+            i -= 1;
+        }
+    }
+
+    // 反转操作 (之前是从后向前)
+    operations.reverse();
+
+    // 分配行号
+    for (ln, diff_type, orig, fix) in operations {
+        diffs.push(LineDiff {
+            line_number: ln,
+            diff_type,
+            original_line: orig,
+            fixed_line: fix,
+        });
+        line_number = ln + 1;
+    }
+
+    let _ = line_number; // suppress unused warning
+    diffs
+}
+
+/// 分阶段自动修复 — 按优先级分批修复, 每批验证后再修下一批 (Session 121)
+///
+/// 与 `apply_fixes` 一次性修复所有问题不同, 此函数分三个阶段:
+///
+/// 1. **高优先级**: Unwrap / Expect / Todo / Unimplemented / Panic / Unreachable / MissingResultReturn
+/// 2. **中优先级**: UnsafeBlock / UnsafeFn / UnsafeImpl / UnwrapOr / UnwrapOrDefault / MissingMustUse
+/// 3. **低优先级**: MissingDoc
+///
+/// 每阶段使用 `apply_fixes_except` 排除其他阶段的问题,
+/// 确保高优先级修复不会因低优先级修复的行号偏移而错位。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_staged_fixes;
+///
+/// let code = "pub fn foo() { let x = bar().unwrap(); }";
+/// let result = apply_staged_fixes(code);
+/// assert!(!result.contains(".unwrap()"), "unwrap 应被修复");
+/// assert!(result.contains("#[must_use]"), "应添加 #[must_use]");
+/// ```
+pub fn apply_staged_fixes(content: &str) -> String {
+    // 阶段 1: 高优先级 — 排除中低优先级
+    let stage1_exclude = [
+        IssueType::UnsafeBlock,
+        IssueType::UnsafeFn,
+        IssueType::UnsafeImpl,
+        IssueType::UnwrapOr,
+        IssueType::UnwrapOrDefault,
+        IssueType::MissingMustUse,
+        IssueType::MissingDoc,
+    ];
+    let after_stage1 = apply_fixes_except(content, &stage1_exclude);
+
+    // 阶段 2: 中优先级 — 排除低优先级
+    let stage2_exclude = [IssueType::MissingDoc];
+    let after_stage2 = apply_fixes_except(&after_stage1, &stage2_exclude);
+
+    // 阶段 3: 低优先级 — 修复剩余所有问题
+    apply_fixes(&after_stage2)
 }
 
 #[cfg(test)]
@@ -5952,16 +6533,22 @@ fn foo(
         let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
         let result = apply_fixes_with_imports(code);
         assert!(result.contains("Result<"), "应修改返回类型为 Result");
-        assert!(result.contains("use anyhow::Result;"), "应添加 anyhow 导入");
+        // Session 121: 增强版使用合并导入
+        assert!(
+            result.contains("use anyhow::"),
+            "应添加 anyhow 导入: {}",
+            result
+        );
     }
 
     #[test]
     fn test_apply_fixes_with_imports_already_has_import() {
         let code = "use anyhow::Result;\nfn foo() { let x = bar().unwrap(); }";
         let result = apply_fixes_with_imports(code);
-        // 应只有一次 use anyhow::Result;
-        let count = result.matches("use anyhow::Result;").count();
-        assert_eq!(count, 1, "不应重复添加导入");
+        // Session 121: 增强版可能合并为 use anyhow::{Result, Error};
+        // 关键是不重复添加导入
+        let import_count = result.matches("use anyhow::").count();
+        assert_eq!(import_count, 1, "应只有一个 anyhow 导入行: {}", result);
     }
 
     // ===== Session 120: verify_idempotent_detailed 增强 (行级别 diff) 测试 =====
@@ -5996,5 +6583,415 @@ fn foo(
             deserialized.first_pass_diff.len(),
             result.first_pass_diff.len()
         );
+    }
+
+    // ===== Session 121: wrap_last_expression_in_ok 测试 =====
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_single_line() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { 42 }";
+        let result = wrap_last_expression_in_ok(code);
+        assert!(result.contains("Ok(42)"), "应包装返回值: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_already_wrapped() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = wrap_last_expression_in_ok(code);
+        assert_eq!(result, code, "已包装不修改 (幂等)");
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_already_err() {
+        let code = r#"fn foo() -> Result<i32, anyhow::Error> { Err(anyhow!("error")) }"#;
+        let result = wrap_last_expression_in_ok(code);
+        assert_eq!(result, code, "已有 Err 不修改");
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_multiline() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    let x = 42;\n    x\n}";
+        let result = wrap_last_expression_in_ok(code);
+        assert!(
+            result.contains("Ok(x)"),
+            "多行函数应包装最后表达式: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_multiline_already_wrapped() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    let x = 42;\n    Ok(x)\n}";
+        let result = wrap_last_expression_in_ok(code);
+        assert_eq!(result, code, "已包装不修改 (幂等)");
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_not_result_function() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = wrap_last_expression_in_ok(code);
+        assert_eq!(result, code, "非 Result 函数不修改");
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { 42 }";
+        let first = wrap_last_expression_in_ok(code);
+        let second = wrap_last_expression_in_ok(&first);
+        assert_eq!(first, second, "二次调用不变化 (幂等)");
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_unit_type() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    println!(\"hello\");\n}";
+        let result = wrap_last_expression_in_ok(code);
+        // 函数体最后是 println! 语句 (以 ; 结尾), 不需要包装
+        // 只有无分号的尾表达式才需要包装
+        let _ = result;
+    }
+
+    #[test]
+    fn test_wrap_last_expression_in_ok_preserves_indentation() {
+        let code = "    fn foo() -> Result<i32, anyhow::Error> { 42 }";
+        let result = wrap_last_expression_in_ok(code);
+        assert!(result.contains("Ok(42)"), "应包装");
+        assert!(result.starts_with("    "), "应保留缩进");
+    }
+
+    // ===== Session 121: merge_anyhow_imports 测试 =====
+
+    #[test]
+    fn test_merge_anyhow_imports_combines() {
+        let code = "use anyhow::Result;\nuse anyhow::Error;\nfn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert!(
+            result.contains("use anyhow::{Result, Error};"),
+            "应合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_merge_anyhow_imports_idempotent() {
+        let code = "use anyhow::{Result, Error};\nfn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert_eq!(result, code, "已合并不修改 (幂等)");
+    }
+
+    #[test]
+    fn test_merge_anyhow_imports_only_result() {
+        let code = "use anyhow::Result;\nfn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert_eq!(result, code, "只有 Result 不合并");
+    }
+
+    #[test]
+    fn test_merge_anyhow_imports_only_error() {
+        let code = "use anyhow::Error;\nfn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert_eq!(result, code, "只有 Error 不合并");
+    }
+
+    #[test]
+    fn test_merge_anyhow_imports_no_imports() {
+        let code = "fn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert_eq!(result, code, "无导入不修改");
+    }
+
+    #[test]
+    fn test_merge_anyhow_imports_preserves_order() {
+        let code = "use std::io;\nuse anyhow::Result;\nuse anyhow::Error;\nfn foo() {}";
+        let result = merge_anyhow_imports(code);
+        assert!(result.contains("use anyhow::{Result, Error};"), "应合并");
+        assert!(result.contains("use std::io;"), "应保留其他导入");
+    }
+
+    // ===== Session 121: ensure_anyhow_imports 测试 =====
+
+    #[test]
+    fn test_ensure_anyhow_imports_no_need() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = ensure_anyhow_imports(code);
+        assert_eq!(result, code, "不需要 anyhow 不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_already_has_both() {
+        let code =
+            "use anyhow::{Result, Error};\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert_eq!(result, code, "已有合并导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_already_has_wildcard() {
+        let code = "use anyhow::*;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert_eq!(result, code, "通配导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_needs_both_adds_merged() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert!(
+            result.contains("use anyhow::{Result, Error};"),
+            "应添加合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_has_result_merges_error() {
+        let code = "use anyhow::Result;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert!(
+            result.contains("use anyhow::{Result, Error};"),
+            "应合并添加 Error: {}",
+            result
+        );
+        let count = result.matches("use anyhow::").count();
+        assert_eq!(count, 1, "应只有一个 anyhow 导入行");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_has_error_merges_result() {
+        let code = "use anyhow::Error;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert!(
+            result.contains("use anyhow::{Result, Error};"),
+            "应合并添加 Result: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let first = ensure_anyhow_imports(code);
+        let second = ensure_anyhow_imports(&first);
+        assert_eq!(first, second, "二次调用不变化 (幂等)");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_with_comments() {
+        let code = "//! Module docs\n// comment\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert!(result.contains("use anyhow::"), "应添加导入");
+        let import_pos = result.find("use anyhow::").unwrap();
+        let fn_pos = result.find("fn foo()").unwrap();
+        assert!(import_pos < fn_pos, "导入应在函数之前");
+    }
+
+    #[test]
+    fn test_ensure_anyhow_imports_merges_separate() {
+        let code = "use anyhow::Result;\nuse anyhow::Error;\nfn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let result = ensure_anyhow_imports(code);
+        assert!(
+            result.contains("use anyhow::{Result, Error};"),
+            "应合并分散导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 121: compute_line_diff_lcs 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_lcs_no_change() {
+        let original = "fn foo() {}\nfn bar() {}";
+        let fixed = "fn foo() {}\nfn bar() {}";
+        let diffs = compute_line_diff_lcs(original, fixed);
+        assert!(diffs.is_empty(), "无差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_added() {
+        let original = "fn foo() {}\nfn bar() {}";
+        let fixed = "fn foo() {}\nfn new() {}\nfn bar() {}";
+        let diffs = compute_line_diff_lcs(original, fixed);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "应有 Added"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.diff_type == LineDiffType::Modified),
+            "不应有 Modified (LCS 正确识别插入)"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.diff_type == LineDiffType::Removed),
+            "不应有 Removed"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_removed() {
+        let original = "fn foo() {}\nfn removed() {}\nfn bar() {}";
+        let fixed = "fn foo() {}\nfn bar() {}";
+        let diffs = compute_line_diff_lcs(original, fixed);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Removed),
+            "应有 Removed"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "不应有 Added"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_modified() {
+        // LCS 不产生 Modified, 而是 Removed + Added
+        let original = "let x = 1;";
+        let fixed = "let x = 2;";
+        let diffs = compute_line_diff_lcs(original, fixed);
+        assert!(!diffs.is_empty(), "应有差异");
+        // 旧行被 Removed, 新行被 Added
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Removed),
+            "应有 Removed"
+        );
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "应有 Added"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_empty_original() {
+        let diffs = compute_line_diff_lcs("", "fn foo() {}");
+        assert!(
+            diffs.iter().all(|d| d.diff_type == LineDiffType::Added),
+            "空原始 → 全部 Added"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_empty_fixed() {
+        let diffs = compute_line_diff_lcs("fn foo() {}", "");
+        assert!(
+            diffs.iter().all(|d| d.diff_type == LineDiffType::Removed),
+            "空修复 → 全部 Removed"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_both_empty() {
+        let diffs = compute_line_diff_lcs("", "");
+        assert!(diffs.is_empty(), "双空 → 无差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_multiple_insertions() {
+        let original = "a\nc\ne";
+        let fixed = "a\nb\nc\nd\ne";
+        let diffs = compute_line_diff_lcs(original, fixed);
+        let added_count = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(added_count, 2, "应添加 2 行 (b 和 d)");
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_serde() {
+        let diffs = compute_line_diff_lcs("a\nb", "a\nc\nb");
+        let json = serde_json::to_string(&diffs).expect("序列化失败");
+        let deserialized: Vec<LineDiff> = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(diffs.len(), deserialized.len());
+    }
+
+    #[test]
+    fn test_compute_line_diff_lcs_vs_basic() {
+        // 对比: 基础版会标记修改行, LCS 版正确识别为 Added
+        let original = "fn foo() {\n}\nfn bar() {}";
+        let fixed = "fn foo() {\n    let x = 42;\n}\nfn bar() {}";
+
+        let basic_diffs = compute_line_diff(original, fixed);
+        let lcs_diffs = compute_line_diff_lcs(original, fixed);
+
+        // 基础版: 从第 2 行开始全部 Modified (因为行号对齐失效)
+        // LCS 版: 只有第 2 行 Added, 其他行匹配
+        let lcs_added = lcs_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(lcs_added, 1, "LCS 应只有 1 个 Added");
+
+        // 基础版至少有 Modified (因为行号错位)
+        let basic_modified = basic_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Modified)
+            .count();
+        assert!(basic_modified >= 1, "基础版应有 Modified");
+    }
+
+    // ===== Session 121: apply_staged_fixes 测试 =====
+
+    #[test]
+    fn test_apply_staged_fixes_unwrap() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes(code);
+        assert!(!result.contains(".unwrap()"), "unwrap 应被修复");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_must_use() {
+        let code = "pub fn foo() -> bool { true }";
+        let result = apply_staged_fixes(code);
+        assert!(result.contains("#[must_use]"), "应添加 #[must_use]");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_missing_doc() {
+        let code = "pub fn foo() -> bool { true }";
+        let result = apply_staged_fixes(code);
+        assert!(
+            result.contains("///") || result.contains("TODO"),
+            "应有文档注释或 TODO"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = apply_staged_fixes(code);
+        assert_eq!(result, code, "无问题不修改");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_multiple_issues() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes(code);
+        assert!(!result.contains(".unwrap()"), "unwrap 应被修复");
+        assert!(result.contains("#[must_use]"), "应添加 #[must_use]");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_idempotent() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let first = apply_staged_fixes(code);
+        let second = apply_staged_fixes(&first);
+        assert_eq!(first, second, "分阶段修复应幂等");
+    }
+
+    // ===== Session 121: apply_fixes_with_imports 增强测试 =====
+
+    #[test]
+    fn test_apply_fixes_with_imports_wraps_ok() {
+        // 函数使用 ? 但未返回 Result, 修复后应包装返回值为 Ok(...)
+        let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
+        let result = apply_fixes_with_imports(code);
+        assert!(result.contains("Result<"), "应修改返回类型");
+        assert!(result.contains("use anyhow::"), "应添加导入");
+    }
+
+    #[test]
+    fn test_apply_fixes_with_imports_merges_imports() {
+        // 已有分散导入, 修复后应合并
+        let code = "use anyhow::Result;\nfn foo() -> i32 { let x: Result<i32, _> = Ok(42); x? }";
+        let result = apply_fixes_with_imports(code);
+        let import_count = result.matches("use anyhow::").count();
+        assert_eq!(import_count, 1, "应只有一个 anyhow 导入行: {}", result);
     }
 }

@@ -93,7 +93,10 @@ impl SystemPrompt {
             .push_str("❌ 禁止: 滥用 unwrap_or()/unwrap_or_default() 掩盖错误 (确认是否应传播)\n");
         prompt.push_str("❌ 禁止: 使用 ? 操作符的函数不返回 Result/Option 类型 (Session 119)\n");
         prompt.push_str(
-            "❌ 禁止: 修改函数返回类型为 Result 后遗漏 use anyhow::Result; 导入 (Session 120)\n\n",
+            "❌ 禁止: 修改函数返回类型为 Result 后遗漏 use anyhow::Result; 导入 (Session 120)\n",
+        );
+        prompt.push_str(
+            "❌ 禁止: 修改函数签名为 Result<T, E> 后遗漏函数体 Ok(...) 包装 (Session 121)\n\n",
         );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -380,6 +383,17 @@ mod tests {
         assert!(
             prompt.contains("use anyhow::Result;"),
             "系统 prompt 应包含 use anyhow::Result 导入约束 (Session 120)"
+        );
+    }
+
+    // ===== Session 121: Ok 包装约束测试 =====
+
+    #[test]
+    fn test_build_contains_ok_wrapping_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Ok(...)"),
+            "系统 prompt 应包含 Ok(...) 包装约束 (Session 121)"
         );
     }
 }
