@@ -2522,9 +2522,9 @@ pub fn verify_idempotent_detailed(content: &str) -> IdempotencyResult {
         .cloned()
         .collect();
 
-    // 计算行级别差异 (Session 120)
-    let first_pass_diff = compute_line_diff(content, &first_pass);
-    let second_pass_diff = compute_line_diff(&first_pass, &second_pass);
+    // 计算行级别差异 (Session 120, Session 124: 使用统一 diff 接口自动选择最优算法)
+    let first_pass_diff = compute_line_diff_unified(content, &first_pass);
+    let second_pass_diff = compute_line_diff_unified(&first_pass, &second_pass);
 
     IdempotencyResult {
         is_idempotent: first_pass == second_pass,
@@ -3326,85 +3326,133 @@ pub fn wrap_return_statements_in_ok(content: &str) -> String {
                 while j < stripped_lines.len() && brace_depth > 0 {
                     let cur = stripped_lines[j].trim();
 
-                    // 检测 return 语句 (Session 122 + Session 123 多行增强)
-                    if cur.starts_with("return ")
-                        && !cur.starts_with("return Ok(")
-                        && !cur.starts_with("return Err(")
-                    {
-                        let after_return = &cur["return ".len()..];
-                        let trimmed_expr = after_return.trim();
+                    // 检测 return 语句 (Session 122 + Session 123 多行 + Session 124 闭包/async/tab)
+                    // Session 124: 支持 tab (\t) 和 return-at-end-of-line (表达式在下一行)
+                    let is_return_stmt = cur == "return"
+                        || cur == "return;"
+                        || cur.starts_with("return ")
+                        || cur.starts_with("return\t");
 
-                        // 跳过已包装或空表达式
-                        if !trimmed_expr.is_empty()
-                            && !trimmed_expr.starts_with("Ok(")
-                            && !trimmed_expr.starts_with("Err(")
-                        {
-                            if trimmed_expr.ends_with(';') {
-                                // 单行 return (Session 122)
-                                let expr = trimmed_expr.trim_end_matches(';').trim();
-                                let orig_line = result_lines[j].clone();
-                                let indent_len = orig_line.len() - orig_line.trim_start().len();
-                                let indent = &orig_line[..indent_len];
-                                result_lines[j] = format!("{}return Ok({});", indent, expr);
+                    let already_wrapped = cur.starts_with("return Ok(")
+                        || cur.starts_with("return Err(")
+                        || cur.starts_with("return\tOk(")
+                        || cur.starts_with("return\tErr(");
+
+                    if is_return_stmt && !already_wrapped {
+                        // Session 124: 处理 return; (返回 unit) → return Ok(());
+                        if cur == "return;" {
+                            let orig_line = result_lines[j].clone();
+                            let indent_len = orig_line.len() - orig_line.trim_start().len();
+                            let indent = &orig_line[..indent_len];
+                            result_lines[j] = format!("{}return Ok(());", indent);
+                        } else {
+                            // 获取 return 之后的表达式
+                            let after_return: &str = if cur == "return" {
+                                // return 在行尾, 表达式在下一行 (Session 124)
+                                ""
                             } else {
-                                // 多行 return (Session 123)
-                                // 跟踪表达式内的括号深度, 找到终止 ;
-                                let mut expr_depth = 0i32;
-                                let mut found_semi = false;
+                                // 跳过 "return" (6 chars) + 空白
+                                cur[6..].trim_start()
+                            };
+                            let trimmed_expr = after_return.trim();
 
-                                // 计算首行 return 之后部分的深度
-                                for ch in after_return.chars() {
-                                    match ch {
-                                        '(' | '[' | '{' => expr_depth += 1,
-                                        ')' | ']' | '}' => expr_depth -= 1,
-                                        ';' if expr_depth == 0 => found_semi = true,
-                                        _ => {}
+                            // 跳过已包装或空表达式
+                            // Session 124: cur == "return" 时 trimmed_expr 为空, 但表达式在下一行
+                            if (!trimmed_expr.is_empty() || cur == "return")
+                                && !trimmed_expr.starts_with("Ok(")
+                                && !trimmed_expr.starts_with("Err(")
+                            {
+                                if trimmed_expr.ends_with(';') {
+                                    // 单行 return (Session 122)
+                                    let expr = trimmed_expr.trim_end_matches(';').trim();
+                                    let orig_line = result_lines[j].clone();
+                                    let indent_len = orig_line.len() - orig_line.trim_start().len();
+                                    let indent = &orig_line[..indent_len];
+                                    result_lines[j] = format!("{}return Ok({});", indent, expr);
+                                } else {
+                                    // 多行 return (Session 123 + Session 124)
+                                    // 跟踪表达式内的括号深度, 找到终止 ;
+                                    // 支持: 闭包 (||x| ...), async 块 (async { ... }),
+                                    //       unsafe 块 (unsafe { ... }), move 闭包 (move || ...)
+                                    let mut expr_depth = 0i32;
+                                    let mut found_semi = false;
+
+                                    // 计算首行 return 之后部分的深度
+                                    for ch in after_return.chars() {
+                                        match ch {
+                                            '(' | '[' | '{' => expr_depth += 1,
+                                            ')' | ']' | '}' => expr_depth -= 1,
+                                            ';' if expr_depth == 0 => found_semi = true,
+                                            _ => {}
+                                        }
                                     }
-                                }
 
-                                if !found_semi && expr_depth > 0 {
-                                    // 扫描后续行找到终止 ;
-                                    let mut end_line = j + 1;
-                                    while end_line < stripped_lines.len() {
-                                        for ch in stripped_lines[end_line].chars() {
-                                            match ch {
-                                                '(' | '[' | '{' => expr_depth += 1,
-                                                ')' | ']' | '}' => expr_depth -= 1,
-                                                ';' if expr_depth == 0 => found_semi = true,
-                                                _ => {}
+                                    // Session 124: return 在行尾时, expr_depth == 0 且 !found_semi
+                                    // 此时表达式在下一行, 需要扫描后续行
+                                    if !found_semi
+                                        && (expr_depth > 0 || (cur == "return" && expr_depth == 0))
+                                    {
+                                        // 扫描后续行找到终止 ;
+                                        let mut end_line = j + 1;
+                                        while end_line < stripped_lines.len() {
+                                            for ch in stripped_lines[end_line].chars() {
+                                                match ch {
+                                                    '(' | '[' | '{' => expr_depth += 1,
+                                                    ')' | ']' | '}' => expr_depth -= 1,
+                                                    ';' if expr_depth == 0 => found_semi = true,
+                                                    _ => {}
+                                                }
                                             }
+                                            if found_semi && expr_depth == 0 {
+                                                break;
+                                            }
+                                            end_line += 1;
                                         }
-                                        if found_semi && expr_depth == 0 {
-                                            break;
-                                        }
-                                        end_line += 1;
-                                    }
 
-                                    if found_semi && end_line < stripped_lines.len() {
-                                        // 包装多行表达式: return expr → return Ok(expr
-                                        let orig_line = result_lines[j].clone();
-                                        let indent_len =
-                                            orig_line.len() - orig_line.trim_start().len();
-                                        let indent = &orig_line[..indent_len];
+                                        if found_semi && end_line < stripped_lines.len() {
+                                            // 包装多行表达式: return expr → return Ok(expr
+                                            let orig_line = result_lines[j].clone();
+                                            let indent_len =
+                                                orig_line.len() - orig_line.trim_start().len();
+                                            let indent = &orig_line[..indent_len];
 
-                                        // 修改首行: "    return expr..." → "    return Ok(expr..."
-                                        result_lines[j] = format!(
-                                            "{}return Ok({}",
-                                            indent,
-                                            after_return.trim_start()
-                                        );
+                                            if cur == "return" {
+                                                // Session 124: return 在行尾, 表达式在下一行
+                                                // 首行改为 "return Ok(" (不含表达式)
+                                                result_lines[j] = format!("{}return Ok(", indent);
+                                                // 末行在 ; 前插入 )
+                                                let last_line = result_lines[end_line].clone();
+                                                let last_trimmed = last_line.trim();
+                                                if let Some(semi_pos) = last_trimmed.rfind(';') {
+                                                    let before_semi = &last_trimmed[..semi_pos];
+                                                    let last_indent_len = last_line.len()
+                                                        - last_line.trim_start().len();
+                                                    let last_indent = &last_line[..last_indent_len];
+                                                    result_lines[end_line] =
+                                                        format!("{}{});", last_indent, before_semi);
+                                                }
+                                            } else {
+                                                // 正常多行 return (Session 123)
+                                                // 修改首行: "    return expr..." → "    return Ok(expr..."
+                                                result_lines[j] = format!(
+                                                    "{}return Ok({}",
+                                                    indent,
+                                                    after_return.trim_start()
+                                                );
 
-                                        // 修改末行: "...);" → "...);"
-                                        // 在最后一个 ; 前插入 )
-                                        let last_line = result_lines[end_line].clone();
-                                        let last_trimmed = last_line.trim();
-                                        if let Some(semi_pos) = last_trimmed.rfind(';') {
-                                            let before_semi = &last_trimmed[..semi_pos];
-                                            let last_indent_len =
-                                                last_line.len() - last_line.trim_start().len();
-                                            let last_indent = &last_line[..last_indent_len];
-                                            result_lines[end_line] =
-                                                format!("{}{});", last_indent, before_semi);
+                                                // 修改末行: "...);" → "...);"
+                                                // 在最后一个 ; 前插入 )
+                                                let last_line = result_lines[end_line].clone();
+                                                let last_trimmed = last_line.trim();
+                                                if let Some(semi_pos) = last_trimmed.rfind(';') {
+                                                    let before_semi = &last_trimmed[..semi_pos];
+                                                    let last_indent_len = last_line.len()
+                                                        - last_line.trim_start().len();
+                                                    let last_indent = &last_line[..last_indent_len];
+                                                    result_lines[end_line] =
+                                                        format!("{}{});", last_indent, before_semi);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -4094,6 +4142,528 @@ pub fn ensure_anyhow_imports_extended(content: &str) -> String {
         for &idx in anyhow_line_indices[1..].iter().rev() {
             result_lines.remove(idx);
         }
+    }
+
+    result_lines.join("\n")
+}
+
+// ============================================================================
+//  Session 124: Hirschberg 线性空间 diff + 统一 diff 格式 + std 导入检查
+// ============================================================================
+
+/// Hirschberg 算法辅助函数 — 正向 LCS 长度计算 (O(M) 空间)
+///
+/// 返回 `Vec<usize>`，其中 `result[j]` = LCS(a, b[:j])
+fn hirschberg_forward_lcs(a: &[&str], b: &[&str]) -> Vec<usize> {
+    let m = b.len();
+    let mut prev = vec![0usize; m + 1];
+    let mut curr = vec![0usize; m + 1];
+
+    for &ai in a {
+        curr[0] = 0;
+        for j in 0..m {
+            if ai == b[j] {
+                curr[j + 1] = prev[j] + 1;
+            } else {
+                curr[j + 1] = prev[j + 1].max(curr[j]);
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev
+}
+
+/// Hirschberg 算法辅助函数 — 反向 LCS 长度计算 (O(M) 空间)
+///
+/// 返回 `Vec<usize>`，其中 `result[j]` = LCS(a, b[j:])
+fn hirschberg_backward_lcs(a: &[&str], b: &[&str]) -> Vec<usize> {
+    let m = b.len();
+    let mut next = vec![0usize; m + 1];
+    let mut curr = vec![0usize; m + 1];
+
+    for &ai in a.iter().rev() {
+        curr[m] = 0;
+        for j in (0..m).rev() {
+            if ai == b[j] {
+                curr[j] = next[j + 1] + 1;
+            } else {
+                curr[j] = next[j].max(curr[j + 1]);
+            }
+        }
+        std::mem::swap(&mut next, &mut curr);
+    }
+    next
+}
+
+/// Hirschberg 分治递归 — 返回 LCS 匹配对的列表 `(a_index, b_index)`
+fn hirschberg_lcs_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    let n = a.len();
+    let m = b.len();
+
+    if n == 0 || m == 0 {
+        return Vec::new();
+    }
+
+    if n == 1 {
+        // 基本情况: 在 b 中找到第一个匹配 a[0] 的行
+        for (j, item) in b.iter().enumerate() {
+            if a[0] == *item {
+                return vec![(0, j)];
+            }
+        }
+        return Vec::new();
+    }
+
+    if m == 1 {
+        // 基本情况: 在 a 中找到第一个匹配 b[0] 的行
+        for (i, item) in a.iter().enumerate() {
+            if *item == b[0] {
+                return vec![(i, 0)];
+            }
+        }
+        return Vec::new();
+    }
+
+    // 分治: 将 a 分成两半
+    let mid = n / 2;
+
+    // 正向: LCS(a[:mid], b[:j]) for all j
+    let forward = hirschberg_forward_lcs(&a[..mid], b);
+
+    // 反向: LCS(a[mid:], b[j:]) for all j
+    let backward = hirschberg_backward_lcs(&a[mid..], b);
+
+    // 找到最优分割点 k, 最大化 forward[k] + backward[k]
+    let mut max_sum = 0usize;
+    let mut split_k = 0usize;
+    for k in 0..=m {
+        let sum = forward[k] + backward[k];
+        if sum > max_sum {
+            max_sum = sum;
+            split_k = k;
+        }
+    }
+
+    // 递归求解左右两半
+    let left = hirschberg_lcs_pairs(&a[..mid], &b[..split_k]);
+    let right = hirschberg_lcs_pairs(&a[mid..], &b[split_k..]);
+
+    // 合并: 右半部分的索引需要加上偏移量
+    let mut result = left;
+    for (ai, bi) in right {
+        result.push((ai + mid, bi + split_k));
+    }
+    result
+}
+
+/// 使用 Hirschberg 线性空间算法计算行级别差异 (Session 124)
+///
+/// Hirschberg 算法是 LCS 的线性空间变体, 空间复杂度 O(N+M),
+/// 而标准 LCS DP 需要 O(N×M) 空间。时间复杂度仍为 O(N×M)。
+///
+/// 适用于大文件 diff, 避免 LCS 的 O(N×M) 内存消耗。
+///
+/// # 算法
+///
+/// 1. 分治: 将输入分成两半
+/// 2. 正向计算左半 LCS 长度 (O(M) 空间)
+/// 3. 反向计算右半 LCS 长度 (O(M) 空间)
+/// 4. 找到最优分割点, 递归求解
+/// 5. 从 LCS 匹配对生成 `LineDiff` (Added/Removed)
+///
+/// # 与其他算法的对比
+///
+/// | 算法 | 时间 | 空间 | 适用场景 |
+/// |------|------|------|---------|
+/// | Basic | O(N) | O(1) | 小输入, 行号对齐 |
+/// | LCS | O(N×M) | O(N×M) | 中等输入 |
+/// | Myers | O(ND) | O(D²) | 稀疏差异 |
+/// | Hirschberg | O(N×M) | O(N+M) | 大输入, 内存受限 |
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compute_line_diff_hirschberg, LineDiffType};
+///
+/// // 无差异
+/// let diffs = compute_line_diff_hirschberg("fn foo() {}", "fn foo() {}");
+/// assert!(diffs.is_empty());
+///
+/// // 插入一行
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diffs = compute_line_diff_hirschberg(original, fixed);
+/// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Added));
+/// ```
+pub fn compute_line_diff_hirschberg(original: &str, fixed: &str) -> Vec<LineDiff> {
+    let a: Vec<&str> = original.lines().collect();
+    let b: Vec<&str> = fixed.lines().collect();
+
+    if a.is_empty() && b.is_empty() {
+        return Vec::new();
+    }
+    if a.is_empty() {
+        return b
+            .iter()
+            .enumerate()
+            .map(|(i, line)| LineDiff {
+                line_number: i + 1,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some(line.to_string()),
+            })
+            .collect();
+    }
+    if b.is_empty() {
+        return a
+            .iter()
+            .enumerate()
+            .map(|(i, line)| LineDiff {
+                line_number: i + 1,
+                diff_type: LineDiffType::Removed,
+                original_line: Some(line.to_string()),
+                fixed_line: None,
+            })
+            .collect();
+    }
+
+    // 使用 Hirschberg 算法计算 LCS 匹配对
+    let lcs_pairs = hirschberg_lcs_pairs(&a, &b);
+
+    // 从 LCS 匹配对生成 diff
+    let mut diffs = Vec::new();
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+
+    for &(match_a, match_b) in &lcs_pairs {
+        // 原始中匹配前的行 → Removed
+        while ai < match_a {
+            diffs.push(LineDiff {
+                line_number: ai + 1,
+                diff_type: LineDiffType::Removed,
+                original_line: Some(a[ai].to_string()),
+                fixed_line: None,
+            });
+            ai += 1;
+        }
+        // 修复中匹配前的行 → Added
+        while bi < match_b {
+            diffs.push(LineDiff {
+                line_number: bi + 1,
+                diff_type: LineDiffType::Added,
+                original_line: None,
+                fixed_line: Some(b[bi].to_string()),
+            });
+            bi += 1;
+        }
+        // 匹配行 — 跳过 (不变)
+        ai = match_a + 1;
+        bi = match_b + 1;
+    }
+
+    // 最后一个匹配之后的剩余行
+    while ai < a.len() {
+        diffs.push(LineDiff {
+            line_number: ai + 1,
+            diff_type: LineDiffType::Removed,
+            original_line: Some(a[ai].to_string()),
+            fixed_line: None,
+        });
+        ai += 1;
+    }
+    while bi < b.len() {
+        diffs.push(LineDiff {
+            line_number: bi + 1,
+            diff_type: LineDiffType::Added,
+            original_line: None,
+            fixed_line: Some(b[bi].to_string()),
+        });
+        bi += 1;
+    }
+
+    diffs
+}
+
+/// 统一 diff 格式输出 — 类似 `git diff` 的格式 (Session 124)
+///
+/// 将两段文本的差异格式化为统一 diff 格式 (unified diff),
+/// 包含 `---`/`+++` 文件头和 `@@ -start,count +start,count @@` hunk 头,
+/// 每行前缀 ` `(空格=不变)、`+`(新增)、`-`(删除)。
+///
+/// # 参数
+///
+/// - `original`: 原始文本
+/// - `fixed`: 修改后文本
+///
+/// # 返回值
+///
+/// 统一 diff 格式的字符串。如果两段文本相同, 返回空字符串。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::format_diff_unified;
+///
+/// // 无差异 → 空字符串
+/// assert_eq!(format_diff_unified("fn foo() {}", "fn foo() {}"), "");
+///
+/// // 有差异 → 统一 diff 格式
+/// let diff = format_diff_unified("fn foo() {\n}\n", "fn foo() {\n    let x = 42;\n}\n");
+/// assert!(diff.contains("--- original"), "应包含 --- original 头");
+/// assert!(diff.contains("+++ fixed"), "应包含 +++ fixed 头");
+/// assert!(diff.contains("@@"), "应包含 @@ hunk 头");
+/// assert!(diff.contains("+    let x = 42;"), "应包含新增行");
+/// ```
+pub fn format_diff_unified(original: &str, fixed: &str) -> String {
+    if original == fixed {
+        return String::new();
+    }
+
+    let orig_lines: Vec<&str> = original.lines().collect();
+    let fixed_lines: Vec<&str> = fixed.lines().collect();
+
+    // 使用 Hirschberg 算法计算 LCS 对齐 (O(N+M) 空间)
+    let lcs_pairs = hirschberg_lcs_pairs(&orig_lines, &fixed_lines);
+
+    // 构建差异条目列表: (prefix, orig_line_no, fixed_line_no, content)
+    // prefix: ' ' = 不变, '+' = 新增, '-' = 删除
+    #[allow(clippy::type_complexity)]
+    let mut entries: Vec<(char, Option<usize>, Option<usize>, &str)> = Vec::new();
+    let mut ai = 0usize;
+    let mut bi = 0usize;
+
+    for &(match_a, match_b) in &lcs_pairs {
+        while ai < match_a {
+            entries.push(('-', Some(ai + 1), None, orig_lines[ai]));
+            ai += 1;
+        }
+        while bi < match_b {
+            entries.push(('+', None, Some(bi + 1), fixed_lines[bi]));
+            bi += 1;
+        }
+        entries.push((' ', Some(ai + 1), Some(bi + 1), orig_lines[ai]));
+        ai = match_a + 1;
+        bi = match_b + 1;
+    }
+    while ai < orig_lines.len() {
+        entries.push(('-', Some(ai + 1), None, orig_lines[ai]));
+        ai += 1;
+    }
+    while bi < fixed_lines.len() {
+        entries.push(('+', None, Some(bi + 1), fixed_lines[bi]));
+        bi += 1;
+    }
+
+    let context = 3usize;
+
+    // 找到所有变更区域, 合并相近的变更 (距离 <= 2*context 的归入同一 hunk)
+    let mut hunks: Vec<(usize, usize)> = Vec::new(); // (start, end) in entries
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].0 == ' ' {
+            i += 1;
+            continue;
+        }
+
+        // 找到变更区域的起始 (包含 context 行)
+        let hunk_start = i.saturating_sub(context);
+        let mut last_change = i;
+        let mut j = i + 1;
+        while j < entries.len() {
+            if entries[j].0 != ' ' {
+                last_change = j;
+                j += 1;
+            } else {
+                // 检查前方是否有变更 (在 2*context 范围内)
+                let look_ahead = std::cmp::min(j + 2 * context, entries.len());
+                let has_more = entries[j..look_ahead].iter().any(|e| e.0 != ' ');
+                if has_more {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let hunk_end = std::cmp::min(last_change + context + 1, entries.len());
+        hunks.push((hunk_start, hunk_end));
+        i = hunk_end;
+    }
+
+    let mut result = String::new();
+    result.push_str("--- original\n");
+    result.push_str("+++ fixed\n");
+
+    for &(start, end) in &hunks {
+        let hunk_entries = &entries[start..end];
+
+        // 统计 hunk 中原始和修复的行数
+        let orig_count = hunk_entries.iter().filter(|e| e.1.is_some()).count();
+        let fixed_count = hunk_entries.iter().filter(|e| e.2.is_some()).count();
+
+        // 获取起始行号
+        let orig_start = hunk_entries.iter().find_map(|e| e.1).unwrap_or(0);
+        let fixed_start = hunk_entries.iter().find_map(|e| e.2).unwrap_or(0);
+
+        // 格式化 hunk 头
+        result.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            orig_start, orig_count, fixed_start, fixed_count
+        ));
+
+        // 格式化条目
+        for &(prefix, _, _, content) in hunk_entries {
+            result.push(prefix);
+            result.push_str(content);
+            result.push('\n');
+        }
+    }
+
+    result
+}
+
+/// 检测并添加缺失的 `std` 导入 (Session 124)
+///
+/// 类似 `ensure_anyhow_imports`, 但针对 Rust 标准库常用类型:
+///
+/// - `HashMap` / `HashSet` → `use std::collections::{HashMap, HashSet};`
+/// - `BTreeMap` / `BTreeSet` → `use std::collections::{BTreeMap, BTreeSet};`
+/// - `Path` / `PathBuf` → `use std::path::{Path, PathBuf};`
+/// - `File` → `use std::fs::File;`
+/// - `Read` / `Write` / `BufRead` → `use std::io::{Read, Write, BufRead};`
+///
+/// # 规则
+///
+/// 1. 检测代码中使用了哪些 std 类型
+/// 2. 检查已有的导入 (包括合并导入和全限定路径如 `std::collections::HashMap`)
+/// 3. 缺失的导入自动添加, 已有的不重复
+/// 4. 同一模块的多个类型合并为 `use std::module::{Type1, Type2};`
+/// 5. 幂等: 已有导入不重复添加
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::ensure_std_imports;
+///
+/// // 使用 HashMap 但未导入
+/// let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+/// let result = ensure_std_imports(code);
+/// assert!(result.contains("use std::collections::HashMap;"), "应添加 HashMap 导入: {}", result);
+///
+/// // 已有导入不重复 (幂等)
+/// let second = ensure_std_imports(&result);
+/// assert_eq!(result, second, "二次调用不变化");
+///
+/// // 使用全限定路径不需要导入
+/// let code = "fn foo() -> std::collections::HashMap<String, i32> { std::collections::HashMap::new() }";
+/// let result = ensure_std_imports(code);
+/// assert!(!result.contains("use std::collections"), "全限定路径不需要导入");
+/// ```
+pub fn ensure_std_imports(content: &str) -> String {
+    // 定义需要检测的类型: (类型名, 模块路径, 导入前缀)
+    // 格式: (type_name, module_path)
+    let type_modules: &[(&str, &str)] = &[
+        // collections
+        ("HashMap", "std::collections"),
+        ("HashSet", "std::collections"),
+        ("BTreeMap", "std::collections"),
+        ("BTreeSet", "std::collections"),
+        ("VecDeque", "std::collections"),
+        ("LinkedList", "std::collections"),
+        ("BinaryHeap", "std::collections"),
+        // path
+        ("Path", "std::path"),
+        ("PathBuf", "std::path"),
+        // fs
+        ("File", "std::fs"),
+        // io
+        ("BufReader", "std::io"),
+        ("BufWriter", "std::io"),
+        ("Read", "std::io"),
+        ("Write", "std::io"),
+        ("BufRead", "std::io"),
+        ("Stdin", "std::io"),
+        ("Stdout", "std::io"),
+        ("Stderr", "std::io"),
+    ];
+
+    // 收集需要的导入: module_path -> Vec<type_name>
+    let mut needed: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+
+    for &(type_name, module_path) in type_modules {
+        // 检测使用: 出现类型名作为标识符 (不是全限定路径的一部分)
+        // 简单策略: 检测 type_name 出现, 但排除 "module_path::type_name" 的全限定用法
+        let full_path = format!("{}::{}", module_path, type_name);
+        let bare_usage = content.contains(type_name) && !content.contains(&full_path);
+
+        if bare_usage {
+            // 检查是否已有导入
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                // 检查 use module_path::type_name;
+                trimmed.starts_with(&format!("use {}::{}", module_path, type_name))
+                // 检查 use module_path::{..., type_name, ...};
+                || (trimmed.contains(&format!("use {}::{{", module_path))
+                    && trimmed.contains(type_name))
+                // 检查 use module_path::*;
+                || trimmed.starts_with(&format!("use {}::*;", module_path))
+                // 检查 use std::collections::*; 等 (对 std::collections::HashMap 等)
+                || trimmed.starts_with("use std::*;")
+            });
+
+            if !already_imported {
+                needed.entry(module_path).or_default().push(type_name);
+            }
+        }
+    }
+
+    if needed.is_empty() {
+        return content.to_string();
+    }
+
+    // 构建导入行
+    let import_lines: Vec<String> = needed
+        .iter()
+        .map(|(&module, types)| {
+            if types.len() == 1 {
+                format!("use {}::{};", module, types[0])
+            } else {
+                format!("use {}::{{{}}};", module, types.join(", "))
+            }
+        })
+        .collect();
+
+    // 找到插入位置: 第一个非注释、非属性、非空白行之前
+    let lines: Vec<&str> = content.lines().collect();
+    let mut insert_pos = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*")
+            || trimmed.starts_with("#![")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("///")
+        {
+            continue;
+        }
+        insert_pos = i;
+        break;
+    }
+
+    if insert_pos == 0 && !lines.is_empty() {
+        let all_comments = lines
+            .iter()
+            .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+        if all_comments {
+            insert_pos = lines.len();
+        }
+    }
+
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    for (offset, import_line) in import_lines.iter().enumerate() {
+        result_lines.insert(insert_pos + offset, import_line.clone());
     }
 
     result_lines.join("\n")
@@ -8611,6 +9181,546 @@ fn foo(
             !result.contains("Context"),
             "不需要 Context 时不应添加: {}",
             result
+        );
+    }
+
+    // ===== Session 124: compute_line_diff_hirschberg 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_no_diff() {
+        let diffs = compute_line_diff_hirschberg("fn foo() {}", "fn foo() {}");
+        assert!(diffs.is_empty(), "无差异应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_insertion() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diffs = compute_line_diff_hirschberg(original, fixed);
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(added, 1, "应有 1 个 Added");
+        assert!(
+            !diffs.iter().any(|d| d.diff_type == LineDiffType::Removed),
+            "不应有 Removed"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_deletion() {
+        let original = "fn foo() {\n    let x = 42;\n}\n";
+        let fixed = "fn foo() {\n}\n";
+        let diffs = compute_line_diff_hirschberg(original, fixed);
+        let removed = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        assert_eq!(removed, 1, "应有 1 个 Removed");
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_both_empty() {
+        let diffs = compute_line_diff_hirschberg("", "");
+        assert!(diffs.is_empty(), "双空应返回空");
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_empty_original() {
+        let diffs = compute_line_diff_hirschberg("", "a\nb\nc");
+        assert_eq!(diffs.len(), 3, "空 original 应全部 Added");
+        assert!(diffs.iter().all(|d| d.diff_type == LineDiffType::Added));
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_empty_fixed() {
+        let diffs = compute_line_diff_hirschberg("a\nb\nc", "");
+        assert_eq!(diffs.len(), 3, "空 fixed 应全部 Removed");
+        assert!(diffs.iter().all(|d| d.diff_type == LineDiffType::Removed));
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_multiple_changes() {
+        let original = "a\nb\nc\nd\ne";
+        let fixed = "a\nx\nc\ny\ne";
+        let diffs = compute_line_diff_hirschberg(original, fixed);
+        assert!(!diffs.is_empty(), "应有差异");
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        let removed = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        assert!(added + removed > 0, "应有 Added 或 Removed");
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_no_modified() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let diffs = compute_line_diff_hirschberg(original, fixed);
+        let modified = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Modified)
+            .count();
+        assert_eq!(modified, 0, "Hirschberg 不应产生 Modified");
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_vs_lcs_same_result() {
+        let original = "fn foo() {\n}\nfn bar() {}";
+        let fixed = "fn foo() {\n    let x = 42;\n}\nfn bar() {}";
+
+        let lcs_diffs = compute_line_diff_lcs(original, fixed);
+        let hirschberg_diffs = compute_line_diff_hirschberg(original, fixed);
+
+        let lcs_added = lcs_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        let hirschberg_added = hirschberg_diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(
+            lcs_added, hirschberg_added,
+            "LCS 和 Hirschberg 应有相同 Added 计数"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_large_input() {
+        let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        fixed.push_str("line 100\n");
+        let diffs = compute_line_diff_hirschberg(&original, &fixed);
+        assert!(
+            diffs.iter().any(|d| d.diff_type == LineDiffType::Added),
+            "大输入应检测到新增行"
+        );
+    }
+
+    #[test]
+    fn test_compute_line_diff_hirschberg_middle_insertion() {
+        let original = "a\nb\nc\nd\ne";
+        let fixed = "a\nb\nX\nc\nd\ne";
+        let diffs = compute_line_diff_hirschberg(original, fixed);
+        let added = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        assert_eq!(added, 1, "中间插入应有 1 个 Added");
+        let added_content = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .map(|d| d.fixed_line.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert!(added_content.contains(&"X"), "应包含插入的行 X");
+    }
+
+    // ===== Session 124: format_diff_unified 测试 =====
+
+    #[test]
+    fn test_format_diff_unified_no_diff() {
+        assert_eq!(
+            format_diff_unified("fn foo() {}", "fn foo() {}"),
+            "",
+            "无差异应返回空字符串"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_contains_headers() {
+        let diff = format_diff_unified("fn foo() {\n}\n", "fn foo() {\n    let x = 42;\n}\n");
+        assert!(
+            diff.contains("--- original"),
+            "应包含 --- original: {}",
+            diff
+        );
+        assert!(diff.contains("+++ fixed"), "应包含 +++ fixed: {}", diff);
+        assert!(diff.contains("@@"), "应包含 @@ hunk 头: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_contains_added_line() {
+        let diff = format_diff_unified("fn foo() {\n}\n", "fn foo() {\n    let x = 42;\n}\n");
+        assert!(diff.contains("+    let x = 42;"), "应包含新增行: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_contains_removed_line() {
+        let diff = format_diff_unified("fn foo() {\n    let x = 42;\n}\n", "fn foo() {\n}\n");
+        assert!(diff.contains("-    let x = 42;"), "应包含删除行: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_contains_context_lines() {
+        let original = "line1\nline2\nline3\nline4\nline5";
+        let fixed = "line1\nline2\nCHANGED\nline4\nline5";
+        let diff = format_diff_unified(original, fixed);
+        // 应包含上下文行 (以空格开头)
+        assert!(diff.contains(" line1"), "应包含上下文行 line1: {}", diff);
+        assert!(diff.contains(" line5"), "应包含上下文行 line5: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_hunk_header_format() {
+        let diff = format_diff_unified("a\nb\nc", "a\nB\nc");
+        // 应包含 @@ -start,count +start,count @@ 格式
+        assert!(
+            diff.contains("@@ -") && diff.contains(" +"),
+            "hunk 头格式应正确: {}",
+            diff
+        );
+        assert!(diff.contains("@@"), "应有 @@ 标记: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_empty_original() {
+        let diff = format_diff_unified("", "a\nb\nc");
+        assert!(!diff.is_empty(), "空 original 应有 diff");
+        assert!(diff.contains("+a"), "应包含 +a: {}", diff);
+        assert!(diff.contains("+b"), "应包含 +b: {}", diff);
+        assert!(diff.contains("+c"), "应包含 +c: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_empty_fixed() {
+        let diff = format_diff_unified("a\nb\nc", "");
+        assert!(!diff.is_empty(), "空 fixed 应有 diff");
+        assert!(diff.contains("-a"), "应包含 -a: {}", diff);
+        assert!(diff.contains("-b"), "应包含 -b: {}", diff);
+        assert!(diff.contains("-c"), "应包含 -c: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_multiple_hunks() {
+        // 两个相距很远的变更 → 两个 hunk
+        let original: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        // 修改第 2 行和第 18 行 (相距 > 2*context=6)
+        fixed = fixed.replace("line 1\n", "line CHANGED1\n");
+        fixed = fixed.replace("line 17\n", "line CHANGED2\n");
+        let diff = format_diff_unified(&original, &fixed);
+        let hunk_count = diff.matches("@@").count() / 2; // 每个 hunk 有 2 个 @@
+        assert!(
+            hunk_count >= 2,
+            "应有至少 2 个 hunk, 实际 {}: {}",
+            hunk_count,
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_single_line_change() {
+        let diff = format_diff_unified("let x = 1;", "let x = 2;");
+        assert!(!diff.is_empty(), "单行修改应有 diff");
+        assert!(diff.contains("-let x = 1;"), "应包含旧行: {}", diff);
+        assert!(diff.contains("+let x = 2;"), "应包含新行: {}", diff);
+    }
+
+    // ===== Session 124: ensure_std_imports 测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_hashmap() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::collections::HashMap;"),
+            "应添加 HashMap 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_hashset() {
+        let code = "fn foo() -> HashSet<String> { HashSet::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::collections::HashSet;"),
+            "应添加 HashSet 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_multiple_collections() {
+        let code = "fn foo() -> HashMap<String, HashSet<i32>> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::collections::{HashMap, HashSet};"),
+            "应合并 collections 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_path_pathbuf() {
+        let code = "fn foo(p: &Path) -> PathBuf { p.to_path_buf() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::path::{Path, PathBuf};"),
+            "应合并 path 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_file() {
+        let code = "fn foo() -> File { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::fs::File;"),
+            "应添加 File 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_io_types() {
+        let code = "fn foo(r: &mut dyn Read, w: &mut dyn Write) -> std::io::Result<()> { Ok(()) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::io::{Read, Write};"),
+            "应合并 io 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_already_imported() {
+        let code =
+            "use std::collections::HashMap;\nfn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        let count = result.matches("use std::collections::HashMap;").count();
+        assert_eq!(count, 1, "已有导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_std_imports_already_merged() {
+        let code = "use std::collections::{HashMap, HashSet};\nfn foo() -> HashMap<String, HashSet<i32>> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        let count = result.matches("use std::collections::").count();
+        assert_eq!(count, 1, "已有合并导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_std_imports_full_path_no_import() {
+        let code = "fn foo() -> std::collections::HashMap<String, i32> { std::collections::HashMap::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::collections"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_idempotent() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "二次调用不变化 (幂等)");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_no_need() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = ensure_std_imports(code);
+        assert_eq!(result, code, "不需要 std 导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_wildcard() {
+        let code = "use std::collections::*;\nfn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        assert_eq!(result, code, "通配导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_btreemap() {
+        let code = "fn foo() -> BTreeMap<String, i32> { BTreeMap::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::collections::BTreeMap;"),
+            "应添加 BTreeMap 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_insert_position() {
+        let code = "//! Module docs\nfn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        let import_pos = result.find("use std::").unwrap();
+        let fn_pos = result.find("fn foo()").unwrap();
+        assert!(
+            import_pos < fn_pos,
+            "导入应在函数之前: {} < {}",
+            import_pos,
+            fn_pos
+        );
+    }
+
+    // ===== Session 124: wrap_return_statements_in_ok 闭包/async/tab 测试 =====
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_closure_single_line() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return |x| x + 1;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(|x| x + 1);"),
+            "应包装闭包: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_closure_no_args() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return || 42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(|| 42);"),
+            "应包装无参闭包: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_move_closure() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return move || 42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(move || 42);"),
+            "应包装 move 闭包: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_async_block() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return async { 42 };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(async { 42 });"),
+            "应包装 async 块: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_async_move_block() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return async move { 42 };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(async move { 42 });"),
+            "应包装 async move 块: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_unsafe_block() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return unsafe { 42 };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(unsafe { 42 });"),
+            "应包装 unsafe 块: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_closure() {
+        let code =
+            "fn foo() -> Result<i32, anyhow::Error> {\n    return |x| {\n        x + 1\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(|x| {"),
+            "应包装多行闭包: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_multiline_async_block() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return async {\n        let x = 42;\n        x + 1\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(async {"),
+            "应包装多行 async 块: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_return_semicolon() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    return;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(());"),
+            "应将 return; 包装为 return Ok(());: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_return_at_end_of_line() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return\n        42;\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok("),
+            "应处理 return 在行尾的情况: {}",
+            result
+        );
+        assert!(result.contains("42);"), "应在末行添加闭合: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_closure_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return |x| x + 1;\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "闭包包装应幂等");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_async_idempotent() {
+        let code = "fn foo() -> Result<i32, anyhow::Error> {\n    return async { 42 };\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "async 包装应幂等");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_return_semicolon_idempotent() {
+        let code = "fn foo() -> Result<(), anyhow::Error> {\n    return;\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "return; 包装应幂等");
+    }
+
+    // ===== Session 124: verify_idempotent_detailed 使用统一 diff 接口测试 =====
+
+    #[test]
+    fn test_verify_idempotent_detailed_unified_diff_clean() {
+        let result = verify_idempotent_detailed("fn foo() -> i32 { 42 }");
+        assert!(result.is_idempotent);
+        assert!(result.first_pass_diff.is_empty(), "无问题代码不应有 diff");
+    }
+
+    #[test]
+    fn test_verify_idempotent_detailed_unified_diff_with_fix() {
+        let result = verify_idempotent_detailed("fn foo() { let x = bar().unwrap(); }");
+        assert!(!result.first_pass_diff.is_empty(), "有问题的代码应有 diff");
+        assert!(
+            result.second_pass_diff.is_empty(),
+            "幂等修复第二次不应有 diff"
         );
     }
 }

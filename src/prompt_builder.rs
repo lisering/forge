@@ -105,7 +105,10 @@ impl SystemPrompt {
             "❌ 禁止: 使用 anyhow!() 宏或 .context() 但未导入 use anyhow::{anyhow, Context}; (Session 123)\n",
         );
         prompt.push_str(
-            "❌ 禁止: 使用 quote! 宏时括号不配对 — #(#field),* 等重复语法需确保 () {} [] 配对 (Session 123)\n\n",
+            "❌ 禁止: 使用 quote! 宏时括号不配对 — #(#field),* 等重复语法需确保 () {} [] 配对 (Session 123)\n",
+        );
+        prompt.push_str(
+            "❌ 禁止: 使用 HashMap/HashSet/BTreeMap 等标准库类型但未导入 use std::collections::... (Session 124)\n\n",
         );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -403,6 +406,21 @@ mod tests {
         assert!(
             prompt.contains("Ok(...)"),
             "系统 prompt 应包含 Ok(...) 包装约束 (Session 121)"
+        );
+    }
+
+    // ===== Session 124: std 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_std_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("HashMap"),
+            "系统 prompt 应包含 HashMap 导入约束 (Session 124)"
+        );
+        assert!(
+            prompt.contains("std::collections"),
+            "系统 prompt 应包含 std::collections 导入约束 (Session 124)"
         );
     }
 
