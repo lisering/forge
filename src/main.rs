@@ -278,6 +278,18 @@ enum Commands {
         /// 0 表示禁用 (默认)。建议值 3~5。
         #[arg(long, default_value = "0")]
         memory_context: usize,
+
+        /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
+        ///
+        /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
+        /// 需要在编译时启用 pprof feature:
+        /// `cargo run --features pprof -- run "goal" --profile`
+        #[arg(long)]
+        profile: bool,
+
+        /// 火焰图输出路径 (默认: ./forge_profile.svg)
+        #[arg(long, default_value = "./forge_profile.svg")]
+        profile_output: PathBuf,
     },
 }
 
@@ -291,6 +303,62 @@ async fn main() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+
+    // === pprof 火焰图分析 (需 --features pprof 编译) ===
+    #[cfg(feature = "pprof")]
+    let _profiler_guard = {
+        let enable_profile = matches!(&cli.command, Commands::Run { profile: true, .. });
+        if enable_profile {
+            let output_path = match &cli.command {
+                Commands::Run { profile_output, .. } => profile_output.clone(),
+                _ => PathBuf::from("./forge_profile.svg"),
+            };
+            info!("🔥 pprof 火焰图分析已启用, 输出: {}", output_path.display());
+            let guard = pprof::ProfilerGuardBuilder::default()
+                .frequency(1000)
+                .blocklist(&["libc", "libgcc", "pthread", "ld-linux"])
+                .build()
+                .map_err(|e| anyhow::anyhow!("pprof 初始化失败: {}", e))?;
+
+            // 在程序退出时生成火焰图
+            struct ProfileGuard {
+                guard: Option<pprof::ProfilerGuard<'static>>,
+                output: PathBuf,
+            }
+            impl Drop for ProfileGuard {
+                fn drop(&mut self) {
+                    if let Some(guard) = self.guard.take() {
+                        match guard.report().build() {
+                            Ok(report) => {
+                                let file = std::fs::File::create(&self.output)
+                                    .expect("创建火焰图文件失败");
+                                if let Err(e) = report.flamegraph(file) {
+                                    eprintln!("生成火焰图失败: {}", e);
+                                } else {
+                                    eprintln!("✅ 火焰图已生成: {}", self.output.display());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("生成 pprof 报告失败: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // SAFETY: guard 的生命周期被延长到整个 main 函数
+            // 这是 pprof-rs 的标准用法
+            let guard_static: pprof::ProfilerGuard<'static> = unsafe { std::mem::transmute(guard) };
+            Some(ProfileGuard {
+                guard: Some(guard_static),
+                output: output_path,
+            })
+        } else {
+            None
+        }
+    };
+    #[cfg(not(feature = "pprof"))]
+    let _profiler_guard: Option<()> = None;
 
     // === Session 69: 加载配置文件 (~/.forge/config.toml + 环境变量覆盖) ===
     //
@@ -774,6 +842,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             failover_max_failures,
             failover_cooldown,
             memory_context,
+            profile: _,
+            profile_output: _,
         } => {
             let mut manager = BrowserManager::new(port);
             manager.discover_and_connect().await?;

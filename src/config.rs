@@ -263,13 +263,23 @@ impl Default for RecoveryConfig {
 //  配置加载逻辑
 // ============================================================================
 
+/// 配置文件默认路径缓存 — 使用 OnceLock 避免每次调用都读取环境变量
+static DEFAULT_CONFIG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// 配置文件默认路径: `~/.forge/config.toml`
+///
+/// 使用 `OnceLock` 缓存结果, 首次调用后不再重复读取 `HOME` 环境变量。
+/// 环境变量在程序运行期间通常不会变化, 缓存是安全的。
 pub fn default_config_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".forge").join("config.toml")
-    } else {
-        PathBuf::from(".forge").join("config.toml")
-    }
+    DEFAULT_CONFIG_PATH
+        .get_or_init(|| {
+            if let Some(home) = std::env::var_os("HOME") {
+                PathBuf::from(home).join(".forge").join("config.toml")
+            } else {
+                PathBuf::from(".forge").join("config.toml")
+            }
+        })
+        .clone()
 }
 
 /// 从 TOML 文件加载配置

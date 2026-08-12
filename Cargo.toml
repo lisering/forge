@@ -32,6 +32,9 @@ async-trait = "0.1"
 tempfile = "3"
 toml = "0.8"
 
+# 火焰图分析 (optional feature)
+pprof = { version = "0.13", features = ["flamegraph", "protobuf-codec"], optional = true }
+
 # Unix 进程组管理 (Chrome 进程树 kill)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -42,6 +45,11 @@ tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thre
 proptest = "1"
 mockall = "0.12"
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+default = []
+# 启用 pprof 火焰图分析: cargo run --features pprof -- run ... --profile
+pprof = ["dep:pprof"]
 
 [[bench]]
 name = "sparkline_performance"
@@ -165,6 +173,30 @@ harness = false
 
 [[bench]]
 name = "cancellation_token_performance"
+harness = false
+
+[[bench]]
+name = "evaluator_synergy_performance"
+harness = false
+
+[[bench]]
+name = "trace_store_performance"
+harness = false
+
+[[bench]]
+name = "response_handler_performance"
+harness = false
+
+[[bench]]
+name = "proxy_pool_performance"
+harness = false
+
+[[bench]]
+name = "web_tool_performance"
+harness = false
+
+[[bench]]
+name = "workspace_performance"
 harness = false
 
 # ── docs.rs 官方文档配置 ──────────────────────────────────
