@@ -37,6 +37,7 @@ use tracing::{error, info, warn};
 #[derive(Parser)]
 #[command(name = "forge")]
 #[command(about = "自主软件开发 Agent — 给终极目标,自动拆解、开发、测试、修复")]
+#[allow(clippy::large_enum_variant)]
 struct Cli {
     /// Chrome 调试端口
     #[arg(short, long, default_value = "9222")]
@@ -62,6 +63,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// 发现并列出聊天标签页
     List,
@@ -288,6 +290,14 @@ enum Commands {
         /// 需要连接到 Chrome 浏览器。默认禁用。
         #[arg(long)]
         web_tool: bool,
+
+        /// 启用自动修复 — 代码提取后自动修复质量问题 (Session 118)
+        ///
+        /// 启用后, 从 AI 回复提取的 Rust (.rs) 文件会自动调用 apply_fixes,
+        /// 修复 unwrap() → ?, 添加 #[must_use], 文档注释等。
+        /// 默认禁用。
+        #[arg(long)]
+        auto_fix: bool,
 
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
@@ -853,6 +863,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             failover_cooldown,
             memory_context,
             web_tool: enable_web_tool,
+            auto_fix,
             profile: _,
             profile_output: _,
         } => {
@@ -1045,6 +1056,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         trace_backend,
                         memory_context,
                         web_tool,
+                        auto_fix,
                     )
                     .await?;
 
@@ -1077,6 +1089,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         trace_backend,
                         memory_context,
                         web_tool,
+                        auto_fix,
                     )
                     .await?;
 
@@ -1127,6 +1140,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         trace_backend,
                         memory_context,
                         web_tool,
+                        auto_fix,
                     )
                     .await?;
                 } else {
@@ -1156,6 +1170,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         trace_backend,
                         memory_context,
                         web_tool,
+                        auto_fix,
                     )
                     .await?;
                 }
@@ -1272,6 +1287,7 @@ async fn run_with_clarifier<C, Q>(
     trace_backend: StorageBackend,
     memory_context: usize,
     web_tool: Option<Box<dyn WebTool>>,
+    auto_fix: bool,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1298,6 +1314,11 @@ where
     .with_loop_detection(loop_detection)
     .with_slash_commands(slash_commands)
     .with_memory_context(memory_context);
+
+    // Session 118: 自动修复
+    if auto_fix {
+        orch = orch.with_auto_fix(true);
+    }
 
     // Session 113: Web 工具集成
     if let Some(tool) = web_tool {

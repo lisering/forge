@@ -1014,24 +1014,56 @@ fn has_doc_comment(lines: &[&str], line_num: usize) -> bool {
     false
 }
 
-/// 检查返回类型字符串是否是需要 `#[must_use]` 的类型 (Session 117)
+/// 检查返回类型字符串是否是需要 `#[must_use]` 的类型 (Session 117, Session 118 扩展)
 ///
 /// 纯函数: 检测返回类型是否属于不应被忽略的类型。
+///
+/// Session 118 新增类型:
+/// - `Box<[T]>`, `Box<str>` — 堆分配的切片/字符串
+/// - `Rc<T>`, `Arc<T>` — 引用计数智能指针
+/// - `Cow<'a, B>` — 写时复制
+/// - `PathBuf`, `&Path` — 路径类型
+/// - `&[T]` — 切片引用
+/// - `impl Into<>`, `impl AsRef<>` — 转换 trait
+/// - `impl DoubleEndedIterator`, `impl ExactSizeIterator`, `impl FusedIterator` — 迭代器 trait
+/// - `impl Read`, `impl Write`, `impl BufRead` — I/O trait
 fn is_must_use_return_type(return_type: &str) -> bool {
     return_type.starts_with("Result")
         || return_type.starts_with("Option")
         || return_type.starts_with("bool")
+        // impl trait 系列
         || return_type.starts_with("impl Iterator")
         || return_type.starts_with("impl IntoIterator")
         || return_type.starts_with("impl Display")
         || return_type.starts_with("impl Debug")
+        || return_type.starts_with("impl Into<")
+        || return_type.starts_with("impl AsRef<")
+        || return_type.starts_with("impl DoubleEndedIterator")
+        || return_type.starts_with("impl ExactSizeIterator")
+        || return_type.starts_with("impl FusedIterator")
+        || return_type.starts_with("impl Read")
+        || return_type.starts_with("impl Write")
+        || return_type.starts_with("impl BufRead")
+        // 字符串类型
         || return_type.starts_with("&str")
         || return_type.starts_with("String")
+        // 集合类型
         || return_type.starts_with("Vec<")
         || return_type.starts_with("HashMap<")
         || return_type.starts_with("HashSet<")
         || return_type.starts_with("BTreeMap<")
         || return_type.starts_with("BTreeSet<")
+        // 智能指针 (Session 118)
+        || return_type.starts_with("Box<[")
+        || return_type.starts_with("Box<str")
+        || return_type.starts_with("Rc<")
+        || return_type.starts_with("Arc<")
+        || return_type.starts_with("Cow<")
+        // 路径类型 (Session 118)
+        || return_type.starts_with("PathBuf")
+        || return_type.starts_with("&Path")
+        // 切片引用 (Session 118)
+        || return_type.starts_with("&[")
 }
 
 /// 检查函数签名是否返回需要 `#[must_use]` 的类型 (Session 116, Session 117 增强)
@@ -1107,6 +1139,25 @@ fn has_must_use_attribute(lines: &[&str], line_num: usize) -> bool {
         return false;
     }
     false
+}
+
+/// 检查前一非空行是否以指定注释前缀开头 (Session 118)
+///
+/// 用于使前缀修复 (REVIEW/SAFETY) 幂等: 如果上一行已有对应注释,
+/// 则不再重复报告该问题。
+///
+/// # 示例
+///
+/// ```ignore
+/// let lines = vec!["    // REVIEW: 确认 unwrap_or", "    let x = foo().unwrap_or(0);"];
+/// assert!(has_prefix_comment(&lines, 1, "// REVIEW:"));
+/// ```
+fn has_prefix_comment(lines: &[&str], line_num: usize, prefix: &str) -> bool {
+    if line_num == 0 {
+        return false;
+    }
+    let prev = lines[line_num - 1].trim();
+    prev.starts_with(prefix)
 }
 
 /// 验证 Rust 代码质量 — 详细版, 返回结构化问题列表 (Session 115, Session 116 增强)
@@ -1198,8 +1249,10 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                 });
             }
 
-            // Session 117: 检查 .unwrap_or()
-            if contains_pattern_outside_comment(trimmed, ".unwrap_or(") {
+            // Session 117: 检查 .unwrap_or() (Session 118: 跳过已有 REVIEW 注释)
+            if contains_pattern_outside_comment(trimmed, ".unwrap_or(")
+                && !has_prefix_comment(&lines, line_num, "// REVIEW:")
+            {
                 issues.push(QualityIssue {
                     line: line_num + 1,
                     issue_type: IssueType::UnwrapOr,
@@ -1211,8 +1264,10 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                 });
             }
 
-            // Session 117: 检查 .unwrap_or_default()
-            if contains_pattern_outside_comment(trimmed, ".unwrap_or_default()") {
+            // Session 117: 检查 .unwrap_or_default() (Session 118: 跳过已有 REVIEW 注释)
+            if contains_pattern_outside_comment(trimmed, ".unwrap_or_default()")
+                && !has_prefix_comment(&lines, line_num, "// REVIEW:")
+            {
                 issues.push(QualityIssue {
                     line: line_num + 1,
                     issue_type: IssueType::UnwrapOrDefault,
@@ -1269,8 +1324,12 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
             }
 
             // Session 115: 检查 unsafe 块/函数/实现
+            // Session 115/116: 检查 unsafe (Session 118: 跳过已有 SAFETY 注释)
             if let Some(unsafe_kind) = detect_unsafe_keyword(trimmed) {
-                let (issue_type, message, suggestion) = match unsafe_kind {
+                if has_prefix_comment(&lines, line_num, "// SAFETY:") {
+                    // 已有 SAFETY 注释, 跳过检测 (幂等性)
+                } else {
+                    let (issue_type, message, suggestion) = match unsafe_kind {
                     "block" => (
                         IssueType::UnsafeBlock,
                         "使用 unsafe 块 — 应避免 unsafe, 寻找安全替代方案".to_string(),
@@ -1290,12 +1349,13 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
                     ),
                     _ => unreachable!(),
                 };
-                issues.push(QualityIssue {
-                    line: line_num + 1,
-                    issue_type,
-                    message,
-                    suggestion: Some(suggestion),
-                });
+                    issues.push(QualityIssue {
+                        line: line_num + 1,
+                        issue_type,
+                        message,
+                        suggestion: Some(suggestion),
+                    });
+                }
             }
 
             // Session 115: 检查公共 API 缺少文档注释
@@ -1558,6 +1618,127 @@ pub fn apply_fixes(content: &str) -> String {
     }
 
     result_lines.join("\n")
+}
+
+/// 修复预览 — dry-run 模式的返回值 (Session 118)
+///
+/// 包含原始内容、修复后内容、检测到的问题列表和修复统计,
+/// 不实际修改文件, 仅预览将要应用的修复。
+///
+/// # 字段
+///
+/// - `original_content`: 原始代码内容
+/// - `fixed_content`: 修复后的代码内容 (与 `apply_fixes` 结果相同)
+/// - `issues`: 检测到的所有质量问题
+/// - `fixes_applied`: 成功应用的修复数量
+/// - `is_changed`: 是否有任何变化 (`fixed_content != original_content`)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_fixes_dry_run;
+///
+/// let code = "fn foo() { let x = bar().unwrap(); }";
+/// let preview = apply_fixes_dry_run(code);
+/// assert!(preview.is_changed);
+/// assert!(preview.fixes_applied > 0);
+/// assert!(!preview.fixed_content.contains(".unwrap()"));
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FixPreview {
+    /// 原始代码内容
+    pub original_content: String,
+    /// 修复后的代码内容
+    pub fixed_content: String,
+    /// 检测到的所有质量问题
+    pub issues: Vec<QualityIssue>,
+    /// 成功应用的修复数量
+    pub fixes_applied: usize,
+    /// 是否有任何变化
+    pub is_changed: bool,
+}
+
+/// 批量自动修复 dry-run 模式 — 预览将要应用的修复 (Session 118)
+///
+/// 与 `apply_fixes` 功能相同, 但返回 `FixPreview` 结构体,
+/// 包含详细的修复信息 (问题列表、修复数量、变化标识),
+/// 不修改原始内容, 适用于:
+/// - 代码审查: 预览修复后再决定是否应用
+/// - 修复报告: 展示哪些问题被自动修复
+/// - CI/CD: 在 PR 中展示修复预览
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_fixes_dry_run;
+///
+/// let code = "pub fn foo() -> bool { true }";
+/// let preview = apply_fixes_dry_run(code);
+/// assert!(preview.is_changed, "应有修复");
+/// assert!(!preview.issues.is_empty(), "应检测到问题");
+/// assert!(preview.fixed_content.contains("#[must_use]"), "应添加 #[must_use]");
+/// ```
+pub fn apply_fixes_dry_run(content: &str) -> FixPreview {
+    let issues = validate_rust_code_quality_detailed(content);
+    let fixed_content = apply_fixes(content);
+    let fixes_applied = if issues.is_empty() {
+        0
+    } else {
+        // 统计实际应用的修复数量 (有变化则至少应用了一个)
+        if fixed_content != content {
+            // 通过比较行数差和问题数估算
+            issues
+                .iter()
+                .filter(|issue| {
+                    // 检查 generate_fix 是否能产生修复
+                    let lines: Vec<&str> = content.lines().collect();
+                    if issue.line == 0 || issue.line > lines.len() {
+                        return false;
+                    }
+                    generate_fix(issue, lines[issue.line - 1]).is_some()
+                })
+                .count()
+        } else {
+            0
+        }
+    };
+
+    FixPreview {
+        is_changed: fixed_content != content,
+        original_content: content.to_string(),
+        fixed_content,
+        issues,
+        fixes_applied,
+    }
+}
+
+/// 验证 apply_fixes 的幂等性 — 二次应用不应产生变化 (Session 118)
+///
+/// 幂等性: `apply_fixes(apply_fixes(x)) == apply_fixes(x)`
+///
+/// 如果 `apply_fixes` 一次应用后已修复所有问题, 二次应用应无变化。
+/// 如果不满足幂等性, 说明修复可能引入了新的问题或修复不完整。
+///
+/// # 返回值
+///
+/// - `true`: 二次应用无变化 (幂等)
+/// - `false`: 二次应用仍有变化 (非幂等, 需要调查)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_idempotent;
+///
+/// // 无问题的代码是幂等的
+/// assert!(verify_idempotent("fn foo() -> i32 { 42 }"));
+///
+/// // 有问题的代码, 修复后应幂等
+/// assert!(verify_idempotent("fn foo() { let x = bar().unwrap(); }"));
+/// ```
+pub fn verify_idempotent(content: &str) -> bool {
+    let first_pass = apply_fixes(content);
+    let second_pass = apply_fixes(&first_pass);
+    first_pass == second_pass
 }
 
 fn guess_language_from_path(path: &str) -> String {
@@ -4063,5 +4244,212 @@ mod tests {
                 .any(|i| i.issue_type == IssueType::MissingMustUse),
             "多行函数签名返回 Option 应检测到缺少 #[must_use]"
         );
+    }
+
+    // ===== Session 118: is_must_use_return_type 扩展类型测试 =====
+
+    #[test]
+    fn test_is_must_use_return_type_box() {
+        assert!(is_must_use_return_type("Box<[u8]>"));
+        assert!(is_must_use_return_type("Box<str>"));
+        assert!(!is_must_use_return_type("Box<i32>")); // Box<T> 不含 T 是 must_use
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_rc_arc() {
+        assert!(is_must_use_return_type("Rc<String>"));
+        assert!(is_must_use_return_type("Arc<Vec<i32>>"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_cow() {
+        assert!(is_must_use_return_type("Cow<'a, str>"));
+        assert!(is_must_use_return_type("Cow<'_, [u8]>"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_pathbuf() {
+        assert!(is_must_use_return_type("PathBuf"));
+        assert!(is_must_use_return_type("&Path"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_slice_ref() {
+        assert!(is_must_use_return_type("&[u8]"));
+        assert!(is_must_use_return_type("&[String]"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_extended_impl_traits() {
+        assert!(is_must_use_return_type("impl Into<String>"));
+        assert!(is_must_use_return_type("impl AsRef<str>"));
+        assert!(is_must_use_return_type("impl DoubleEndedIterator"));
+        assert!(is_must_use_return_type("impl ExactSizeIterator"));
+        assert!(is_must_use_return_type("impl FusedIterator"));
+        assert!(is_must_use_return_type("impl Read"));
+        assert!(is_must_use_return_type("impl Write"));
+        assert!(is_must_use_return_type("impl BufRead"));
+    }
+
+    #[test]
+    fn test_is_must_use_return_type_non_must_use_extended() {
+        assert!(!is_must_use_return_type("i32"));
+        assert!(!is_must_use_return_type("()"));
+        assert!(!is_must_use_return_type("u64"));
+        assert!(!is_must_use_return_type("f64"));
+        assert!(!is_must_use_return_type("Box<i32>")); // 非 Box<[T]> 或 Box<str>
+    }
+
+    // ===== Session 118: returns_must_use_type 新类型测试 =====
+
+    #[test]
+    fn test_returns_must_use_type_pathbuf() {
+        assert!(returns_must_use_type(
+            "pub fn get_path() -> PathBuf { PathBuf::new() }"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_box_slice() {
+        assert!(returns_must_use_type(
+            "pub fn data() -> Box<[u8]> { Box::new([0u8; 10]) }"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_arc() {
+        assert!(returns_must_use_type(
+            "pub fn shared() -> Arc<String> { Arc::new(String::new()) }"
+        ));
+    }
+
+    #[test]
+    fn test_returns_must_use_type_impl_into() {
+        assert!(returns_must_use_type(
+            "pub fn convert() -> impl Into<String> { String::new() }"
+        ));
+    }
+
+    // ===== Session 118: apply_fixes_dry_run 测试 =====
+
+    #[test]
+    fn test_apply_fixes_dry_run_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let preview = apply_fixes_dry_run(code);
+        assert!(!preview.is_changed, "无问题代码不应有变化");
+        assert_eq!(preview.fixes_applied, 0, "无修复");
+        assert!(preview.issues.is_empty(), "无问题");
+        assert_eq!(preview.original_content, code);
+        assert_eq!(preview.fixed_content, code);
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_with_unwrap() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_fixes_dry_run(code);
+        assert!(preview.is_changed, "应有变化");
+        assert!(preview.fixes_applied > 0, "应有修复");
+        assert!(!preview.issues.is_empty(), "应检测到问题");
+        assert!(
+            !preview.fixed_content.contains(".unwrap()"),
+            "修复后不应包含 .unwrap()"
+        );
+        assert!(preview.fixed_content.contains('?'), "应包含 ? 操作符");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_with_missing_doc_and_must_use() {
+        let code = "pub fn foo() -> bool { true }";
+        let preview = apply_fixes_dry_run(code);
+        assert!(preview.is_changed, "应有变化");
+        assert!(
+            preview.fixed_content.contains("/// TODO:"),
+            "应添加文档注释"
+        );
+        assert!(
+            preview.fixed_content.contains("#[must_use]"),
+            "应添加 #[must_use]"
+        );
+        // 文档注释应在 #[must_use] 之前
+        let doc_pos = preview.fixed_content.find("/// TODO:").unwrap();
+        let must_use_pos = preview.fixed_content.find("#[must_use]").unwrap();
+        assert!(doc_pos < must_use_pos, "文档注释应在 #[must_use] 之前");
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_preserves_original() {
+        let code = "fn foo() { let x = bar().unwrap(); }";
+        let preview = apply_fixes_dry_run(code);
+        // 原始内容不应被修改
+        assert_eq!(preview.original_content, code);
+        assert!(preview.original_content.contains(".unwrap()"));
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_multiple_issues() {
+        let code = "fn foo() {\n    let x = a().unwrap();\n    let y = b().unwrap();\n}";
+        let preview = apply_fixes_dry_run(code);
+        assert!(preview.is_changed);
+        assert!(preview.fixes_applied >= 2, "应至少修复 2 处");
+        assert!(!preview.fixed_content.contains(".unwrap()"));
+    }
+
+    #[test]
+    fn test_apply_fixes_dry_run_serde_roundtrip() {
+        let code = "pub fn foo() -> bool { true }";
+        let preview = apply_fixes_dry_run(code);
+        let json = serde_json::to_string(&preview).expect("序列化失败");
+        let deserialized: FixPreview = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(deserialized.original_content, preview.original_content);
+        assert_eq!(deserialized.fixed_content, preview.fixed_content);
+        assert_eq!(deserialized.fixes_applied, preview.fixes_applied);
+        assert_eq!(deserialized.is_changed, preview.is_changed);
+    }
+
+    // ===== Session 118: verify_idempotent 测试 =====
+
+    #[test]
+    fn test_verify_idempotent_clean_code() {
+        assert!(verify_idempotent("fn foo() -> i32 { 42 }"));
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_unwrap() {
+        assert!(
+            verify_idempotent("fn foo() { let x = bar().unwrap(); }"),
+            "修复后二次应用应无变化"
+        );
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_missing_doc() {
+        assert!(
+            verify_idempotent("pub fn foo() {}"),
+            "修复后二次应用应无变化"
+        );
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_multiple_issues() {
+        let code = "pub fn foo() -> bool { let x = bar().unwrap(); true }";
+        assert!(verify_idempotent(code), "多问题修复后二次应用应无变化");
+    }
+
+    #[test]
+    fn test_verify_idempotent_with_todo() {
+        let code = "fn foo() { let x = todo!(); }";
+        assert!(verify_idempotent(code), "todo!() 修复后二次应用应无变化");
+    }
+
+    #[test]
+    fn test_verify_idempotent_complex_code() {
+        let code = r#"
+pub fn process(data: Vec<i32>) -> Option<i32> {
+    let x = data.first().unwrap();
+    let y = x.checked_mul(2).unwrap_or(0);
+    Some(y)
+}
+"#;
+        assert!(verify_idempotent(code), "复杂代码修复后二次应用应无变化");
     }
 }

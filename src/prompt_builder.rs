@@ -102,7 +102,7 @@ impl SystemPrompt {
         prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n");
         prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n");
         prompt.push_str(
-            "✅ 必须: 返回 Result/Option/bool/Vec/String/&str 的公共函数添加 #[must_use] 属性\n\n",
+            "✅ 必须: 返回 Result/Option/bool/Vec/String/&str/Box/Rc/Arc/Cow/PathBuf 的公共函数添加 #[must_use] 属性\n\n",
         );
 
         prompt.push_str("📎 附件内容 (必须逐条执行):\n");
@@ -338,6 +338,25 @@ mod tests {
         assert!(
             prompt.contains("&str"),
             "系统 prompt 应在 #[must_use] 要求中包含 &str 类型"
+        );
+    }
+
+    // ===== Session 118: 扩展 must_use 类型测试 =====
+
+    #[test]
+    fn test_build_contains_extended_must_use_types() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Box"),
+            "系统 prompt 应在 #[must_use] 要求中包含 Box 类型"
+        );
+        assert!(
+            prompt.contains("Arc"),
+            "系统 prompt 应在 #[must_use] 要求中包含 Arc 类型"
+        );
+        assert!(
+            prompt.contains("PathBuf"),
+            "系统 prompt 应在 #[must_use] 要求中包含 PathBuf 类型"
         );
     }
 }

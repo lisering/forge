@@ -716,6 +716,13 @@ where
     ///
     /// `None` 表示禁用 (默认, 向后兼容)。
     pub joint_decision_engine: Option<JointDecisionEngine>,
+
+    /// 自动修复开关 — 代码提取后自动应用 apply_fixes (Session 118)
+    ///
+    /// 启用后, 在从 AI 回复提取代码文件后, 对 Rust (.rs) 文件自动调用
+    /// `apply_fixes` 修复质量问题 (unwrap → ?, 添加 #[must_use], 文档注释等),
+    /// 并打印修复摘要。默认 false (向后兼容)。
+    pub auto_fix_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -768,6 +775,7 @@ where
             memory_context_stats: MemoryContextStats::new(),
             memory_evaluator: None,
             joint_decision_engine: None,
+            auto_fix_enabled: false,
         }
     }
 }
@@ -836,6 +844,7 @@ where
             memory_context_stats: self.memory_context_stats,
             memory_evaluator: self.memory_evaluator,
             joint_decision_engine: self.joint_decision_engine,
+            auto_fix_enabled: self.auto_fix_enabled,
         }
     }
 
@@ -1135,6 +1144,70 @@ where
     pub fn with_joint_decision_engine(mut self, engine: JointDecisionEngine) -> Self {
         self.joint_decision_engine = Some(engine);
         self
+    }
+
+    /// 启用/禁用自动修复 — 代码提取后自动应用 apply_fixes (Session 118)
+    ///
+    /// 启用后, 在从 AI 回复提取代码文件后, 对 Rust (.rs) 文件自动调用
+    /// `apply_fixes` 修复质量问题, 并打印修复摘要。
+    pub fn with_auto_fix(mut self, enabled: bool) -> Self {
+        self.auto_fix_enabled = enabled;
+        self
+    }
+
+    /// 对提取的文件应用自动修复 (Session 118)
+    ///
+    /// 遍历所有提取的文件, 对 Rust (.rs) 文件调用 `apply_fixes`,
+    /// 修复质量问题 (unwrap → ?, 添加 #[must_use], 文档注释等)。
+    /// 非 Rust 文件不做处理。
+    ///
+    /// 返回修复后的文件列表, 并打印修复摘要。
+    fn apply_auto_fixes_to_files(
+        &self,
+        files: Vec<crate::extract::ExtractedFile>,
+    ) -> Vec<crate::extract::ExtractedFile> {
+        use crate::extract::apply_fixes_dry_run;
+
+        let mut fixed_files = Vec::with_capacity(files.len());
+        let mut total_fixes = 0usize;
+        let mut fixed_count = 0usize;
+
+        for file in files {
+            if file.path.ends_with(".rs") {
+                let preview = apply_fixes_dry_run(&file.content);
+                if preview.is_changed {
+                    total_fixes += preview.fixes_applied;
+                    fixed_count += 1;
+                    println!(
+                        "    🔧 自动修复 {}: {} 处修复",
+                        file.path, preview.fixes_applied
+                    );
+                    for issue in &preview.issues {
+                        debug!(
+                            "  {}:{} — {:?}: {}",
+                            file.path, issue.line, issue.issue_type, issue.message
+                        );
+                    }
+                    fixed_files.push(crate::extract::ExtractedFile {
+                        content: preview.fixed_content,
+                        ..file
+                    });
+                } else {
+                    fixed_files.push(file);
+                }
+            } else {
+                fixed_files.push(file);
+            }
+        }
+
+        if total_fixes > 0 {
+            println!(
+                "    🔧 自动修复摘要: {} 个文件, {} 处修复",
+                fixed_count, total_fixes
+            );
+        }
+
+        fixed_files
     }
 
     /// 计算增量消息 — 使用 LiveContinuation 和 ConversationTracker
@@ -4448,6 +4521,13 @@ where
             for f in &files {
                 println!("      {} ({}字符)", f.path, f.content.len());
             }
+
+            // === 自动修复: 对 Rust 文件应用 apply_fixes (Session 118) ===
+            let files = if self.auto_fix_enabled {
+                self.apply_auto_fixes_to_files(files)
+            } else {
+                files
+            };
 
             // 写入工作区 (带版本快照: 先保存将被覆盖的文件)
             let (_snap_id, written) = self
@@ -10242,6 +10322,152 @@ mod tests {
                 .collect();
             assert!(!jd_entries.is_empty(), "DevTrace 应记录联合决策条目");
         }
+    }
+
+    // ===== Session 118: 自动修复 (apply_fixes) 集成测试 =====
+
+    #[test]
+    fn test_auto_fix_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(!orch.auto_fix_enabled, "auto_fix_enabled 应默认为 false");
+    }
+
+    #[test]
+    fn test_with_auto_fix_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_auto_fix(true);
+        assert!(
+            orch.auto_fix_enabled,
+            "with_auto_fix(true) 应设置 auto_fix_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_auto_fix_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_auto_fix(false);
+        assert!(
+            !orch.auto_fix_enabled,
+            "with_auto_fix(false) 应设置 auto_fix_enabled 为 false"
+        );
+    }
+
+    #[test]
+    fn test_apply_auto_fixes_to_files_fixes_rust() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn foo() { let x = bar().unwrap(); }".to_string(),
+            language: "rust".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert_eq!(fixed.len(), 1);
+        assert!(
+            !fixed[0].content.contains(".unwrap()"),
+            "Rust 文件中的 unwrap() 应被修复"
+        );
+        assert!(fixed[0].content.contains('?'), "应包含 ? 操作符");
+    }
+
+    #[test]
+    fn test_apply_auto_fixes_to_files_skips_non_rust() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let files = vec![crate::extract::ExtractedFile {
+            path: "Cargo.toml".to_string(),
+            content: "[package]\nname = \"test\"\nversion = \"0.1.0\"".to_string(),
+            language: "toml".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert_eq!(fixed.len(), 1);
+        // 非 Rust 文件不应被修改
+        assert!(fixed[0].content.contains("[package]"));
+    }
+
+    #[test]
+    fn test_apply_auto_fixes_to_files_mixed() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let files = vec![
+            crate::extract::ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "fn foo() { let x = bar().unwrap(); }".to_string(),
+                language: "rust".to_string(),
+            },
+            crate::extract::ExtractedFile {
+                path: "Cargo.toml".to_string(),
+                content: "[package]".to_string(),
+                language: "toml".to_string(),
+            },
+            crate::extract::ExtractedFile {
+                path: "src/lib.rs".to_string(),
+                content: "pub fn bar() -> bool { true }".to_string(),
+                language: "rust".to_string(),
+            },
+        ];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert_eq!(fixed.len(), 3);
+        // 第一个 Rust 文件应被修复
+        assert!(!fixed[0].content.contains(".unwrap()"));
+        // TOML 文件不应被修改
+        assert!(fixed[1].content.contains("[package]"));
+        // 第三个 Rust 文件应被修复 (添加 #[must_use] 和文档注释)
+        assert!(
+            fixed[2].content.contains("#[must_use]") || fixed[2].content.contains("/// TODO:"),
+            "第三个 Rust 文件应被修复: {}",
+            fixed[2].content
+        );
+    }
+
+    #[test]
+    fn test_apply_auto_fixes_to_files_no_issues() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn foo() -> i32 { 42 }".to_string(),
+            language: "rust".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert_eq!(fixed.len(), 1);
+        assert_eq!(
+            fixed[0].content, "fn foo() -> i32 { 42 }",
+            "无问题的代码不应被修改"
+        );
+    }
+
+    #[test]
+    fn test_auto_fix_preserves_file_path_and_language() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/utils/helper.rs".to_string(),
+            content: "fn foo() { let x = bar().unwrap(); }".to_string(),
+            language: "rust".to_string(),
+        }];
+
+        let fixed = orch.apply_auto_fixes_to_files(files);
+        assert_eq!(fixed[0].path, "src/utils/helper.rs", "路径应保留");
+        assert_eq!(fixed[0].language, "rust", "语言应保留");
     }
 }
 
