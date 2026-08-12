@@ -1938,10 +1938,14 @@ pub fn apply_fixes_with_imports(content: &str) -> String {
     let fixed = apply_fixes(content);
     // 2. 包装函数体最后的表达式为 Ok(...) (Session 121)
     let wrapped = wrap_last_expression_in_ok(&fixed);
-    // 3. 确保所需的 anyhow 导入 (增强版, Session 121)
-    let imported = ensure_anyhow_imports(&wrapped);
-    // 4. 合并分散的 anyhow 导入 (Session 121)
-    merge_anyhow_imports(&imported)
+    // 3. 包装 return 语句为 Ok(...) (Session 122)
+    let return_wrapped = wrap_return_statements_in_ok(&wrapped);
+    // 4. 确保所需的 anyhow 导入 (增强版, Session 121)
+    let anyhow_imported = ensure_anyhow_imports(&return_wrapped);
+    // 5. 合并分散的 anyhow 导入 (Session 121)
+    let anyhow_merged = merge_anyhow_imports(&anyhow_imported);
+    // 6. 确保所需的 std 导入 (Session 125)
+    ensure_std_imports(&anyhow_merged)
 }
 
 /// 修复预览 — dry-run 模式的返回值 (Session 118)
@@ -2289,7 +2293,7 @@ pub enum LineDiffType {
 /// assert!(!diffs.is_empty(), "应有差异");
 /// assert!(diffs.iter().any(|d| d.diff_type == LineDiffType::Modified), "应有修改行");
 /// ```
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LineDiff {
     /// 行号 (1-based, 基于原始内容)
     pub line_number: usize,
@@ -3721,7 +3725,7 @@ pub enum DiffAlgorithm {
     /// 1. 任一输入为空 → Myers (直接处理边界)
     /// 2. 两输入都 < 20 行 → Basic (最快, 无需构建 DP 表)
     /// 3. N × M ≤ 10000 → LCS (中等规模, 稳定)
-    /// 4. N × M > 10000 → Myers (大规模, 稀疏差异更高效)
+    /// 4. N × M > 10000 → Hirschberg (大规模, 线性空间 O(N+M)) (Session 125)
     #[default]
     Auto,
     /// 基础逐行比较 O(N)
@@ -3730,6 +3734,10 @@ pub enum DiffAlgorithm {
     Lcs,
     /// Myers O(ND)
     Myers,
+    /// Hirschberg 线性空间 LCS O(N+M) 空间 (Session 125)
+    ///
+    /// 适用于大文件 diff, 空间效率远优于 LCS (O(N×M) → O(N+M))
+    Hirschberg,
 }
 
 /// 使用指定算法计算行级别差异 (Session 123)
@@ -3763,6 +3771,7 @@ pub fn compute_line_diff_with_algorithm(
         DiffAlgorithm::Basic => compute_line_diff(original, fixed),
         DiffAlgorithm::Lcs => compute_line_diff_lcs(original, fixed),
         DiffAlgorithm::Myers => compute_line_diff_myers(original, fixed),
+        DiffAlgorithm::Hirschberg => compute_line_diff_hirschberg(original, fixed),
         DiffAlgorithm::Auto => {
             let n = original.lines().count();
             let m = fixed.lines().count();
@@ -3783,8 +3792,9 @@ pub fn compute_line_diff_with_algorithm(
                 return compute_line_diff_lcs(original, fixed);
             }
 
-            // 大输入: Myers 更适合稀疏差异
-            compute_line_diff_myers(original, fixed)
+            // 大输入: Hirschberg 线性空间 (Session 125)
+            // 空间 O(N+M) 远优于 LCS 的 O(N×M), 适用于大文件
+            compute_line_diff_hirschberg(original, fixed)
         }
     }
 }
@@ -4415,6 +4425,34 @@ pub fn compute_line_diff_hirschberg(original: &str, fixed: &str) -> Vec<LineDiff
 /// assert!(diff.contains("+    let x = 42;"), "应包含新增行");
 /// ```
 pub fn format_diff_unified(original: &str, fixed: &str) -> String {
+    format_diff_unified_with_options(original, fixed, "original", "fixed", 3)
+}
+
+/// 带选项的统一 diff 格式输出 (Session 125)
+///
+/// 与 `format_diff_unified` 功能相同, 但支持自定义:
+/// - `original_name`: 原始文件名 (显示在 `---` 头)
+/// - `fixed_name`: 修复后文件名 (显示在 `+++` 头)
+/// - `context`: 上下文行数 (默认 3)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::format_diff_unified_with_options;
+///
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let diff = format_diff_unified_with_options(original, fixed, "src/main.rs", "src/main.rs", 5);
+/// assert!(diff.contains("--- src/main.rs"));
+/// assert!(diff.contains("+++ src/main.rs"));
+/// ```
+pub fn format_diff_unified_with_options(
+    original: &str,
+    fixed: &str,
+    original_name: &str,
+    fixed_name: &str,
+    context: usize,
+) -> String {
     if original == fixed {
         return String::new();
     }
@@ -4454,8 +4492,6 @@ pub fn format_diff_unified(original: &str, fixed: &str) -> String {
         bi += 1;
     }
 
-    let context = 3usize;
-
     // 找到所有变更区域, 合并相近的变更 (距离 <= 2*context 的归入同一 hunk)
     let mut hunks: Vec<(usize, usize)> = Vec::new(); // (start, end) in entries
     let mut i = 0;
@@ -4490,8 +4526,8 @@ pub fn format_diff_unified(original: &str, fixed: &str) -> String {
     }
 
     let mut result = String::new();
-    result.push_str("--- original\n");
-    result.push_str("+++ fixed\n");
+    result.push_str(&format!("--- {}\n", original_name));
+    result.push_str(&format!("+++ {}\n", fixed_name));
 
     for &(start, end) in &hunks {
         let hunk_entries = &entries[start..end];
@@ -4521,7 +4557,35 @@ pub fn format_diff_unified(original: &str, fixed: &str) -> String {
     result
 }
 
-/// 检测并添加缺失的 `std` 导入 (Session 124)
+/// 检测类型名是否作为独立标识符出现 (词边界匹配) (Session 125)
+///
+/// 防止 "Cell" 误匹配 "OnceCell" 或 "RefCell" 中的子串。
+/// 检查类型名出现位置的左右字符是否为非标识符字符 (非字母数字和下划线)。
+fn contains_type_usage(content: &str, type_name: &str) -> bool {
+    let bytes = content.as_bytes();
+    let tn_bytes = type_name.as_bytes();
+    let tn_len = tn_bytes.len();
+
+    for (pos, _) in content.match_indices(type_name) {
+        // 检查前一个字符是否为非标识符字符
+        let before_ok = pos == 0 || {
+            let ch = bytes[pos - 1];
+            !ch.is_ascii_alphanumeric() && ch != b'_'
+        };
+        // 检查后一个字符是否为非标识符字符
+        let after_pos = pos + tn_len;
+        let after_ok = after_pos >= bytes.len() || {
+            let ch = bytes[after_pos];
+            !ch.is_ascii_alphanumeric() && ch != b'_'
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// 检测并添加缺失的 `std` 导入 (Session 124 + Session 125 扩展)
 ///
 /// 类似 `ensure_anyhow_imports`, 但针对 Rust 标准库常用类型:
 ///
@@ -4530,6 +4594,13 @@ pub fn format_diff_unified(original: &str, fixed: &str) -> String {
 /// - `Path` / `PathBuf` → `use std::path::{Path, PathBuf};`
 /// - `File` → `use std::fs::File;`
 /// - `Read` / `Write` / `BufRead` → `use std::io::{Read, Write, BufRead};`
+/// - `Cell` / `RefCell` / `OnceCell` → `use std::cell::{Cell, RefCell, OnceCell};` (Session 125)
+/// - `Arc` / `Mutex` / `RwLock` / `OnceLock` → `use std::sync::{Arc, Mutex, RwLock, OnceLock};` (Session 125)
+/// - `Rc` → `use std::rc::Rc;` (Session 125)
+/// - `Command` / `ExitStatus` → `use std::process::{Command, ExitStatus};` (Session 125)
+/// - `env` → `use std::env;` (Session 125)
+/// - `Instant` / `Duration` → `use std::time::{Instant, Duration};` (Session 125)
+/// - `TcpListener` / `TcpStream` → `use std::net::{TcpListener, TcpStream};` (Session 125)
 ///
 /// # 规则
 ///
@@ -4584,6 +4655,28 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("Stdin", "std::io"),
         ("Stdout", "std::io"),
         ("Stderr", "std::io"),
+        // cell (Session 125)
+        ("Cell", "std::cell"),
+        ("RefCell", "std::cell"),
+        ("OnceCell", "std::cell"),
+        // sync (Session 125)
+        ("Arc", "std::sync"),
+        ("Mutex", "std::sync"),
+        ("RwLock", "std::sync"),
+        ("OnceLock", "std::sync"),
+        // rc (Session 125)
+        ("Rc", "std::rc"),
+        // process (Session 125)
+        ("Command", "std::process"),
+        ("ExitStatus", "std::process"),
+        // env (Session 125)
+        ("env", "std"),
+        // time (Session 125)
+        ("Instant", "std::time"),
+        ("Duration", "std::time"),
+        // net (Session 125)
+        ("TcpListener", "std::net"),
+        ("TcpStream", "std::net"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -4591,9 +4684,9 @@ pub fn ensure_std_imports(content: &str) -> String {
 
     for &(type_name, module_path) in type_modules {
         // 检测使用: 出现类型名作为标识符 (不是全限定路径的一部分)
-        // 简单策略: 检测 type_name 出现, 但排除 "module_path::type_name" 的全限定用法
+        // 使用词边界匹配: 排除 type_name 作为更大标识符子串的情况 (如 "Cell" in "OnceCell")
         let full_path = format!("{}::{}", module_path, type_name);
-        let bare_usage = content.contains(type_name) && !content.contains(&full_path);
+        let bare_usage = contains_type_usage(content, type_name) && !content.contains(&full_path);
 
         if bare_usage {
             // 检查是否已有导入
@@ -4603,7 +4696,7 @@ pub fn ensure_std_imports(content: &str) -> String {
                 trimmed.starts_with(&format!("use {}::{}", module_path, type_name))
                 // 检查 use module_path::{..., type_name, ...};
                 || (trimmed.contains(&format!("use {}::{{", module_path))
-                    && trimmed.contains(type_name))
+                    && contains_type_usage(trimmed, type_name))
                 // 检查 use module_path::*;
                 || trimmed.starts_with(&format!("use {}::*;", module_path))
                 // 检查 use std::collections::*; 等 (对 std::collections::HashMap 等)
@@ -8400,6 +8493,54 @@ fn foo(
         assert_eq!(import_count, 1, "应只有一个 anyhow 导入行: {}", result);
     }
 
+    // ===== Session 125: apply_fixes_with_imports 集成 std 导入测试 =====
+
+    #[test]
+    fn test_apply_fixes_with_imports_adds_std_imports() {
+        // 修复后使用了 HashMap 但未导入, 应自动添加 std 导入
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let result = apply_fixes_with_imports(code);
+        assert!(
+            result.contains("use std::collections::HashMap;"),
+            "应添加 HashMap 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_apply_fixes_with_imports_adds_both_imports() {
+        // 同时需要 anyhow 和 std 导入
+        let code = "fn foo() -> i32 { let x: Result<i32, _> = Ok(42); let m = HashMap::new(); x? }";
+        let result = apply_fixes_with_imports(code);
+        assert!(
+            result.contains("use anyhow::"),
+            "应添加 anyhow 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("use std::collections::HashMap;"),
+            "应添加 HashMap 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_apply_fixes_with_imports_wraps_return_and_imports() {
+        // return 包装 + std 导入同时工作
+        let code = "fn foo() -> Result<HashMap<String, i32>, anyhow::Error> {\n    return HashMap::new();\n}";
+        let result = apply_fixes_with_imports(code);
+        assert!(
+            result.contains("return Ok(HashMap::new());"),
+            "应包装 return: {}",
+            result
+        );
+        assert!(
+            result.contains("use std::collections::HashMap;"),
+            "应添加 HashMap 导入: {}",
+            result
+        );
+    }
+
     // ===== Session 122: wrap_return_statements_in_ok 测试 =====
 
     #[test]
@@ -8941,6 +9082,46 @@ fn foo(
         assert_eq!(algo, deserialized, "Serde 往返应保持一致");
     }
 
+    // ===== Session 125: DiffAlgorithm::Hirschberg 测试 =====
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_hirschberg() {
+        let original = "a\nb\nc";
+        let fixed = "a\nB\nc";
+        let diffs = compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Hirschberg);
+        assert!(!diffs.is_empty(), "Hirschberg 应检测到差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_hirschberg_empty() {
+        let diffs = compute_line_diff_with_algorithm("", "", DiffAlgorithm::Hirschberg);
+        assert!(diffs.is_empty(), "空输入应无差异");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_hirschberg_serde() {
+        let algo = DiffAlgorithm::Hirschberg;
+        let json = serde_json::to_string(&algo).unwrap();
+        let deserialized: DiffAlgorithm = serde_json::from_str(&json).unwrap();
+        assert_eq!(algo, deserialized, "Hirschberg Serde 往返应保持一致");
+    }
+
+    #[test]
+    fn test_compute_line_diff_with_algorithm_auto_large_uses_hirschberg() {
+        // 大输入 (N×M > 10000) → Auto 应使用 Hirschberg
+        // 结果应与直接调用 Hirschberg 一致
+        let original: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        fixed.push_str("line 200\n");
+        let auto_diffs = compute_line_diff_with_algorithm(&original, &fixed, DiffAlgorithm::Auto);
+        let hirschberg_diffs =
+            compute_line_diff_with_algorithm(&original, &fixed, DiffAlgorithm::Hirschberg);
+        assert_eq!(
+            auto_diffs, hirschberg_diffs,
+            "大输入 Auto 应使用 Hirschberg, 结果一致"
+        );
+    }
+
     #[test]
     fn test_compute_line_diff_unified_one_empty() {
         let diffs = compute_line_diff_unified("", "a\nb\nc");
@@ -9422,6 +9603,95 @@ fn foo(
         assert!(diff.contains("+let x = 2;"), "应包含新行: {}", diff);
     }
 
+    // ===== Session 125: format_diff_unified_with_options 测试 =====
+
+    #[test]
+    fn test_format_diff_unified_with_options_custom_names() {
+        let diff = format_diff_unified_with_options(
+            "fn foo() {}\n",
+            "fn bar() {}\n",
+            "src/main.rs",
+            "src/main.rs",
+            3,
+        );
+        assert!(
+            diff.contains("--- src/main.rs"),
+            "应包含自定义原始文件名: {}",
+            diff
+        );
+        assert!(
+            diff.contains("+++ src/main.rs"),
+            "应包含自定义修复文件名: {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_no_diff() {
+        let diff = format_diff_unified_with_options("a\nb\nc", "a\nb\nc", "old.rs", "new.rs", 3);
+        assert!(diff.is_empty(), "无差异应返回空字符串");
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_context_zero() {
+        let original = "line1\nline2\nline3\nline4\nline5\n";
+        let fixed = "line1\nline2\nCHANGED\nline4\nline5\n";
+        let diff = format_diff_unified_with_options(original, fixed, "a", "b", 0);
+        // context=0 时不应包含上下文行
+        assert!(!diff.contains(" line1"), "context=0 不应有上下文: {}", diff);
+        assert!(!diff.contains(" line5"), "context=0 不应有上下文: {}", diff);
+        assert!(diff.contains("-line3"), "应包含删除行: {}", diff);
+        assert!(diff.contains("+CHANGED"), "应包含新增行: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_context_large() {
+        let original = "line1\nline2\nline3\n";
+        let fixed = "line1\nCHANGED\nline3\n";
+        let diff = format_diff_unified_with_options(original, fixed, "a", "b", 10);
+        // context=10 时应包含所有行作为上下文
+        assert!(diff.contains(" line1"), "大 context 应包含 line1: {}", diff);
+        assert!(diff.contains(" line3"), "大 context 应包含 line3: {}", diff);
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_different_names() {
+        let diff =
+            format_diff_unified_with_options("a\n", "b\n", "original_file.rs", "fixed_file.rs", 3);
+        assert!(
+            diff.contains("--- original_file.rs"),
+            "应包含原始文件名: {}",
+            diff
+        );
+        assert!(
+            diff.contains("+++ fixed_file.rs"),
+            "应包含修复文件名: {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_defaults_match() {
+        // format_diff_unified 应等价于 format_diff_unified_with_options 默认参数
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let default_diff = format_diff_unified(original, fixed);
+        let options_diff =
+            format_diff_unified_with_options(original, fixed, "original", "fixed", 3);
+        assert_eq!(
+            default_diff, options_diff,
+            "默认参数应与 format_diff_unified 一致"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_unified_with_options_empty_inputs() {
+        let diff = format_diff_unified_with_options("", "a\nb\n", "old", "new", 3);
+        assert!(!diff.is_empty(), "空 original 应有 diff");
+        assert!(diff.contains("+a"), "应包含 +a: {}", diff);
+        assert!(diff.contains("+b"), "应包含 +b: {}", diff);
+    }
+
     // ===== Session 124: ensure_std_imports 测试 =====
 
     #[test]
@@ -9563,6 +9833,175 @@ fn foo(
             import_pos,
             fn_pos
         );
+    }
+
+    // ===== Session 125: ensure_std_imports 新增 cell/sync/rc/process/env/time/net 类型 =====
+
+    #[test]
+    fn test_ensure_std_imports_cell_refcell() {
+        let code = "fn foo(cell: Cell<i32>, rc: RefCell<String>) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::cell::{Cell, RefCell};"),
+            "应添加 cell 模块合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_once_cell() {
+        let code = "fn foo() -> OnceCell<i32> { OnceCell::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::cell::OnceCell;"),
+            "应添加 OnceCell 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_arc_mutex_rwlock() {
+        let code = "fn foo() -> Arc<Mutex<i32>> { Arc::new(Mutex::new(0)) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::{Arc, Mutex};"),
+            "应合并 sync 模块导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_rwlock() {
+        let code = "fn foo() -> RwLock<i32> { RwLock::new(0) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::RwLock;"),
+            "应添加 RwLock 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_once_lock() {
+        let code = "fn foo() -> OnceLock<i32> { OnceLock::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::OnceLock;"),
+            "应添加 OnceLock 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_rc() {
+        let code = "fn foo() -> Rc<String> { Rc::new(String::new()) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::rc::Rc;"),
+            "应添加 Rc 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_command() {
+        let code = "fn foo() { let mut cmd = Command::new(\"ls\"); }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::process::Command;"),
+            "应添加 Command 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_exit_status() {
+        let code = "fn foo(status: ExitStatus) -> bool { status.success() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::process::ExitStatus;"),
+            "应添加 ExitStatus 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_env() {
+        let code = "fn foo() { let v = env::var(\"HOME\"); }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::env;"),
+            "应添加 env 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_instant_duration() {
+        let code = "fn foo() -> Duration { let start = Instant::now(); start.elapsed() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::time::{Instant, Duration};"),
+            "应添加 time 模块合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_tcp() {
+        let code = "fn foo() -> TcpListener { TcpListener::bind(\"127.0.0.1:0\").unwrap() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::net::TcpListener;"),
+            "应添加 TcpListener 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_tcp_stream() {
+        let code = "fn foo() -> TcpStream { TcpStream::connect(\"127.0.0.1:80\").unwrap() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::net::TcpStream;"),
+            "应添加 TcpStream 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_arc_full_path_no_import() {
+        let code = "fn foo() -> std::sync::Arc<i32> { std::sync::Arc::new(0) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::sync::Arc;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_multiple_new_types() {
+        let code = "fn foo() -> Arc<Mutex<HashMap<String, Vec<i32>>>> { Arc::new(Mutex::new(HashMap::new())) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::sync::{Arc, Mutex};"),
+            "应有合并的 sync 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("use std::collections::HashMap;"),
+            "应有 HashMap: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_new_types_idempotent() {
+        let code = "fn foo() -> Arc<Mutex<i32>> { Arc::new(Mutex::new(0)) }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "新增类型检测应幂等");
     }
 
     // ===== Session 124: wrap_return_statements_in_ok 闭包/async/tab 测试 =====
@@ -9722,5 +10161,71 @@ fn foo(
             result.second_pass_diff.is_empty(),
             "幂等修复第二次不应有 diff"
         );
+    }
+
+    // ===== Session 125: wrap_return_statements_in_ok match 表达式测试 =====
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_single_line() {
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return match x { 1 => 42, _ => 0 };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(match x { 1 => 42, _ => 0 });"),
+            "应包装单行 match: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_multiline() {
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return match x {\n        1 => 42,\n        _ => 0,\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(match x {"),
+            "应包装多行 match 首行: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合括号: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_with_block_arms() {
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return match x {\n        1 => {\n            let y = 42;\n            y\n        }\n        _ => 0,\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(match x {"),
+            "应包装含块臂的 match: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合括号: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_already_ok() {
+        // match 表达式已被 Ok() 包装, 不应重复包装
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return Ok(match x { 1 => 42, _ => 0 });\n}";
+        let result = wrap_return_statements_in_ok(code);
+        let ok_count = result.matches("return Ok(").count();
+        assert_eq!(ok_count, 1, "不应重复包装: {}", result);
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_idempotent() {
+        let code = "fn foo(x: i32) -> Result<i32, anyhow::Error> {\n    return match x {\n        1 => 42,\n        _ => 0,\n    };\n}";
+        let first = wrap_return_statements_in_ok(code);
+        let second = wrap_return_statements_in_ok(&first);
+        assert_eq!(first, second, "match 包装应幂等");
+    }
+
+    #[test]
+    fn test_wrap_return_statements_in_ok_match_with_nested_match() {
+        let code = "fn foo(x: i32, y: i32) -> Result<i32, anyhow::Error> {\n    return match x {\n        1 => match y {\n            2 => 42,\n            _ => 0,\n        },\n        _ => -1,\n    };\n}";
+        let result = wrap_return_statements_in_ok(code);
+        assert!(
+            result.contains("return Ok(match x {"),
+            "应包装嵌套 match: {}",
+            result
+        );
+        assert!(result.contains("});"), "应在末行添加闭合括号: {}", result);
     }
 }

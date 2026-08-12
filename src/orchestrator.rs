@@ -1259,7 +1259,7 @@ where
     ) -> Vec<crate::extract::ExtractedFile> {
         use crate::extract::{
             apply_fixes_dry_run, apply_staged_fixes, apply_staged_fixes_preview,
-            compute_line_diff_unified, format_diff_summary,
+            compute_line_diff_unified, format_diff_summary, format_diff_unified_with_options,
         };
 
         let mut fixed_files = Vec::with_capacity(files.len());
@@ -1334,6 +1334,21 @@ where
                             println!("        {}", line);
                         }
 
+                        // Session 125: 打印统一 diff (类似 git diff)
+                        let unified = format_diff_unified_with_options(
+                            &file.content,
+                            &fixed_content,
+                            &file.path,
+                            &file.path,
+                            3,
+                        );
+                        if !unified.is_empty() {
+                            println!("        📝 统一 diff:");
+                            for line in unified.lines().take(20) {
+                                println!("          {}", line);
+                            }
+                        }
+
                         fixed_files.push(crate::extract::ExtractedFile {
                             content: fixed_content,
                             ..file
@@ -1348,6 +1363,21 @@ where
                         let summary = format_diff_summary(&diffs);
                         for line in summary.lines().take(10) {
                             println!("        {}", line);
+                        }
+
+                        // Session 125: 打印统一 diff
+                        let unified = format_diff_unified_with_options(
+                            &file.content,
+                            &fixed_content,
+                            &file.path,
+                            &file.path,
+                            3,
+                        );
+                        if !unified.is_empty() {
+                            println!("        📝 统一 diff:");
+                            for line in unified.lines().take(20) {
+                                println!("          {}", line);
+                            }
                         }
                     }
                     fixed_files.push(crate::extract::ExtractedFile {

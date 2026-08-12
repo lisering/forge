@@ -108,8 +108,14 @@ impl SystemPrompt {
             "❌ 禁止: 使用 quote! 宏时括号不配对 — #(#field),* 等重复语法需确保 () {} [] 配对 (Session 123)\n",
         );
         prompt.push_str(
-            "❌ 禁止: 使用 HashMap/HashSet/BTreeMap 等标准库类型但未导入 use std::collections::... (Session 124)\n\n",
-        );
+"❌ 禁止: 使用 HashMap/HashSet/BTreeMap 等标准库类型但未导入 use std::collections::... (Session 124)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 Arc/Mutex/RwLock/Cell/RefCell 等类型但未导入 use std::sync::... / use std::cell::... (Session 125)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 Command/Instant/Duration/TcpListener 等类型但未导入对应 use std::process::... / use std::time::... / use std::net::... (Session 125)\n\n",
+);
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -421,6 +427,46 @@ mod tests {
         assert!(
             prompt.contains("std::collections"),
             "系统 prompt 应包含 std::collections 导入约束 (Session 124)"
+        );
+    }
+
+    // ===== Session 125: std sync/cell/process/time/net 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_std_sync_cell_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Arc/Mutex/RwLock"),
+            "系统 prompt 应包含 Arc/Mutex/RwLock 导入约束 (Session 125)"
+        );
+        assert!(
+            prompt.contains("std::sync"),
+            "系统 prompt 应包含 std::sync 导入约束 (Session 125)"
+        );
+        assert!(
+            prompt.contains("std::cell"),
+            "系统 prompt 应包含 std::cell 导入约束 (Session 125)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_std_process_time_net_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Command"),
+            "系统 prompt 应包含 Command 导入约束 (Session 125)"
+        );
+        assert!(
+            prompt.contains("std::process"),
+            "系统 prompt 应包含 std::process 导入约束 (Session 125)"
+        );
+        assert!(
+            prompt.contains("std::time"),
+            "系统 prompt 应包含 std::time 导入约束 (Session 125)"
+        );
+        assert!(
+            prompt.contains("std::net"),
+            "系统 prompt 应包含 std::net 导入约束 (Session 125)"
         );
     }
 

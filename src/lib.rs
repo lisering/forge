@@ -213,12 +213,12 @@ pub use extract::{
     compute_line_diff_lcs, compute_line_diff_myers, compute_line_diff_unified,
     compute_line_diff_with_algorithm, detect_missing_result_returns, ensure_anyhow_import,
     ensure_anyhow_imports, ensure_anyhow_imports_extended, ensure_std_imports, extract_files,
-    format_diff_summary, format_diff_unified, generate_fix, merge_anyhow_imports, run_clippy_check,
-    strip_string_content, validate_rust_braces, validate_rust_code_quality,
-    validate_rust_code_quality_detailed, verify_idempotent, verify_idempotent_detailed,
-    wrap_last_expression_in_ok, wrap_return_statements_in_ok, DefaultExtractor, DiffAlgorithm,
-    FixPreview, IdempotencyResult, IssueType, LineDiff, LineDiffType, QualityIssue,
-    StagedFixPreview,
+    format_diff_summary, format_diff_unified, format_diff_unified_with_options, generate_fix,
+    merge_anyhow_imports, run_clippy_check, strip_string_content, validate_rust_braces,
+    validate_rust_code_quality, validate_rust_code_quality_detailed, verify_idempotent,
+    verify_idempotent_detailed, wrap_last_expression_in_ok, wrap_return_statements_in_ok,
+    DefaultExtractor, DiffAlgorithm, FixPreview, IdempotencyResult, IssueType, LineDiff,
+    LineDiffType, QualityIssue, StagedFixPreview,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{
