@@ -173,6 +173,205 @@ fn validate_toml(content: &str) -> Option<String> {
     }
 }
 
+/// 验证 Rust 代码的括号配对 (Session 113)
+///
+/// AI 生成的 Rust 代码 (特别是 GLM 模型) 可能存在括号不配对的问题:
+/// - `{` 和 `}` 不配对 (最常见的大括号匹配问题)
+/// - `(` 和 `)` 不配对
+/// - `[` 和 `]` 不配对
+///
+/// 本函数在跳过字符串、字符字面量和注释中的括号后, 检查括号配对。
+/// 返回 `Some(warning_message)` 如果检测到问题, `None` 如果格式正常。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::validate_rust_braces;
+///
+/// // 配对的代码 — 无问题
+/// assert!(validate_rust_braces("fn main() { let x = vec![1, 2, 3]; }").is_none());
+///
+/// // 缺少闭合大括号 — 应报告问题
+/// let result = validate_rust_braces("fn main() { let x = 42;");
+/// assert!(result.is_some());
+/// assert!(result.unwrap().contains("大括号"));
+/// ```
+pub fn validate_rust_braces(content: &str) -> Option<String> {
+    let mut issues = Vec::new();
+
+    // 状态机: 跟踪字符串/注释状态, 只在代码状态中计数括号
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Code,
+        LineComment,      // // ...
+        BlockComment,     // /* ... */
+        String,           // "..."
+        RawString(usize), // r#"..."# (hash_depth)
+    }
+
+    let mut state = State::Code;
+    let mut brace_open = 0i32;
+    let mut brace_close = 0i32;
+    let mut paren_open = 0i32;
+    let mut paren_close = 0i32;
+    let mut bracket_open = 0i32;
+    let mut bracket_close = 0i32;
+
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        state = match (state, c, next) {
+            // === 从代码状态转换 ===
+            (State::Code, '/', Some('/')) => {
+                i += 1; // 跳过第二个 /
+                State::LineComment
+            }
+            (State::Code, '/', Some('*')) => {
+                i += 1; // 跳过 *
+                State::BlockComment
+            }
+            (State::Code, '"', _) => State::String,
+            (State::Code, 'r', Some('"')) => {
+                // r"..." 或 r#"..."#
+                i += 1; // 跳过 "
+                let mut hash_depth = 0;
+                while i + 1 < chars.len() && chars[i + 1] == '#' {
+                    hash_depth += 1;
+                    i += 1;
+                }
+                State::RawString(hash_depth)
+            }
+            (State::Code, 'r', Some('#')) => {
+                // r#"..."#
+                let mut hash_depth = 0;
+                while i + 1 < chars.len() && chars[i + 1] == '#' {
+                    hash_depth += 1;
+                    i += 1;
+                }
+                if i + 1 < chars.len() && chars[i + 1] == '"' {
+                    i += 1; // 跳过 "
+                    State::RawString(hash_depth)
+                } else {
+                    // 不是 raw string, 当作普通字符
+                    State::Code
+                }
+            }
+            (State::Code, '\'', _) => {
+                // 可能是字符字面量 'x' 或生命周期 'a
+                // 简单判断: 如果后面是单字符+引号, 则是字符字面量
+                if chars.len() > i + 2 && chars[i + 2] == '\'' {
+                    i += 2; // 跳过字符和闭合引号
+                    State::Code
+                } else if chars.len() > i + 3 && chars[i + 1] == '\\' && chars[i + 3] == '\'' {
+                    // 转义字符 '\n' '\t' 等
+                    i += 3;
+                    State::Code
+                } else {
+                    // 可能是生命周期标注 'a — 不进入字符状态
+                    State::Code
+                }
+            }
+            (State::Code, '{', _) => {
+                brace_open += 1;
+                State::Code
+            }
+            (State::Code, '}', _) => {
+                brace_close += 1;
+                State::Code
+            }
+            (State::Code, '(', _) => {
+                paren_open += 1;
+                State::Code
+            }
+            (State::Code, ')', _) => {
+                paren_close += 1;
+                State::Code
+            }
+            (State::Code, '[', _) => {
+                bracket_open += 1;
+                State::Code
+            }
+            (State::Code, ']', _) => {
+                bracket_close += 1;
+                State::Code
+            }
+
+            // === Code 状态: 其他字符保持不变 ===
+            (State::Code, _, _) => State::Code,
+
+            // === 行注释: 遇到换行结束 ===
+            (State::LineComment, '\n', _) => State::Code,
+            (State::LineComment, _, _) => State::LineComment,
+
+            // === 块注释: 遇到 */ 结束 ===
+            (State::BlockComment, '*', Some('/')) => {
+                i += 1; // 跳过 /
+                State::Code
+            }
+            (State::BlockComment, _, _) => State::BlockComment,
+
+            // === 字符串: 遇到 " 结束 (处理转义) ===
+            (State::String, '\\', Some(_)) => {
+                i += 1; // 跳过转义字符
+                State::String
+            }
+            (State::String, '"', _) => State::Code,
+            (State::String, _, _) => State::String,
+
+            // === Raw 字符串: 遇到 "#...#" 结束 ===
+            (State::RawString(depth), '"', _) => {
+                // 检查后面是否有对应数量的 #
+                let mut found = 0;
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] == '#' && found < depth {
+                    found += 1;
+                    j += 1;
+                }
+                if found == depth {
+                    i = j - 1; // 跳过所有 #
+                    State::Code
+                } else {
+                    // " 后面没有足够的 #, 不是结束
+                    State::RawString(depth)
+                }
+            }
+            (State::RawString(d), _, _) => State::RawString(d),
+        };
+
+        i += 1;
+    }
+
+    // 检查括号配对
+    if brace_open != brace_close {
+        issues.push(format!(
+            "大括号不配对 ({} 个 {{ vs {} 个 }})",
+            brace_open, brace_close
+        ));
+    }
+    if paren_open != paren_close {
+        issues.push(format!(
+            "圆括号不配对 ({} 个 ( vs {} 个 ))",
+            paren_open, paren_close
+        ));
+    }
+    if bracket_open != bracket_close {
+        issues.push(format!(
+            "方括号不配对 ({} 个 [ vs {} 个 ])",
+            bracket_open, bracket_close
+        ));
+    }
+
+    if issues.is_empty() {
+        None
+    } else {
+        Some(issues.join("; "))
+    }
+}
+
 /// 从文本中提取所有代码文件
 pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
     // 清理 DeepSeek 等 UI 文本污染 (如 "复制下载" 按钮文本)
@@ -278,6 +477,12 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
             if f.path.ends_with(".toml") {
                 if let Some(issue) = validate_toml(&f.content) {
                     warn!("⚠ TOML 格式验证失败 [{}]: {}", f.path, issue);
+                }
+            }
+            // Session 113: 验证 Rust 代码括号配对
+            if f.path.ends_with(".rs") {
+                if let Some(issue) = validate_rust_braces(&f.content) {
+                    warn!("⚠ Rust 代码括号验证失败 [{}]: {}", f.path, issue);
                 }
             }
         }
@@ -617,5 +822,167 @@ name = "test"
     #[test]
     fn test_validate_toml_empty_content() {
         assert!(validate_toml("").is_some(), "空内容应报告缺少 [package]");
+    }
+
+    // ===== validate_rust_braces 测试 (Session 113) =====
+
+    #[test]
+    fn test_validate_rust_braces_balanced() {
+        let code = "fn main() { let x = vec![1, 2, 3]; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "配对的代码不应报告问题"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_missing_close_brace() {
+        let code = "fn main() { let x = 42;";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "缺少闭合大括号应报告问题");
+        assert!(result.unwrap().contains("大括号"), "应报告大括号不配对");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_extra_close_brace() {
+        let code = "fn main() { let x = 42; }}";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "多余闭合大括号应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_missing_paren() {
+        let code = "fn main() { let x = (1 + 2; }";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "缺少闭合圆括号应报告问题");
+        assert!(result.unwrap().contains("圆括号"), "应报告圆括号不配对");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_missing_bracket() {
+        let code = "fn main() { let x = vec![1, 2, 3; }";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "缺少闭合方括号应报告问题");
+        assert!(result.unwrap().contains("方括号"), "应报告方括号不配对");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_ignores_string_content() {
+        // 字符串中的括号不应影响计数
+        let code = r#"fn main() { let s = "}{)(["; }"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字符串中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_ignores_line_comment() {
+        let code = "fn main() { // comment with { } ( ) [ ]\n let x = 42; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "行注释中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_ignores_block_comment() {
+        let code = "fn main() { /* comment with { } ( ) [ ] */ let x = 42; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "块注释中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_ignores_raw_string() {
+        let code = r##"fn main() { let s = r#"{ } ( ) [ ]"#; }"##;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "raw string 中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_ignores_char_literal() {
+        let code = "fn main() { let c = '}'; let d = '{'; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字符字面量中的括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_handles_lifetime() {
+        let code = "fn foo<'a>(x: &'a str) { let y = x; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "生命周期标注不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_complex_code() {
+        let code = r#"
+use std::collections::HashMap;
+
+fn main() {
+    let mut map: HashMap<String, Vec<i32>> = HashMap::new();
+    map.insert("key".to_string(), vec![1, 2, 3]);
+    
+    for (k, v) in &map {
+        println!("{}: {:?}", k, v);
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "复杂 Rust 代码应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_empty() {
+        assert!(validate_rust_braces("").is_none(), "空内容不应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_nested() {
+        let code = "fn main() { if true { if false { } else { } } }";
+        assert!(validate_rust_braces(code).is_none(), "嵌套大括号应正确配对");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_with_escape_in_string() {
+        let code = r#"fn main() { let s = "Hello \\\"World{"; }"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字符串中的转义字符和括号不应影响计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_glm_style_truncation() {
+        // 模拟 GLM 模型截断代码 (缺少最后的闭合大括号)
+        let code = r#"
+pub struct Config {
+    pub name: String,
+    pub value: i32,
+}
+
+impl Config {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            value: 0,
+        }
+    }
+    
+    pub fn validate(&self) -> bool {
+        !self.name.is_empty() && self.value >= 0
+    }
+"#;
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "GLM 截断代码应报告大括号不配对");
     }
 }

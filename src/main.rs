@@ -24,7 +24,7 @@ use forge::site_health::SiteHealthChecker;
 use forge::testrunner;
 use forge::trace_store::StorageBackend;
 use forge::traits::{
-    ChatClient, ClarificationChecker, FileExtractor, HumanInteraction, TestRunner,
+    ChatClient, ClarificationChecker, FileExtractor, HumanInteraction, TestRunner, WebTool,
 };
 use forge::workspace::Workspace;
 use forge::BrowserManager;
@@ -278,6 +278,16 @@ enum Commands {
         /// 0 表示禁用 (默认)。建议值 3~5。
         #[arg(long, default_value = "0")]
         memory_context: usize,
+
+        /// 启用 Web 工具 — AI 自主网页搜索/文档查阅能力 (Session 113)
+        ///
+        /// 启用后, Forge 创建一个独立的浏览器标签页用于网页搜索:
+        /// - 编译错误自动搜索: 通过 WebTool 搜索解决方案, 追加到修复 prompt
+        /// - `/search` slash command: AI 自主请求搜索
+        ///
+        /// 需要连接到 Chrome 浏览器。默认禁用。
+        #[arg(long)]
+        web_tool: bool,
 
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
@@ -842,6 +852,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             failover_max_failures,
             failover_cooldown,
             memory_context,
+            web_tool: enable_web_tool,
             profile: _,
             profile_output: _,
         } => {
@@ -950,6 +961,38 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             handler_chain.add(Box::new(MemoryUpdaterHandler::new()));
             let handler_chain = Some(handler_chain);
 
+            // === Session 113: Web 工具集成 — 创建独立标签页用于网页搜索 ===
+            //
+            // 当 --web-tool 启用时, 创建一个独立的浏览器标签页用于网页搜索:
+            // - 编译错误自动搜索: 从错误中提取关键词 → Google 搜索 → 结果注入修复 prompt
+            // - /search slash command: AI 自主请求搜索
+            //
+            // 使用独立标签页避免搜索导航影响 AI 聊天页面。
+            let web_tool: Option<Box<dyn WebTool>> = if enable_web_tool {
+                match cdp::create_tab(port, "about:blank").await {
+                    Ok(tab_info) => match forge::cdp::CdpSession::connect(&tab_info.ws_url).await {
+                        Ok(session) => {
+                            let cdp_web_tool = forge::web_tool_client::CdpWebTool::new(session);
+                            info!("🔍 Web 工具已启用 (独立标签页: {})", tab_info.id);
+                            println!("🔍 Web 工具已启用 — 编译错误自动搜索 + /search 指令");
+                            Some(Box::new(cdp_web_tool) as Box<dyn WebTool>)
+                        }
+                        Err(e) => {
+                            warn!("Web 工具标签页连接失败 (非致命): {}", e);
+                            println!("⚠ Web 工具启用失败 (连接错误), 继续不使用 Web 工具");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!("创建 Web 工具标签页失败 (非致命): {}", e);
+                        println!("⚠ Web 工具启用失败 (无法创建标签页), 继续不使用 Web 工具");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // 构建聊天客户端: 单标签页或多网站自动切换
             if auto_failover && manager.tabs.len() >= 2 {
                 // === 多网站自动切换模式 ===
@@ -1001,6 +1044,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         handler_chain,
                         trace_backend,
                         memory_context,
+                        web_tool,
                     )
                     .await?;
 
@@ -1032,6 +1076,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         handler_chain,
                         trace_backend,
                         memory_context,
+                        web_tool,
                     )
                     .await?;
 
@@ -1081,6 +1126,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         handler_chain,
                         trace_backend,
                         memory_context,
+                        web_tool,
                     )
                     .await?;
                 } else {
@@ -1109,6 +1155,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         handler_chain,
                         trace_backend,
                         memory_context,
+                        web_tool,
                     )
                     .await?;
                 }
@@ -1224,6 +1271,7 @@ async fn run_with_clarifier<C, Q>(
     handler_chain: Option<HandlerChain>,
     trace_backend: StorageBackend,
     memory_context: usize,
+    web_tool: Option<Box<dyn WebTool>>,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1250,6 +1298,11 @@ where
     .with_loop_detection(loop_detection)
     .with_slash_commands(slash_commands)
     .with_memory_context(memory_context);
+
+    // Session 113: Web 工具集成
+    if let Some(tool) = web_tool {
+        orch = orch.with_web_tool(tool);
+    }
 
     // Session 69: 根据配置选择 trace 后端
     if dev_trace {

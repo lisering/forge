@@ -940,6 +940,18 @@ where
         self
     }
 
+    /// 启用 Web 工具 — AI 自主网页搜索/文档查阅能力 (Session 113)
+    ///
+    /// 启用后, Forge 可以在开发流程中自主搜索文档、查阅网页内容:
+    /// - 编译错误自动搜索: 通过 WebTool 搜索解决方案
+    /// - `/search` slash command: AI 自主请求搜索
+    ///
+    /// 需要传入实现 `WebTool` trait 的实例 (如 `CdpWebTool` 或 `MockWebTool`)。
+    pub fn with_web_tool(mut self, tool: Box<dyn WebTool>) -> Self {
+        self.web_tool = Some(tool);
+        self
+    }
+
     /// 启用自动恢复 — Chrome 断连后自动重连 (24h 可靠性)
     ///
     /// 启用后, 在每次 send_message 前检查 Chrome 连接状态,
