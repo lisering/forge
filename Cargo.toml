@@ -14,7 +14,7 @@ authors = ["john"]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.23"
 futures-util = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
