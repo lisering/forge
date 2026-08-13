@@ -139,7 +139,25 @@ impl SystemPrompt {
         );
         prompt.push_str(
 "❌ 禁止: 使用 IterTools/iproduct!/izip!/multiunzip! (itertools) / #[derive(Error)] (thiserror) / #[async_trait] (async_trait) 等外部 crate 类型或宏但未导入 use itertools::... / use thiserror::... / use async_trait::... (Session 129)\n\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 RawFd/OwnedFd/BorrowedFd (std::os::unix::io) / RawHandle/OwnedHandle/BorrowedHandle (std::os::windows::io) 等平台特定类型但未导入 use std::os::unix::io::... / use std::os::windows::io::... (Session 130)\n",
+);
+        prompt.push_str(
+            "❌ 禁止: 使用 Arg/Subcommand/ArgAction (clap) / Uuid (uuid) / Url (url) / Level/LevelFilter/log! (log) / EnvFilter (tracing_subscriber) 等外部 crate 类型或宏但未导入 use clap::... / use uuid::... / use url::... / use log::... / use tracing_subscriber::... (Session 130)\n\n",
         );
+        prompt.push_str(
+ "❌ 禁止: 使用 Rng/ThreadRng (rand) / DashMap (dashmap) / ParallelIterator/.par_iter() (rayon) / Array1/Array2 (ndarray) / StreamExt/Stream (tokio_stream) 等外部 crate 类型或 trait 方法但未导入 use rand::... / use dashmap::... / use rayon::prelude::... / use ndarray::... / use tokio_stream::... (Session 131)\n",
+ );
+        prompt.push_str(
+  "❌ 禁止: 调用 .lock() 但未导入 use std::sync::Mutex; / 调用 .gen_range() 但未导入 use rand::Rng; / 调用 .par_iter() 但未导入 use rayon::prelude::ParallelIterator; (Session 131 trait 方法检测)\n\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 Router/Json/Handler/IntoResponse (axum) / Tera/Context (tera) / #[derive(Template)] (askama) / Connection/Statement/Row/params! (rusqlite) / Cmd/AsyncConnection (redis) 等外部 crate 类型或宏但未导入 use axum::... / use tera::... / use askama::... / use rusqlite::... / use redis::... (Session 132)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .read()/.write() 但未导入 use std::sync::RwLock; / 调用 .send() 但未导入 use std::sync::mpsc::Sender; / 调用 .recv() 但未导入 use std::sync::mpsc::Receiver; (Session 132 trait 方法检测)\n\n",
+  );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -729,6 +747,157 @@ mod tests {
         assert!(
             prompt.contains("OsStr"),
             "系统 prompt 应包含 OsStr 导入约束 (Session 129)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s130_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("clap"),
+            "系统 prompt 应包含 clap 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("uuid"),
+            "系统 prompt 应包含 uuid 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("url"),
+            "系统 prompt 应包含 url 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("tracing_subscriber"),
+            "系统 prompt 应包含 tracing_subscriber 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("RawFd"),
+            "系统 prompt 应包含 RawFd 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("RawHandle"),
+            "系统 prompt 应包含 RawHandle 导入约束 (Session 130)"
+        );
+        assert!(
+            prompt.contains("EnvFilter"),
+            "系统 prompt 应包含 EnvFilter 导入约束 (Session 130)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s131_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("rand"),
+            "系统 prompt 应包含 rand 导入约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains("dashmap"),
+            "系统 prompt 应包含 dashmap 导入约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains("rayon"),
+            "系统 prompt 应包含 rayon 导入约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains("ndarray"),
+            "系统 prompt 应包含 ndarray 导入约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains("tokio_stream"),
+            "系统 prompt 应包含 tokio_stream 导入约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains("ParallelIterator"),
+            "系统 prompt 应包含 ParallelIterator 导入约束 (Session 131)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s131_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".lock()"),
+            "系统 prompt 应包含 .lock() trait 方法检测约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains(".gen_range()"),
+            "系统 prompt 应包含 .gen_range() trait 方法检测约束 (Session 131)"
+        );
+        assert!(
+            prompt.contains(".par_iter()"),
+            "系统 prompt 应包含 .par_iter() trait 方法检测约束 (Session 131)"
+        );
+    }
+
+    // ===== Session 132: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s132_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("axum"),
+            "系统 prompt 应包含 axum 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("tera"),
+            "系统 prompt 应包含 tera 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("askama"),
+            "系统 prompt 应包含 askama 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("rusqlite"),
+            "系统 prompt 应包含 rusqlite 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("redis"),
+            "系统 prompt 应包含 redis 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("Router"),
+            "系统 prompt 应包含 Router 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("params!"),
+            "系统 prompt 应包含 params! 宏导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("AsyncConnection"),
+            "系统 prompt 应包含 AsyncConnection 导入约束 (Session 132)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s132_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".read()"),
+            "系统 prompt 应包含 .read() trait 方法检测约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains(".write()"),
+            "系统 prompt 应包含 .write() trait 方法检测约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains(".send()"),
+            "系统 prompt 应包含 .send() trait 方法检测约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains(".recv()"),
+            "系统 prompt 应包含 .recv() trait 方法检测约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("RwLock"),
+            "系统 prompt 应包含 RwLock 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("mpsc::Sender"),
+            "系统 prompt 应包含 mpsc::Sender 导入约束 (Session 132)"
+        );
+        assert!(
+            prompt.contains("mpsc::Receiver"),
+            "系统 prompt 应包含 mpsc::Receiver 导入约束 (Session 132)"
         );
     }
 }

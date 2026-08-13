@@ -3833,6 +3833,217 @@ pub fn compute_line_diff_unified(original: &str, fixed: &str) -> Vec<LineDiff> {
     compute_line_diff_with_algorithm(original, fixed, DiffAlgorithm::Auto)
 }
 
+/// Diff 算法对比结果项 (Session 131)
+///
+/// 记录单个 diff 算法的运行结果统计信息。
+///
+/// # 字段
+///
+/// - `algorithm`: 算法名称
+/// - `diff_count`: 检测到的差异行数
+/// - `added_count`: Added 行数
+/// - `removed_count`: Removed 行数
+/// - `modified_count`: Modified 行数
+/// - `original_lines`: 原始文本行数
+/// - `fixed_lines`: 修复文本行数
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiffComparisonEntry {
+    /// 算法名称
+    pub algorithm: String,
+    /// 差异行总数
+    pub diff_count: usize,
+    /// Added 行数
+    pub added_count: usize,
+    /// Removed 行数
+    pub removed_count: usize,
+    /// Modified 行数
+    pub modified_count: usize,
+    /// 原始文本行数
+    pub original_lines: usize,
+    /// 修复文本行数
+    pub fixed_lines: usize,
+}
+
+/// Diff 算法对比结果 (Session 131)
+///
+/// 包含所有 diff 算法 (Basic/LCS/Myers/Hirschberg) 的对比数据,
+/// 可用于选择最优算法和验证算法一致性。
+///
+/// # 字段
+///
+/// - `original_lines`: 原始文本行数
+/// - `fixed_lines`: 修复文本行数
+/// - `entries`: 各算法的对比结果
+/// - `all_consistent`: 所有算法是否产生相同的差异行数
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiffComparisonResult {
+    /// 原始文本行数
+    pub original_lines: usize,
+    /// 修复文本行数
+    pub fixed_lines: usize,
+    /// 各算法对比结果
+    pub entries: Vec<DiffComparisonEntry>,
+    /// 所有算法差异行数是否一致
+    pub all_consistent: bool,
+}
+
+impl DiffComparisonEntry {
+    /// 从算法名称和 diff 结果创建对比项
+    fn from_diffs(
+        algorithm: &str,
+        diffs: &[LineDiff],
+        original_lines: usize,
+        fixed_lines: usize,
+    ) -> Self {
+        let added_count = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Added)
+            .count();
+        let removed_count = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Removed)
+            .count();
+        let modified_count = diffs
+            .iter()
+            .filter(|d| d.diff_type == LineDiffType::Modified)
+            .count();
+        Self {
+            algorithm: algorithm.to_string(),
+            diff_count: diffs.len(),
+            added_count,
+            removed_count,
+            modified_count,
+            original_lines,
+            fixed_lines,
+        }
+    }
+}
+
+/// 对比所有 diff 算法的性能和结果 (Session 131)
+///
+/// 运行 Basic/LCS/Myers/Hirschberg 四种 diff 算法,
+/// 收集各自的差异行数统计, 并检查结果一致性。
+///
+/// # 返回
+///
+/// 返回 `DiffComparisonResult`, 包含:
+/// - 各算法的差异行数 (Added/Removed/Modified)
+/// - 一致性检查结果 (所有算法是否产生相同差异行数)
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::compare_diff_algorithms;
+///
+/// let original = "fn foo() {\n}\n";
+/// let fixed = "fn foo() {\n    let x = 42;\n}\n";
+/// let result = compare_diff_algorithms(original, fixed);
+/// assert_eq!(result.entries.len(), 4, "应有 4 种算法结果");
+/// assert!(result.entries.iter().any(|e| e.algorithm == "Basic"));
+/// assert!(result.entries.iter().any(|e| e.algorithm == "LCS"));
+/// assert!(result.entries.iter().any(|e| e.algorithm == "Myers"));
+/// assert!(result.entries.iter().any(|e| e.algorithm == "Hirschberg"));
+/// ```
+pub fn compare_diff_algorithms(original: &str, fixed: &str) -> DiffComparisonResult {
+    let original_lines = original.lines().count();
+    let fixed_lines = fixed.lines().count();
+
+    let basic_diffs = compute_line_diff(original, fixed);
+    let lcs_diffs = compute_line_diff_lcs(original, fixed);
+    let myers_diffs = compute_line_diff_myers(original, fixed);
+    let hirschberg_diffs = compute_line_diff_hirschberg(original, fixed);
+
+    let entries = vec![
+        DiffComparisonEntry::from_diffs("Basic", &basic_diffs, original_lines, fixed_lines),
+        DiffComparisonEntry::from_diffs("LCS", &lcs_diffs, original_lines, fixed_lines),
+        DiffComparisonEntry::from_diffs("Myers", &myers_diffs, original_lines, fixed_lines),
+        DiffComparisonEntry::from_diffs(
+            "Hirschberg",
+            &hirschberg_diffs,
+            original_lines,
+            fixed_lines,
+        ),
+    ];
+
+    // 检查一致性: 所有算法的差异行数是否相同
+    let diff_counts: Vec<usize> = entries.iter().map(|e| e.diff_count).collect();
+    let all_consistent = diff_counts.iter().all(|&c| c == diff_counts[0]);
+
+    DiffComparisonResult {
+        original_lines,
+        fixed_lines,
+        entries,
+        all_consistent,
+    }
+}
+
+/// 格式化 diff 算法对比结果为表格字符串 (Session 131)
+///
+/// 输出人类可读的对比表格, 包含各算法的差异行数统计。
+///
+/// # 输出格式
+///
+/// ```text
+/// Diff Algorithm Comparison
+/// =========================
+/// Original: 5 lines | Fixed: 7 lines
+/// Consistent: Yes
+///
+/// | Algorithm   | Total | Added | Removed | Modified |
+/// |-------------|-------|-------|---------|----------|
+/// | Basic       |     2 |     2 |       0 |        0 |
+/// | LCS         |     2 |     2 |       0 |        0 |
+/// | Myers       |     2 |     2 |       0 |        0 |
+/// | Hirschberg  |     2 |     2 |       0 |        0 |
+/// ```
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{compare_diff_algorithms, format_diff_comparison};
+///
+/// let result = compare_diff_algorithms("a\nb", "a\nc");
+/// let table = format_diff_comparison(&result);
+/// assert!(table.contains("Algorithm"), "应包含表头");
+/// assert!(table.contains("Basic"), "应包含 Basic");
+/// assert!(table.contains("Hirschberg"), "应包含 Hirschberg");
+/// ```
+pub fn format_diff_comparison(result: &DiffComparisonResult) -> String {
+    let mut output = String::new();
+
+    output.push_str("Diff Algorithm Comparison\n");
+    output.push_str("=========================\n");
+    output.push_str(&format!(
+        "Original: {} lines | Fixed: {} lines\n",
+        result.original_lines, result.fixed_lines
+    ));
+    output.push_str(&format!(
+        "Consistent: {}\n\n",
+        if result.all_consistent { "Yes" } else { "No" }
+    ));
+
+    output.push_str("| Algorithm   | Total | Added | Removed | Modified |\n");
+    output.push_str("|-------------|-------|-------|---------|----------|\n");
+
+    for entry in &result.entries {
+        output.push_str(&format!(
+            "| {:<11} | {:>5} | {:>5} | {:>7} | {:>8} |\n",
+            entry.algorithm,
+            entry.diff_count,
+            entry.added_count,
+            entry.removed_count,
+            entry.modified_count
+        ));
+    }
+
+    // 移除末尾换行
+    if output.ends_with('\n') {
+        output.pop();
+    }
+
+    output
+}
+
 /// 格式化行差异摘要 (Session 122)
 ///
 /// 将 `Vec<LineDiff>` 格式化为人类可读的差异摘要字符串。
@@ -4802,6 +5013,14 @@ pub fn ensure_std_imports(content: &str) -> String {
         // ffi additional (Session 129)
         ("OsStr", "std::ffi"),
         ("OsString", "std::ffi"),
+        // os::unix::io (Session 130)
+        ("RawFd", "std::os::unix::io"),
+        ("OwnedFd", "std::os::unix::io"),
+        ("BorrowedFd", "std::os::unix::io"),
+        // os::windows::io (Session 130)
+        ("RawHandle", "std::os::windows::io"),
+        ("OwnedHandle", "std::os::windows::io"),
+        ("BorrowedHandle", "std::os::windows::io"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -4908,6 +5127,24 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `iproduct!` / `izip!` / `multiunzip!` → `use itertools::{...};` (Session 129)
 /// - `#[derive(Error)]` → `use thiserror::Error;` (Session 129)
 /// - `#[async_trait]` → `use async_trait::async_trait;` (Session 129)
+/// - `Arg` / `Subcommand` / `ArgAction` → `use clap::{...};` (Session 130)
+/// - `Uuid` → `use uuid::Uuid;` (Session 130)
+/// - `Url` → `use url::Url;` (Session 130)
+/// - `Level` / `LevelFilter` / `log!` → `use log::{...};` (Session 130)
+/// - `EnvFilter` → `use tracing_subscriber::EnvFilter;` (Session 130)
+/// - `Rng` / `ThreadRng` → `use rand::Rng;` / `use rand::rngs::ThreadRng;` (Session 131)
+/// - `DashMap` → `use dashmap::DashMap;` (Session 131)
+/// - `ParallelIterator` → `use rayon::prelude::ParallelIterator;` (Session 131)
+/// - `Array1` / `Array2` → `use ndarray::{Array1, Array2};` (Session 131)
+/// - `StreamExt` / `Stream` → `use tokio_stream::{StreamExt, Stream};` (Session 131)
+/// - `.gen_range()` / `.fill()` → `use rand::Rng;` (Session 131)
+/// - `.par_iter()` / `.par_iter_mut()` → `use rayon::prelude::ParallelIterator;` (Session 131)
+/// - `Router` / `Json` / `Handler` / `IntoResponse` → `use axum::{...};` (Session 132)
+/// - `Tera` / `Context` → `use tera::{...};` (Session 132)
+/// - `#[derive(Template)]` → `use askama::Template;` (Session 132)
+/// - `Connection` / `Statement` / `Row` → `use rusqlite::{...};` (Session 132)
+/// - `params!` → `use rusqlite::params;` (Session 132)
+/// - `Cmd` / `AsyncConnection` → `use redis::{...};` (Session 132)
 ///
 /// # 规则
 ///
@@ -4962,6 +5199,49 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("JoinHandle", "tokio::task"),
         // itertools (Session 129)
         ("IterTools", "itertools"),
+        // clap (Session 130)
+        ("Arg", "clap"),
+        ("Subcommand", "clap"),
+        ("ArgAction", "clap"),
+        // uuid (Session 130)
+        ("Uuid", "uuid"),
+        // url (Session 130)
+        ("Url", "url"),
+        // log (Session 130)
+        ("Level", "log"),
+        ("LevelFilter", "log"),
+        // tracing_subscriber (Session 130)
+        ("EnvFilter", "tracing_subscriber"),
+        // rand (Session 131)
+        ("Rng", "rand"),
+        ("ThreadRng", "rand::rngs"),
+        // dashmap (Session 131)
+        ("DashMap", "dashmap"),
+        // rayon (Session 131)
+        ("ParallelIterator", "rayon::prelude"),
+        // ndarray (Session 131)
+        ("Array1", "ndarray"),
+        ("Array2", "ndarray"),
+        // tokio_stream (Session 131)
+        ("StreamExt", "tokio_stream"),
+        ("Stream", "tokio_stream"),
+        // axum (Session 132)
+        ("Router", "axum"),
+        ("Json", "axum"),
+        ("Handler", "axum"),
+        ("IntoResponse", "axum"),
+        // tera (Session 132)
+        ("Tera", "tera"),
+        ("Context", "tera"),
+        // askama (Session 132)
+        ("Template", "askama"),
+        // rusqlite (Session 132)
+        ("Connection", "rusqlite"),
+        ("Statement", "rusqlite"),
+        ("Row", "rusqlite"),
+        // redis (Session 132)
+        ("Cmd", "redis"),
+        ("AsyncConnection", "redis"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -5209,6 +5489,97 @@ pub fn ensure_external_imports(content: &str) -> String {
         }
     }
 
+    // 检测 rand Rng trait 方法调用 (Session 131)
+    // .gen_range( / .fill( 方法需要 Rng trait 在作用域中
+    let rand_methods: &[&str] = &["gen_range", "fill"];
+    let mut rand_method_found = false;
+    for &method_name in rand_methods {
+        let method_call = format!(".{}(", method_name);
+        if content.contains(&method_call) {
+            rand_method_found = true;
+            break;
+        }
+    }
+
+    if rand_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use rand::Rng;")
+                || (trimmed.contains("use rand::{") && contains_type_usage(trimmed, "Rng"))
+                || trimmed.starts_with("use rand::*;")
+        }) || has_covering_glob_import(&glob_imports, "rand");
+
+        if !already_imported {
+            needed.entry("rand").or_default().push("Rng");
+        }
+    }
+
+    // 检测 rayon ParallelIterator trait 方法调用 (Session 131)
+    // .par_iter( / .par_iter_mut( 方法需要 ParallelIterator trait 在作用域中
+    let rayon_methods: &[&str] = &["par_iter", "par_iter_mut"];
+    let mut rayon_method_found = false;
+    for &method_name in rayon_methods {
+        let method_call = format!(".{}(", method_name);
+        if content.contains(&method_call) {
+            rayon_method_found = true;
+            break;
+        }
+    }
+
+    if rayon_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use rayon::prelude::ParallelIterator;")
+                || (trimmed.contains("use rayon::prelude::{")
+                    && contains_type_usage(trimmed, "ParallelIterator"))
+                || trimmed.starts_with("use rayon::prelude::*;")
+                || trimmed.starts_with("use rayon::*;")
+        }) || has_covering_glob_import(&glob_imports, "rayon");
+
+        if !already_imported {
+            needed
+                .entry("rayon::prelude")
+                .or_default()
+                .push("ParallelIterator");
+        }
+    }
+
+    // 检测 clap derive 宏使用 (Session 130)
+    // #[derive(Subcommand)] → use clap::Subcommand;
+    // #[derive(Arg)] → use clap::Arg;
+    // 这些已在 type_modules 中检测, 但 #[derive(Subcommand)] 也需要检测
+    // (contains_type_usage 已覆盖 #[derive(Arg)] 中的 Arg)
+
+    // 检测 log::log! 宏使用 (Session 130)
+    // log!(Level::Info, "msg") → use log::log;
+    if content.contains("log!(") && !content.contains("log::log!") {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use log::log;")
+                || (trimmed.contains("use log::{") && contains_type_usage(trimmed, "log"))
+                || trimmed.starts_with("use log::*;")
+        }) || has_covering_glob_import(&glob_imports, "log");
+
+        if !already_imported {
+            needed.entry("log").or_default().push("log");
+        }
+    }
+
+    // 检测 rusqlite params! 宏使用 (Session 132)
+    // params![1, 2, 3] → use rusqlite::params;
+    if content.contains("params![") && !content.contains("rusqlite::params") {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use rusqlite::params;")
+                || (trimmed.contains("use rusqlite::{") && contains_type_usage(trimmed, "params"))
+                || trimmed.starts_with("use rusqlite::*;")
+        }) || has_covering_glob_import(&glob_imports, "rusqlite");
+
+        if !already_imported {
+            needed.entry("rusqlite").or_default().push("params");
+        }
+    }
+
     if needed.is_empty() {
         return content.to_string();
     }
@@ -5362,6 +5733,12 @@ pub struct ImportIssue {
 /// - `anyhow!` → `use anyhow::anyhow;`
 /// - `.context(` / `.with_context(` → `use anyhow::Context;`
 /// - 所有 `ensure_std_imports` 检测的 std 类型
+/// - `.lock()` → `use std::sync::Mutex;` (Session 131)
+/// - `.par_iter()` / `.par_iter_mut()` → `use rayon::prelude::ParallelIterator;` (Session 131)
+/// - `.gen_range()` / `.fill()` → `use rand::Rng;` (Session 131)
+/// - `.read()` / `.write()` → `use std::sync::RwLock;` (Session 132)
+/// - `.send()` → `use std::sync::mpsc::Sender;` (Session 132)
+/// - `.recv()` → `use std::sync::mpsc::Receiver;` (Session 132)
 ///
 /// # 示例
 ///
@@ -5549,6 +5926,14 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         // ffi additional (Session 129)
         ("OsStr", "std::ffi"),
         ("OsString", "std::ffi"),
+        // os::unix::io (Session 130)
+        ("RawFd", "std::os::unix::io"),
+        ("OwnedFd", "std::os::unix::io"),
+        ("BorrowedFd", "std::os::unix::io"),
+        // os::windows::io (Session 130)
+        ("RawHandle", "std::os::windows::io"),
+        ("OwnedHandle", "std::os::windows::io"),
+        ("BorrowedHandle", "std::os::windows::io"),
         // External crates (Session 128)
         ("Serialize", "serde"),
         ("Deserialize", "serde"),
@@ -5565,6 +5950,37 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("JoinHandle", "tokio::task"),
         // External crates (Session 129)
         ("IterTools", "itertools"),
+        // External crates (Session 130)
+        ("Arg", "clap"),
+        ("Subcommand", "clap"),
+        ("ArgAction", "clap"),
+        ("Uuid", "uuid"),
+        ("Url", "url"),
+        ("Level", "log"),
+        ("LevelFilter", "log"),
+        ("EnvFilter", "tracing_subscriber"),
+        // External crates (Session 131)
+        ("Rng", "rand"),
+        ("ThreadRng", "rand::rngs"),
+        ("DashMap", "dashmap"),
+        ("ParallelIterator", "rayon::prelude"),
+        ("Array1", "ndarray"),
+        ("Array2", "ndarray"),
+        ("StreamExt", "tokio_stream"),
+        ("Stream", "tokio_stream"),
+        // External crates (Session 132)
+        ("Router", "axum"),
+        ("Json", "axum"),
+        ("Handler", "axum"),
+        ("IntoResponse", "axum"),
+        ("Tera", "tera"),
+        ("Context", "tera"),
+        ("Template", "askama"),
+        ("Connection", "rusqlite"),
+        ("Statement", "rusqlite"),
+        ("Row", "rusqlite"),
+        ("Cmd", "redis"),
+        ("AsyncConnection", "redis"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -5641,6 +6057,194 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                 module_path: "itertools".to_string(),
                 usage_line: method_line,
             });
+        }
+    }
+
+    // 检测 std::sync::Mutex 的 .lock() 方法调用 (Session 131)
+    // .lock() 是 Mutex 的核心方法, 如果调用 .lock() 但未导入 Mutex, 可能缺少导入
+    if content.contains(".lock()") || content.contains(".lock().") {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::sync::Mutex;")
+                || (trimmed.contains("use std::sync::{") && contains_type_usage(trimmed, "Mutex"))
+                || trimmed.starts_with("use std::sync::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            // 找到第一个 .lock() 的行
+            for (i, line) in lines.iter().enumerate() {
+                if line.contains(".lock()") || line.contains(".lock().") {
+                    issues.push(ImportIssue {
+                        type_name: "Mutex".to_string(),
+                        module_path: "std::sync".to_string(),
+                        usage_line: i + 1,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    // 检测 rayon ParallelIterator trait 方法调用 (Session 131)
+    // .par_iter( / .par_iter_mut( 方法需要 ParallelIterator trait
+    let rayon_methods: &[&str] = &["par_iter", "par_iter_mut"];
+    let mut rayon_method_found = false;
+    let mut rayon_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &method_name in rayon_methods {
+            let method_call = format!(".{}(", method_name);
+            if line.contains(&method_call) {
+                rayon_method_found = true;
+                rayon_method_line = i + 1;
+                break;
+            }
+        }
+        if rayon_method_found {
+            break;
+        }
+    }
+
+    if rayon_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use rayon::prelude::ParallelIterator;")
+                || (trimmed.contains("use rayon::prelude::{")
+                    && contains_type_usage(trimmed, "ParallelIterator"))
+                || trimmed.starts_with("use rayon::prelude::*;")
+                || trimmed.starts_with("use rayon::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "ParallelIterator".to_string(),
+                module_path: "rayon::prelude".to_string(),
+                usage_line: rayon_method_line,
+            });
+        }
+    }
+
+    // 检测 rand Rng trait 方法调用 (Session 131)
+    // .gen_range( / .fill( 方法需要 Rng trait
+    let rand_methods: &[&str] = &["gen_range", "fill"];
+    let mut rand_method_found = false;
+    let mut rand_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &method_name in rand_methods {
+            let method_call = format!(".{}(", method_name);
+            if line.contains(&method_call) {
+                rand_method_found = true;
+                rand_method_line = i + 1;
+                break;
+            }
+        }
+        if rand_method_found {
+            break;
+        }
+    }
+
+    if rand_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use rand::Rng;")
+                || (trimmed.contains("use rand::{") && contains_type_usage(trimmed, "Rng"))
+                || trimmed.starts_with("use rand::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "Rng".to_string(),
+                module_path: "rand".to_string(),
+                usage_line: rand_method_line,
+            });
+        }
+    }
+
+    // 检测 std::sync::RwLock 的 .read() / .write() 方法调用 (Session 132)
+    // .read() / .write() 是 RwLock 的核心方法, 如果调用但未导入 RwLock, 可能缺少导入
+    let rwlock_methods: &[&str] = &["read", "write"];
+    let mut rwlock_method_found = false;
+    let mut rwlock_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &method_name in rwlock_methods {
+            let method_call = format!(".{}()", method_name);
+            if line.contains(&method_call) {
+                rwlock_method_found = true;
+                rwlock_method_line = i + 1;
+                break;
+            }
+        }
+        if rwlock_method_found {
+            break;
+        }
+    }
+
+    if rwlock_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::sync::RwLock;")
+                || (trimmed.contains("use std::sync::{") && contains_type_usage(trimmed, "RwLock"))
+                || trimmed.starts_with("use std::sync::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "RwLock".to_string(),
+                module_path: "std::sync".to_string(),
+                usage_line: rwlock_method_line,
+            });
+        }
+    }
+
+    // 检测 std::sync::mpsc 的 .send() / .recv() 方法调用 (Session 132)
+    // .send() 是 Sender 的方法, .recv() 是 Receiver 的方法
+    let mpsc_methods: &[&str] = &["send", "recv"];
+    let mut mpsc_method_found = false;
+    let mut mpsc_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &method_name in mpsc_methods {
+            let method_call = format!(".{}(", method_name);
+            if line.contains(&method_call) {
+                mpsc_method_found = true;
+                mpsc_method_line = i + 1;
+                break;
+            }
+        }
+        if mpsc_method_found {
+            break;
+        }
+    }
+
+    if mpsc_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::sync::mpsc::")
+                || (trimmed.contains("use std::sync::mpsc::{")
+                    && (contains_type_usage(trimmed, "Sender")
+                        || contains_type_usage(trimmed, "Receiver")))
+                || trimmed.starts_with("use std::sync::mpsc::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            // 检测具体是 Sender 还是 Receiver
+            let has_send = content.contains(".send(");
+            let has_recv = content.contains(".recv(");
+            if has_send {
+                issues.push(ImportIssue {
+                    type_name: "Sender".to_string(),
+                    module_path: "std::sync::mpsc".to_string(),
+                    usage_line: mpsc_method_line,
+                });
+            }
+            if has_recv {
+                issues.push(ImportIssue {
+                    type_name: "Receiver".to_string(),
+                    module_path: "std::sync::mpsc".to_string(),
+                    usage_line: mpsc_method_line,
+                });
+            }
         }
     }
 
@@ -12671,6 +13275,126 @@ fn foo(
         );
     }
 
+    // ===== Session 130: ensure_std_imports 平台特定类型测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_raw_fd() {
+        let code = "fn foo(fd: RawFd) -> RawFd { fd }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::unix::io::RawFd;"),
+            "应添加 RawFd 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_owned_fd() {
+        let code = "fn foo() -> OwnedFd { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::unix::io::OwnedFd;"),
+            "应添加 OwnedFd 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_borrowed_fd() {
+        let code = "fn foo(fd: BorrowedFd) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::unix::io::BorrowedFd;"),
+            "应添加 BorrowedFd 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_unix_io_merged() {
+        let code = "fn foo(fd: RawFd, owned: OwnedFd, borrowed: BorrowedFd) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::unix::io::{BorrowedFd, OwnedFd, RawFd};"),
+            "应合并 unix::io 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_raw_handle() {
+        let code = "fn foo(h: RawHandle) -> RawHandle { h }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::windows::io::RawHandle;"),
+            "应添加 RawHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_owned_handle() {
+        let code = "fn foo() -> OwnedHandle { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::windows::io::OwnedHandle;"),
+            "应添加 OwnedHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_borrowed_handle() {
+        let code = "fn foo(h: BorrowedHandle) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::windows::io::BorrowedHandle;"),
+            "应添加 BorrowedHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_windows_io_merged() {
+        let code = "fn foo(h: RawHandle, o: OwnedHandle, b: BorrowedHandle) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::os::windows::io::{BorrowedHandle, OwnedHandle, RawHandle};"),
+            "应合并 windows::io 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_s130_idempotent() {
+        let code = "fn foo(fd: RawFd, h: RawHandle) -> (OwnedFd, OwnedHandle) { unimplemented!() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "Session 130 新增 std 平台类型检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_raw_fd_full_path_no_import() {
+        let code = "fn foo(fd: std::os::unix::io::RawFd) -> std::os::unix::io::RawFd { fd }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::os::unix::io::RawFd;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_raw_handle_full_path_no_import() {
+        let code = "fn foo(h: std::os::windows::io::RawHandle) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::os::windows::io::RawHandle;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
     // ===== Session 129: ensure_std_imports glob 导入排除测试 =====
 
     #[test]
@@ -12861,6 +13585,192 @@ fn foo(
         assert_eq!(first, second, "Session 129 新增外部 crate 检测应幂等");
     }
 
+    // ===== Session 130: ensure_external_imports clap/uuid/url/log/tracing_subscriber 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_clap_arg() {
+        let code = "fn foo() -> Arg { Arg::new(\"name\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use clap::Arg;"),
+            "应添加 clap::Arg 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_clap_subcommand() {
+        let code = "#[derive(Subcommand)]\nenum Cmd { Foo }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use clap::Subcommand;"),
+            "应添加 clap::Subcommand 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_clap_arg_action() {
+        let code = "fn foo() -> ArgAction { ArgAction::Set }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use clap::ArgAction;"),
+            "应添加 clap::ArgAction 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_clap_multiple_merged() {
+        let code = "#[derive(Subcommand)]\nenum Cmd { Foo }\nfn bar() -> Arg { Arg::new(\"x\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use clap::{Arg, Subcommand};"),
+            "应合并 clap 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_clap_full_path_no_import() {
+        let code = "fn foo() -> clap::Arg { clap::Arg::new(\"x\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use clap::"),
+            "全限定 clap:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_uuid() {
+        let code = "fn foo() -> Uuid { Uuid::new_v4() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use uuid::Uuid;"),
+            "应添加 uuid::Uuid 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_uuid_full_path() {
+        let code = "fn foo() -> uuid::Uuid { uuid::Uuid::new_v4() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use uuid::"),
+            "全限定 uuid:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_url() {
+        let code = "fn foo() -> Url { Url::parse(\"https://example.com\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use url::Url;"),
+            "应添加 url::Url 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_url_full_path() {
+        let code = "fn foo() -> url::Url { url::Url::parse(\"x\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use url::"),
+            "全限定 url:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_log_level() {
+        let code = "fn foo() -> Level { Level::Info }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use log::Level;"),
+            "应添加 log::Level 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_log_level_filter() {
+        let code = "fn foo() -> LevelFilter { LevelFilter::Info }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use log::LevelFilter;"),
+            "应添加 log::LevelFilter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_log_level_merged() {
+        let code = "fn foo() -> (Level, LevelFilter) { (Level::Info, LevelFilter::Info) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use log::{Level, LevelFilter};"),
+            "应合并 log 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_log_macro() {
+        let code = "fn foo() { log!(log::Level::Info, \"hello\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use log::log;"),
+            "应添加 log::log 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_log_full_path_no_import() {
+        let code = "fn foo() -> log::Level { log::Level::Info }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use log::"),
+            "全限定 log:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tracing_subscriber_env_filter() {
+        let code = "fn foo() -> EnvFilter { EnvFilter::new(\"debug\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tracing_subscriber::EnvFilter;"),
+            "应添加 tracing_subscriber::EnvFilter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tracing_subscriber_full_path() {
+        let code = "fn foo() -> tracing_subscriber::EnvFilter { tracing_subscriber::EnvFilter::new(\"debug\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tracing_subscriber::"),
+            "全限定 tracing_subscriber:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s130_idempotent() {
+        let code = "#[derive(Subcommand)]\nenum Cmd { Foo }\nfn bar() -> (Uuid, Url) { unimplemented!() }\nfn baz() -> EnvFilter { EnvFilter::new(\"info\") }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 130 新增外部 crate 检测应幂等");
+    }
+
     // ===== Session 129: verify_imports 新增类型测试 =====
 
     #[test]
@@ -12907,6 +13817,80 @@ fn foo(
                 .iter()
                 .any(|i| i.type_name == "IterTools" && i.module_path == "itertools"),
             "应检测到 IterTools 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 130: verify_imports 新增类型测试 =====
+
+    #[test]
+    fn test_verify_imports_raw_fd_missing() {
+        let issues = verify_imports("fn foo(fd: RawFd) -> RawFd { fd }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RawFd" && i.module_path == "std::os::unix::io"),
+            "应检测到 RawFd 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_raw_handle_missing() {
+        let issues = verify_imports("fn foo(h: RawHandle) {}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RawHandle" && i.module_path == "std::os::windows::io"),
+            "应检测到 RawHandle 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_clap_arg_missing() {
+        let issues = verify_imports("fn foo() -> Arg { Arg::new(\"x\") }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Arg" && i.module_path == "clap"),
+            "应检测到 clap::Arg 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_uuid_missing() {
+        let issues = verify_imports("fn foo() -> Uuid { Uuid::new_v4() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Uuid" && i.module_path == "uuid"),
+            "应检测到 Uuid 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_url_missing() {
+        let issues = verify_imports("fn foo() -> Url { Url::parse(\"x\").unwrap() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Url" && i.module_path == "url"),
+            "应检测到 Url 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_env_filter_missing() {
+        let issues = verify_imports("fn foo() -> EnvFilter { EnvFilter::new(\"info\") }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "EnvFilter" && i.module_path == "tracing_subscriber"),
+            "应检测到 EnvFilter 缺失导入: {:?}",
             issues
         );
     }
@@ -13050,6 +14034,793 @@ fn foo(
         assert!(
             !has_covering_glob_import(&globs, "std::sync"),
             "空 glob 列表应返回 false"
+        );
+    }
+
+    // ===== Session 131: ensure_external_imports rand 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_rand_rng() {
+        let code = "fn foo(rng: &mut Rng) { let x = rng.gen(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rand::Rng;"),
+            "应添加 rand::Rng 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rand_thread_rng() {
+        let code = "fn foo() -> ThreadRng { rand::thread_rng() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rand::rngs::ThreadRng;"),
+            "应添加 rand::rngs::ThreadRng 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rand_gen_range_method() {
+        let code = "fn foo() { let mut rng = rand::thread_rng(); let x = rng.gen_range(0..10); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rand::Rng;"),
+            "应通过 .gen_range() 方法检测添加 rand::Rng 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rand_full_path_no_import() {
+        let code = "fn foo(rng: &mut rand::Rng) { let x = rng.gen(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use rand::Rng;"),
+            "全限定 rand::Rng 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rand_already_imported() {
+        let code = "use rand::Rng;\nfn foo(rng: &mut Rng) { let x = rng.gen(); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use rand::Rng;").count();
+        assert_eq!(count, 1, "已有 rand::Rng 导入不应重复: {}", result);
+    }
+
+    // ===== Session 131: ensure_external_imports dashmap 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_dashmap() {
+        let code = "fn foo() -> DashMap<i32, String> { DashMap::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use dashmap::DashMap;"),
+            "应添加 dashmap::DashMap 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_dashmap_full_path() {
+        let code = "fn foo() -> dashmap::DashMap<i32, String> { dashmap::DashMap::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use dashmap::"),
+            "全限定 dashmap:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 131: ensure_external_imports rayon 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_rayon_parallel_iterator() {
+        let code = "fn foo(v: Vec<i32>) -> i32 { v.par_iter().sum() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rayon::prelude::ParallelIterator;"),
+            "应通过 .par_iter() 方法检测添加 rayon::prelude::ParallelIterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rayon_par_iter_mut() {
+        let code = "fn foo(v: &mut [i32]) { v.par_iter_mut().for_each(|x| *x += 1); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rayon::prelude::ParallelIterator;"),
+            "应通过 .par_iter_mut() 方法检测添加 rayon 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rayon_full_path_no_import() {
+        let code = "fn foo(v: Vec<i32>) -> i32 { v.par_iter().sum() }";
+        let with_import = format!("use rayon::prelude::ParallelIterator;\n{}", code);
+        let result = ensure_external_imports(&with_import);
+        let count = result
+            .matches("use rayon::prelude::ParallelIterator;")
+            .count();
+        assert_eq!(count, 1, "已有 rayon 导入不应重复: {}", result);
+    }
+
+    // ===== Session 131: ensure_external_imports ndarray 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_array1() {
+        let code = "fn foo() -> Array1<f64> { Array1::zeros(10) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ndarray::Array1;"),
+            "应添加 ndarray::Array1 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_array2() {
+        let code = "fn foo() -> Array2<f64> { Array2::zeros((3, 4)) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ndarray::Array2;"),
+            "应添加 ndarray::Array2 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_merged() {
+        let code = "fn foo() -> (Array1<f64>, Array2<f64>) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ndarray::{Array1, Array2};"),
+            "应合并 ndarray 导入 (字母序): {}",
+            result
+        );
+    }
+
+    // ===== Session 131: ensure_external_imports tokio_stream 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_tokio_stream_stream_ext() {
+        let code = "fn foo() -> StreamExt { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio_stream::StreamExt;"),
+            "应添加 tokio_stream::StreamExt 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_stream_full_path() {
+        let code = "fn foo(s: tokio_stream::Stream) {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tokio_stream::"),
+            "全限定 tokio_stream:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s131_idempotent() {
+        let code = "fn foo() -> (DashMap<i32, String>, Array1<f64>) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.par_iter().sum(); }\nfn baz(rng: &mut Rng) { rng.gen_range(0..10); }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 131 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 131: verify_imports 新增类型测试 =====
+
+    #[test]
+    fn test_verify_imports_rand_rng_missing() {
+        let issues = verify_imports("fn foo(rng: &mut Rng) { let x = rng.gen(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Rng" && i.module_path == "rand"),
+            "应检测到 Rng 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_dashmap_missing() {
+        let issues = verify_imports("fn foo() -> DashMap<i32, String> { DashMap::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "DashMap" && i.module_path == "dashmap"),
+            "应检测到 DashMap 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ndarray_missing() {
+        let issues = verify_imports("fn foo() -> Array1<f64> { Array1::zeros(10) }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Array1" && i.module_path == "ndarray"),
+            "应检测到 Array1 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tokio_stream_missing() {
+        let issues = verify_imports("fn foo(s: Stream) {}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Stream" && i.module_path == "tokio_stream"),
+            "应检测到 Stream 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 131: verify_imports trait 方法检测测试 =====
+
+    #[test]
+    fn test_verify_imports_lock_method_mutex() {
+        let issues = verify_imports("fn foo(m: std::sync::Mutex<i32>) { let g = m.lock(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Mutex" && i.module_path == "std::sync"),
+            "应通过 .lock() 方法检测到 Mutex 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_lock_method_mutex_already_imported() {
+        let code = "use std::sync::Mutex;\nfn foo(m: Mutex<i32>) { let g = m.lock(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Mutex" && i.module_path == "std::sync"),
+            "已有 Mutex 导入不应通过 .lock() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_par_iter_rayon() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) -> i32 { v.par_iter().sum() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ParallelIterator" && i.module_path == "rayon::prelude"),
+            "应通过 .par_iter() 方法检测到 ParallelIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_gen_range_rand() {
+        let issues =
+            verify_imports("fn foo() { let mut rng = rand::thread_rng(); rng.gen_range(0..10); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Rng" && i.module_path == "rand"),
+            "应通过 .gen_range() 方法检测到 Rng 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 131: compare_diff_algorithms 测试 =====
+
+    #[test]
+    fn test_compare_diff_algorithms_no_difference() {
+        let code = "fn foo() {}\nfn bar() {}";
+        let result = compare_diff_algorithms(code, code);
+        assert_eq!(result.entries.len(), 4, "应有 4 种算法结果");
+        assert!(result.all_consistent, "无差异时所有算法应一致");
+        for entry in &result.entries {
+            assert_eq!(entry.diff_count, 0, "无差异时 diff_count 应为 0");
+        }
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_added_line() {
+        let original = "fn foo() {\n}\n";
+        let fixed = "fn foo() {\n    let x = 42;\n}\n";
+        let result = compare_diff_algorithms(original, fixed);
+        assert_eq!(result.original_lines, 2, "原始 2 行");
+        assert_eq!(result.fixed_lines, 3, "修复 3 行");
+        assert_eq!(result.entries.len(), 4, "应有 4 种算法结果");
+        // Myers/LCS/Hirschberg 应检测到 1 个 Added
+        let myers = result
+            .entries
+            .iter()
+            .find(|e| e.algorithm == "Myers")
+            .unwrap();
+        assert_eq!(myers.added_count, 1, "Myers 应有 1 个 Added");
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_modified_line() {
+        let original = "let x = 1;";
+        let fixed = "let x = 2;";
+        let result = compare_diff_algorithms(original, fixed);
+        // Basic 应检测到 Modified
+        let basic = result
+            .entries
+            .iter()
+            .find(|e| e.algorithm == "Basic")
+            .unwrap();
+        assert_eq!(basic.modified_count, 1, "Basic 应有 1 个 Modified");
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_empty_inputs() {
+        let result = compare_diff_algorithms("", "");
+        assert_eq!(result.original_lines, 0);
+        assert_eq!(result.fixed_lines, 0);
+        assert!(result.all_consistent, "空输入所有算法应一致");
+        for entry in &result.entries {
+            assert_eq!(entry.diff_count, 0, "空输入 diff_count 应为 0");
+        }
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_one_empty() {
+        let result = compare_diff_algorithms("", "a\nb\nc");
+        assert_eq!(result.original_lines, 0);
+        assert_eq!(result.fixed_lines, 3);
+        for entry in &result.entries {
+            assert_eq!(
+                entry.added_count, 3,
+                "空 original 应全部 Added: {}",
+                entry.algorithm
+            );
+        }
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_large_input() {
+        let original: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut fixed = original.clone();
+        fixed.push_str("line 100\n");
+        let result = compare_diff_algorithms(&original, &fixed);
+        assert_eq!(result.original_lines, 100);
+        assert_eq!(result.fixed_lines, 101);
+        // LCS/Myers/Hirschberg 应检测到 1 个 Added
+        let myers = result
+            .entries
+            .iter()
+            .find(|e| e.algorithm == "Myers")
+            .unwrap();
+        assert_eq!(myers.added_count, 1, "Myers 应有 1 个 Added");
+    }
+
+    #[test]
+    fn test_compare_diff_algorithms_serde() {
+        let result = compare_diff_algorithms("a\nb", "a\nc");
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: DiffComparisonResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(result, deserialized, "Serde 往返应保持一致");
+    }
+
+    // ===== Session 131: format_diff_comparison 测试 =====
+
+    #[test]
+    fn test_format_diff_comparison_basic() {
+        let result = compare_diff_algorithms("a\nb", "a\nc");
+        let table = format_diff_comparison(&result);
+        assert!(table.contains("Diff Algorithm Comparison"), "应包含标题");
+        assert!(table.contains("Original: 2 lines"), "应包含原始行数");
+        assert!(table.contains("Fixed: 2 lines"), "应包含修复行数");
+        assert!(table.contains("| Algorithm"), "应包含表头");
+        assert!(table.contains("Basic"), "应包含 Basic");
+        assert!(table.contains("LCS"), "应包含 LCS");
+        assert!(table.contains("Myers"), "应包含 Myers");
+        assert!(table.contains("Hirschberg"), "应包含 Hirschberg");
+    }
+
+    #[test]
+    fn test_format_diff_comparison_consistent() {
+        let result = compare_diff_algorithms("a\nb\nc", "a\nb\nc");
+        let table = format_diff_comparison(&result);
+        assert!(
+            table.contains("Consistent: Yes"),
+            "无差异应显示一致: {}",
+            table
+        );
+    }
+
+    #[test]
+    fn test_format_diff_comparison_no_difference() {
+        let result = compare_diff_algorithms("fn foo() {}", "fn foo() {}");
+        let table = format_diff_comparison(&result);
+        assert!(table.contains("Consistent: Yes"), "无差异应一致");
+        for entry in &result.entries {
+            assert_eq!(entry.diff_count, 0, "无差异 diff_count 应为 0");
+        }
+    }
+
+    // ===== Session 132: verify_imports RwLock .read()/.write() 测试 =====
+
+    #[test]
+    fn test_verify_imports_read_method_rwlock() {
+        let issues = verify_imports("fn foo(r: RwLock<i32>) { let g = r.read(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "应通过 .read() 方法检测到 RwLock 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_write_method_rwlock() {
+        let issues = verify_imports("fn foo(w: RwLock<i32>) { let g = w.write(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "应通过 .write() 方法检测到 RwLock 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rwlock_method_already_imported() {
+        let code = "use std::sync::RwLock;\nfn foo(r: RwLock<i32>) { let g = r.read(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "已有 RwLock 导入不应通过 .read() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rwlock_method_glob_import() {
+        let code = "use std::sync::*;\nfn foo(r: RwLock<i32>) { let g = r.write(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "glob 导入 use std::sync::*; 应覆盖 RwLock: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 132: verify_imports mpsc .send()/.recv() 测试 =====
+
+    #[test]
+    fn test_verify_imports_send_method_mpsc() {
+        let issues = verify_imports("fn foo(s: Sender<i32>) { s.send(42); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "应通过 .send() 方法检测到 Sender 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_recv_method_mpsc() {
+        let issues = verify_imports("fn foo(r: Receiver<i32>) { let x = r.recv(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Receiver" && i.module_path == "std::sync::mpsc"),
+            "应通过 .recv() 方法检测到 Receiver 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_send_recv_both() {
+        let issues =
+            verify_imports("fn foo(s: Sender<i32>, r: Receiver<i32>) { s.send(42); r.recv(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "应检测到 Sender: {:?}",
+            issues
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Receiver" && i.module_path == "std::sync::mpsc"),
+            "应检测到 Receiver: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_mpsc_method_already_imported() {
+        let code = "use std::sync::mpsc::Sender;\nfn foo(s: Sender<i32>) { s.send(42); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "已有 Sender 导入不应通过 .send() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 132: ensure_external_imports axum 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_axum_router() {
+        let code = "fn foo() -> Router { Router::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use axum::Router;"),
+            "应添加 axum::Router 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_axum_json() {
+        let code = "fn foo() -> Json<i32> { Json(42) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use axum::Json;"),
+            "应添加 axum::Json 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_axum_multiple() {
+        let code = "fn foo() -> (Router, Json<i32>, IntoResponse) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use axum::{") && result.contains("IntoResponse"),
+            "应合并 axum 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_axum_full_path() {
+        let code = "fn foo() -> axum::Router { axum::Router::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use axum::"),
+            "全限定 axum:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 132: ensure_external_imports tera 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_tera() {
+        let code = "fn foo() -> Tera { Tera::new(\"templates/**/*\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tera::Tera;"),
+            "应添加 tera::Tera 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tera_context() {
+        let code = "fn foo() -> Context { Context::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tera::Context;"),
+            "应添加 tera::Context 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tera_full_path() {
+        let code = "fn foo() -> tera::Tera { tera::Tera::new(\"x\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tera::"),
+            "全限定 tera:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 132: ensure_external_imports askama 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_askama_derive() {
+        let code = "#[derive(Template)]\nstruct Foo {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use askama::Template;"),
+            "应添加 askama::Template 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_askama_full_path() {
+        let code = "#[derive(askama::Template)]\nstruct Foo {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use askama::"),
+            "全限定 askama:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 132: ensure_external_imports rusqlite 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_rusqlite_connection() {
+        let code = "fn foo() -> Connection { Connection::open(\"db.sqlite\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rusqlite::Connection;"),
+            "应添加 rusqlite::Connection 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rusqlite_multiple() {
+        let code = "fn foo(c: &Connection) -> Statement { c.prepare(\"SELECT 1\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("rusqlite::") && result.contains("Connection"),
+            "应添加 Connection: {}",
+            result
+        );
+        assert!(
+            result.contains("rusqlite::") && result.contains("Statement"),
+            "应添加 Statement: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rusqlite_full_path() {
+        let code =
+            "fn foo() -> rusqlite::Connection { rusqlite::Connection::open(\"x\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use rusqlite::"),
+            "全限定 rusqlite:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rusqlite_params_macro() {
+        let code = "fn foo(c: &Connection) { c.execute(\"INSERT\", params![1, 2]); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("rusqlite::") && result.contains("params"),
+            "应通过 params! 宏检测添加 rusqlite::params 导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 132: ensure_external_imports redis 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_redis_async_connection() {
+        let code =
+            "fn foo(c: &mut AsyncConnection) { c.send_packed_command(&Cmd::new(\"PING\")).await; }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("redis::") && result.contains("AsyncConnection"),
+            "应添加 redis::AsyncConnection 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_redis_cmd() {
+        let code = "fn foo() -> Cmd { Cmd::new(\"GET\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use redis::Cmd;"),
+            "应添加 redis::Cmd 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_redis_full_path() {
+        let code = "fn foo() -> redis::Cmd { redis::Cmd::new(\"GET\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use redis::"),
+            "全限定 redis:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s132_idempotent() {
+        let code = "fn foo() -> (Router, Tera) { unimplemented!() }\nfn bar(c: &Connection) { c.execute(\"x\", params![1]); }\n#[derive(Template)]\nstruct T {}\nfn baz() -> (Cmd, AsyncConnection) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 132 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 132: verify_imports 新增外部 crate 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_axum_router_missing() {
+        let issues = verify_imports("fn foo() -> Router { Router::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Router" && i.module_path == "axum"),
+            "应检测到 Router 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tera_missing() {
+        let issues = verify_imports("fn foo() -> Tera { Tera::new(\"x\").unwrap() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Tera" && i.module_path == "tera"),
+            "应检测到 Tera 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rusqlite_connection_missing() {
+        let issues = verify_imports("fn foo() -> Connection { Connection::open(\"x\").unwrap() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Connection" && i.module_path == "rusqlite"),
+            "应检测到 rusqlite::Connection 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_redis_cmd_missing() {
+        let issues = verify_imports("fn foo() -> Cmd { Cmd::new(\"GET\") }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Cmd" && i.module_path == "redis"),
+            "应检测到 redis::Cmd 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_redis_async_connection_missing() {
+        let issues = verify_imports("fn foo(c: &mut AsyncConnection) { }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "AsyncConnection" && i.module_path == "redis"),
+            "应检测到 redis::AsyncConnection 缺失导入: {:?}",
+            issues
         );
     }
 }

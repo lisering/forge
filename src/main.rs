@@ -345,8 +345,25 @@ enum Commands {
         /// 启用后, 在代码写入前对每个 Rust (.rs) 文件调用 verify_imports,
         /// 并将 JSON 格式的缺失导入报告导出到指定路径。
         /// 适用于 CI/CD 集成和代码审查。
+        /// 使用 --import-report-format markdown 可切换为 Markdown 格式。
         #[arg(long)]
         import_report: Option<std::path::PathBuf>,
+
+        /// 导入检查报告格式选择 (Session 130)
+        ///
+        /// 与 --import-report 配合使用, 选择输出格式:
+        /// - json (默认): JSON 格式, 适用于 CI/CD 集成
+        /// - markdown: Markdown 格式, 适用于代码审查和 PR 评论
+        #[arg(long, default_value = "json")]
+        import_report_format: String,
+
+        /// 导出 Markdown 格式导入检查报告 (Session 130)
+        ///
+        /// 启用后, 对每个 Rust (.rs) 文件调用 verify_imports,
+        /// 生成人类可读的 Markdown 格式报告导出到指定路径。
+        /// 适用于代码审查和 PR 评论自动生成。
+        #[arg(long)]
+        import_report_md: Option<std::path::PathBuf>,
 
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
@@ -919,6 +936,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             colored_diff,
             ensure_external_imports,
             import_report,
+            import_report_format,
+            import_report_md,
             profile: _,
             profile_output: _,
         } => {
@@ -1118,6 +1137,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         colored_diff,
                         ensure_external_imports,
                         import_report.as_deref(),
+                        import_report_format.as_str(),
+                        import_report_md.as_deref(),
                     )
                     .await?;
 
@@ -1157,6 +1178,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         colored_diff,
                         ensure_external_imports,
                         import_report.as_deref(),
+                        import_report_format.as_str(),
+                        import_report_md.as_deref(),
                     )
                     .await?;
 
@@ -1214,6 +1237,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         colored_diff,
                         ensure_external_imports,
                         import_report.as_deref(),
+                        import_report_format.as_str(),
+                        import_report_md.as_deref(),
                     )
                     .await?;
                 } else {
@@ -1250,6 +1275,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         colored_diff,
                         ensure_external_imports,
                         import_report.as_deref(),
+                        import_report_format.as_str(),
+                        import_report_md.as_deref(),
                     )
                     .await?;
                 }
@@ -1373,6 +1400,8 @@ async fn run_with_clarifier<C, Q>(
     colored_diff: bool,
     ensure_external_imports: bool,
     import_report: Option<&std::path::Path>,
+    import_report_format: &str,
+    import_report_md: Option<&std::path::Path>,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1503,8 +1532,8 @@ where
 
     run_and_package(&mut orch, workspace).await?;
 
-    // Session 129: 导出导入检查报告到文件
-    if let Some(report_path) = import_report {
+    // Session 129/130: 导出导入检查报告到文件
+    if import_report.is_some() || import_report_md.is_some() {
         let mut all_issues = Vec::new();
         if workspace.exists() {
             let walker = |entry: &walkdir::DirEntry| {
@@ -1526,38 +1555,101 @@ where
             }
         }
 
-        // 生成 JSON 报告
-        let report = if all_issues.is_empty() {
-            serde_json::json!({
-                "status": "no_issues",
-                "message": "All imports are complete across all Rust files."
-            })
-        } else {
-            let total: usize = all_issues.iter().map(|(_, v)| v.len()).sum();
-            let files: Vec<_> = all_issues
-                .iter()
-                .map(|(path, issues)| {
+        // Session 129: --import-report (JSON 或 Markdown 由 --import-report-format 决定)
+        if let Some(report_path) = import_report {
+            if import_report_format == "markdown" {
+                // Session 130: Markdown 格式报告
+                let mut md = String::new();
+                md.push_str("# Import Report\n\n");
+                if all_issues.is_empty() {
+                    md.push_str("**Status:** No issues found. All imports are complete across all Rust files.\n");
+                } else {
+                    let total: usize = all_issues.iter().map(|(_, v)| v.len()).sum();
+                    md.push_str(&format!("**Total Issues:** {}\n", total));
+                    md.push_str(&format!("**Files Affected:** {}\n\n", all_issues.len()));
+                    md.push_str("## Missing Imports\n\n");
+                    md.push_str("| File | Type | Module | Line |\n");
+                    md.push_str("|------|------|--------|------|\n");
+                    for (path, issues) in &all_issues {
+                        for issue in issues {
+                            md.push_str(&format!(
+                                "| {} | {} | {} | {} |\n",
+                                path, issue.type_name, issue.module_path, issue.usage_line
+                            ));
+                        }
+                    }
+                }
+                std::fs::write(report_path, &md)?;
+                println!(
+                    "📋 导入检查报告 (Markdown) 已导出 ({} 个文件有缺失导入)",
+                    all_issues.len()
+                );
+            } else {
+                // Session 129: JSON 格式报告 (默认)
+                let report = if all_issues.is_empty() {
                     serde_json::json!({
-                        "file": path,
-                        "issue_count": issues.len(),
-                        "issues": issues,
+                        "status": "no_issues",
+                        "message": "All imports are complete across all Rust files."
                     })
-                })
-                .collect();
-            serde_json::json!({
-                "status": "has_issues",
-                "total_issues": total,
-                "files_affected": all_issues.len(),
-                "files": files,
-            })
-        };
+                } else {
+                    let total: usize = all_issues.iter().map(|(_, v)| v.len()).sum();
+                    let files: Vec<_> = all_issues
+                        .iter()
+                        .map(|(path, issues)| {
+                            serde_json::json!({
+                                "file": path,
+                                "issue_count": issues.len(),
+                                "issues": issues,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "status": "has_issues",
+                        "total_issues": total,
+                        "files_affected": all_issues.len(),
+                        "files": files,
+                    })
+                };
 
-        let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
-        std::fs::write(report_path, &json)?;
-        println!(
-            "📋 导入检查报告已导出 ({} 个文件有缺失导入)",
-            all_issues.len()
-        );
+                let json =
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+                std::fs::write(report_path, &json)?;
+                println!(
+                    "📋 导入检查报告 (JSON) 已导出 ({} 个文件有缺失导入)",
+                    all_issues.len()
+                );
+            }
+        }
+
+        // Session 130: --import-report-md (Markdown 快捷导出)
+        if let Some(md_path) = import_report_md {
+            let mut md = String::new();
+            md.push_str("# Import Report\n\n");
+            if all_issues.is_empty() {
+                md.push_str("**Status:** No issues found. All imports are complete across all Rust files.\n");
+            } else {
+                let total: usize = all_issues.iter().map(|(_, v)| v.len()).sum();
+                md.push_str(&format!("**Total Issues:** {}\n", total));
+                md.push_str(&format!("**Files Affected:** {}\n\n", all_issues.len()));
+                md.push_str("## Missing Imports\n\n");
+                md.push_str("| File | Type | Module | Line |\n");
+                md.push_str("|------|------|--------|------|\n");
+                for (path, issues) in &all_issues {
+                    for issue in issues {
+                        md.push_str(&format!(
+                            "| {} | {} | {} | {} |\n",
+                            path, issue.type_name, issue.module_path, issue.usage_line
+                        ));
+                    }
+                }
+            }
+            std::fs::write(md_path, &md)?;
+            println!(
+                "📋 导入检查报告 (Markdown) 已导出到 {} ({} 个文件有缺失导入)",
+                md_path.display(),
+                all_issues.len()
+            );
+        }
     }
 
     // 写入最终性能统计到 DevTrace (如 FailoverChatClient 的网站性能统计)
