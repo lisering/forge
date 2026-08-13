@@ -5781,6 +5781,17 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("SerialPort", "serialport"),
         // machine-uid (Session 141)
         ("machine_uid", "machine_uid"),
+        // dotenvy (Session 142)
+        ("EnvLoader", "dotenvy"),
+        ("EnvIter", "dotenvy"),
+        // fd-lock (Session 142)
+        ("FdLock", "fd_lock"),
+        // nix (Session 142)
+        ("NixPath", "nix::path"),
+        ("Errno", "nix::errno"),
+        // camino (Session 142)
+        ("Utf8PathBuf", "camino"),
+        ("Utf8Path", "camino"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6237,6 +6248,33 @@ pub fn ensure_external_imports(content: &str) -> String {
     }
 
     if s141_iterator_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::iter::Iterator;")
+                || (trimmed.contains("use std::iter::{")
+                    && contains_type_usage(trimmed, "Iterator"))
+                || trimmed.starts_with("use std::iter::*;")
+        }) || has_covering_glob_import(&glob_imports, "std::iter");
+
+        if !already_imported {
+            needed.entry("std::iter").or_default().push("Iterator");
+        }
+    }
+
+    // 检测 .flatten() / .max() / .min() / .sum() / .product() → Iterator trait 方法调用 (Session 142)
+    // .flatten() / .max( / .min( 需要 Iterator trait 在作用域中
+    // .sum( / .product( 需要 Iterator trait 的 sum()/product() 方法 (通过 std::iter::Sum/Product trait)
+    let s142_iterator_methods: &[&str] = &["flatten", "max", "min", "sum", "product"];
+    let mut s142_iterator_method_found = false;
+    for &method_name in s142_iterator_methods {
+        let method_call = format!(".{}(", method_name);
+        if content.contains(&method_call) {
+            s142_iterator_method_found = true;
+            break;
+        }
+    }
+
+    if s142_iterator_method_found {
         let already_imported = content.lines().any(|line| {
             let trimmed = line.trim();
             trimmed.starts_with("use std::iter::Iterator;")
@@ -6767,6 +6805,14 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("Disk", "sysinfo"),
         ("SerialPort", "serialport"),
         ("machine_uid", "machine_uid"),
+        // External crates (Session 142)
+        ("EnvLoader", "dotenvy"),
+        ("EnvIter", "dotenvy"),
+        ("FdLock", "fd_lock"),
+        ("NixPath", "nix::path"),
+        ("Errno", "nix::errno"),
+        ("Utf8PathBuf", "camino"),
+        ("Utf8Path", "camino"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7291,7 +7337,7 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
     }
 
     // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip() / .take() / .rev() / .step_by() / .cloned() / .copied() / .fuse()
-    // → Iterator trait 方法调用 (Session 136 + 137 + 138 + 139 + 141)
+    // → Iterator trait 方法调用 (Session 136 + 137 + 138 + 139 + 141 + 142)
     // 这些方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
     // 此检测为建议性, 帮助明确导入
     let iterator_methods: &[&str] = &[
@@ -7310,6 +7356,12 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "cloned",
         "copied",
         "fuse",
+        // Session 142: .flatten() / .max( / .min( / .sum( / .product(
+        "flatten",
+        "max",
+        "min",
+        "sum",
+        "product",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -20349,6 +20401,490 @@ fn main() {
             s141_issues.is_empty(),
             "ensure_external_imports 后不应有 Session 141 外部 crate 导入问题: {:?}",
             s141_issues
+        );
+    }
+
+    // ===== Session 142: ensure_external_imports dotenvy/fd-lock/nix/camino 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_dotenvy_env_loader() {
+        let code = "fn foo() -> EnvLoader { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use dotenvy::EnvLoader;"),
+            "应添加 dotenvy::EnvLoader 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_dotenvy_env_iter() {
+        let code = "fn foo() -> EnvIter { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use dotenvy::EnvIter;"),
+            "应添加 dotenvy::EnvIter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fd_lock() {
+        let code = "fn foo() -> FdLock { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use fd_lock::FdLock;"),
+            "应添加 fd_lock::FdLock 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_nix_nix_path() {
+        let code = "fn foo() -> NixPath { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use nix::path::NixPath;"),
+            "应添加 nix::path::NixPath 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_nix_errno() {
+        let code = "fn foo() -> Errno { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use nix::errno::Errno;"),
+            "应添加 nix::errno::Errno 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_camino_utf8_path_buf() {
+        let code = "fn foo() -> Utf8PathBuf { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use camino::Utf8PathBuf;"),
+            "应添加 camino::Utf8PathBuf 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_camino_utf8_path() {
+        let code = "fn foo() -> Utf8Path { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use camino::Utf8Path;"),
+            "应添加 camino::Utf8Path 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s142_idempotent() {
+        let code = "fn foo() -> (EnvLoader, FdLock, NixPath, Utf8PathBuf) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 142 新增外部 crate 检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_dotenvy_already_imported() {
+        let code = "use dotenvy::EnvLoader;\nfn foo() -> EnvLoader { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use dotenvy::EnvLoader;").count();
+        assert_eq!(
+            count, 1,
+            "已有 dotenvy::EnvLoader 导入不应重复添加: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fd_lock_already_imported() {
+        let code = "use fd_lock::FdLock;\nfn foo() -> FdLock { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use fd_lock::FdLock;").count();
+        assert_eq!(
+            count, 1,
+            "已有 fd_lock::FdLock 导入不应重复添加: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_nix_full_path() {
+        // nix::path::NixPath 全限定路径不应需要导入
+        let code = "fn foo() -> nix::path::NixPath { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use nix::path::NixPath;"),
+            "全限定路径 nix::path::NixPath 不应添加导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_camino_full_path() {
+        // camino::Utf8PathBuf 全限定路径不应需要导入
+        let code = "fn foo() -> camino::Utf8PathBuf { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use camino::Utf8PathBuf;"),
+            "全限定路径 camino::Utf8PathBuf 不应添加导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 142: ensure_external_imports .flatten()/.max()/.min()/.sum()/.product() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_flatten_method() {
+        let code = "fn foo(v: Vec<Vec<i32>>) { v.iter().flatten(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .flatten() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_max_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().max(Ord); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .max() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_min_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().min(Ord); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .min() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sum_method() {
+        let code = "fn foo(v: Vec<i32>) { let s: i32 = v.iter().sum(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .sum() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_product_method() {
+        let code = "fn foo(v: Vec<i32>) { let p: i32 = v.iter().product(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .product() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_flatten_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<Vec<i32>>) { v.iter().flatten(); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.flatten): {}",
+            result
+        );
+    }
+
+    // ===== Session 142: verify_imports dotenvy/fd-lock/nix/camino 测试 =====
+
+    #[test]
+    fn test_verify_imports_dotenvy_env_loader_missing() {
+        let issues = verify_imports("fn foo() -> EnvLoader { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "EnvLoader" && i.module_path == "dotenvy"),
+            "应检测到 dotenvy::EnvLoader 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_dotenvy_env_iter_missing() {
+        let issues = verify_imports("fn foo() -> EnvIter { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "EnvIter" && i.module_path == "dotenvy"),
+            "应检测到 dotenvy::EnvIter 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fd_lock_missing() {
+        let issues = verify_imports("fn foo() -> FdLock { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "FdLock" && i.module_path == "fd_lock"),
+            "应检测到 fd_lock::FdLock 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fd_lock_already_imported() {
+        let code = "use fd_lock::FdLock;\nfn foo() -> FdLock { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "FdLock" && i.module_path == "fd_lock"),
+            "已有 fd_lock::FdLock 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_nix_nix_path_missing() {
+        let issues = verify_imports("fn foo() -> NixPath { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "NixPath" && i.module_path == "nix::path"),
+            "应检测到 nix::path::NixPath 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_nix_errno_missing() {
+        let issues = verify_imports("fn foo() -> Errno { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Errno" && i.module_path == "nix::errno"),
+            "应检测到 nix::errno::Errno 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_nix_errno_already_imported() {
+        let code = "use nix::errno::Errno;\nfn foo() -> Errno { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Errno" && i.module_path == "nix::errno"),
+            "已有 nix::errno::Errno 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_camino_utf8_path_buf_missing() {
+        let issues = verify_imports("fn foo() -> Utf8PathBuf { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Utf8PathBuf" && i.module_path == "camino"),
+            "应检测到 camino::Utf8PathBuf 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_camino_utf8_path_missing() {
+        let issues = verify_imports("fn foo() -> Utf8Path { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Utf8Path" && i.module_path == "camino"),
+            "应检测到 camino::Utf8Path 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_camino_already_imported() {
+        let code = "use camino::Utf8PathBuf;\nfn foo() -> Utf8PathBuf { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Utf8PathBuf" && i.module_path == "camino"),
+            "已有 camino::Utf8PathBuf 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s142_combined() {
+        let code = "fn foo() -> (EnvLoader, FdLock, NixPath, Utf8PathBuf) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "EnvLoader"),
+            "应检测到 EnvLoader: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "FdLock"),
+            "应检测到 FdLock: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "NixPath"),
+            "应检测到 NixPath: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Utf8PathBuf"),
+            "应检测到 Utf8PathBuf: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 142: verify_imports .flatten()/.max()/.min()/.sum()/.product() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_flatten_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<Vec<i32>>) { v.iter().flatten(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .flatten() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_max_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().max(Ord); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .max() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_min_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().min(Ord); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .min() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sum_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { let s: i32 = v.iter().sum(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .sum() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_product_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { let p: i32 = v.iter().product(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .product() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_flatten_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<Vec<i32>>) { v.iter().flatten(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .flatten() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sum_product_glob_import() {
+        let code = "use std::iter::*;\nfn foo(v: Vec<i32>) { let s = v.iter().sum(); let p = v.iter().product(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator (.sum/.product): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_flatten_max_min_sum_product_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().flatten().max(Ord).min(Ord); }";
+        let issues = verify_imports(code);
+        // Should only report once (deduped)
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 142: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s142_issues() {
+        let code = "fn foo() -> (EnvLoader, FdLock, NixPath, Utf8PathBuf) { unimplemented!() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s142_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "dotenvy"
+                    || i.module_path == "fd_lock"
+                    || i.module_path == "nix::path"
+                    || i.module_path == "nix::errno"
+                    || i.module_path == "camino"
+            })
+            .collect();
+        assert!(
+            s142_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 142 外部 crate 导入问题: {:?}",
+            s142_issues
         );
     }
 }

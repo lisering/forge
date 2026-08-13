@@ -207,6 +207,12 @@ impl SystemPrompt {
   "❌ 禁止: 调用 .cloned()/.copied()/.fuse() 但未导入 use std::iter::Iterator; (Session 141 trait 方法检测)\n",
   );
         prompt.push_str(
+"❌ 禁止: 使用 EnvLoader/EnvIter (dotenvy) / FdLock (fd-lock) / NixPath/Errno (nix) / Utf8PathBuf/Utf8Path (camino) 等外部 crate 类型但未导入 use dotenvy::... / use fd_lock::... / use nix::... / use camino::... (Session 142)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .flatten()/.max()/.min()/.sum()/.product() 但未导入 use std::iter::Iterator; (Session 142 trait 方法检测)\n",
+  );
+        prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
 
@@ -1354,6 +1360,66 @@ mod tests {
         assert!(
             prompt.contains(".fuse()"),
             "系统 prompt 应包含 .fuse() trait 方法检测约束 (Session 141)"
+        );
+    }
+
+    // ===== Session 142: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s142_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("dotenvy"),
+            "系统 prompt 应包含 dotenvy 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("fd_lock"),
+            "系统 prompt 应包含 fd_lock 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("nix"),
+            "系统 prompt 应包含 nix 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("camino"),
+            "系统 prompt 应包含 camino 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("EnvLoader"),
+            "系统 prompt 应包含 EnvLoader 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("FdLock"),
+            "系统 prompt 应包含 FdLock 导入约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains("Utf8PathBuf"),
+            "系统 prompt 应包含 Utf8PathBuf 导入约束 (Session 142)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s142_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".flatten()"),
+            "系统 prompt 应包含 .flatten() trait 方法检测约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains(".max()"),
+            "系统 prompt 应包含 .max() trait 方法检测约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains(".min()"),
+            "系统 prompt 应包含 .min() trait 方法检测约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains(".sum()"),
+            "系统 prompt 应包含 .sum() trait 方法检测约束 (Session 142)"
+        );
+        assert!(
+            prompt.contains(".product()"),
+            "系统 prompt 应包含 .product() trait 方法检测约束 (Session 142)"
         );
     }
 

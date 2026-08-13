@@ -1011,3 +1011,213 @@ fn test_import_report_json_markdown_consistency_s141() {
         );
     }
 }
+
+// ===== Session 142: JSON 报告 — 新增外部 crate 测试 =====
+
+#[test]
+fn test_import_report_json_dotenvy_missing() {
+    let code = "fn foo() -> EnvLoader { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("EnvLoader"),
+        "JSON 报告应包含 EnvLoader: {}",
+        json
+    );
+    assert!(
+        json.contains("dotenvy"),
+        "JSON 报告应包含 dotenvy 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_fd_lock_missing() {
+    let code = "fn foo() -> FdLock { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("FdLock"), "JSON 报告应包含 FdLock: {}", json);
+    assert!(
+        json.contains("fd_lock"),
+        "JSON 报告应包含 fd_lock 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_nix_missing() {
+    let code = "fn foo() -> (NixPath, Errno) { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("NixPath"),
+        "JSON 报告应包含 NixPath: {}",
+        json
+    );
+    assert!(json.contains("nix"), "JSON 报告应包含 nix 模块: {}", json);
+}
+
+#[test]
+fn test_import_report_json_camino_missing() {
+    let code = "fn foo() -> Utf8PathBuf { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Utf8PathBuf"),
+        "JSON 报告应包含 Utf8PathBuf: {}",
+        json
+    );
+    assert!(
+        json.contains("camino"),
+        "JSON 报告应包含 camino 模块: {}",
+        json
+    );
+}
+
+// ===== Session 142: Markdown 报告 — 新增外部 crate 测试 =====
+
+#[test]
+fn test_import_report_markdown_dotenvy_missing() {
+    let code = "fn foo() -> EnvLoader { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("EnvLoader"),
+        "Markdown 报告应包含 EnvLoader: {}",
+        md
+    );
+    assert!(
+        md.contains("dotenvy"),
+        "Markdown 报告应包含 dotenvy 模块: {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_markdown_fd_lock_missing() {
+    let code = "fn foo() -> FdLock { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("FdLock"), "Markdown 报告应包含 FdLock: {}", md);
+    assert!(
+        md.contains("fd_lock"),
+        "Markdown 报告应包含 fd_lock 模块: {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_markdown_camino_missing() {
+    let code = "fn foo() -> Utf8PathBuf { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Utf8PathBuf"),
+        "Markdown 报告应包含 Utf8PathBuf: {}",
+        md
+    );
+    assert!(
+        md.contains("camino"),
+        "Markdown 报告应包含 camino 模块: {}",
+        md
+    );
+}
+
+// ===== Session 142: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s142_issues() {
+    let code = "fn foo() -> (EnvLoader, FdLock, NixPath, Utf8PathBuf) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s142_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "dotenvy"
+                || i.module_path == "fd_lock"
+                || i.module_path == "nix::path"
+                || i.module_path == "nix::errno"
+                || i.module_path == "camino"
+        })
+        .collect();
+
+    assert!(
+        s142_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 142 外部 crate 导入问题: {:?}",
+        s142_issues
+    );
+}
+
+// ===== Session 142: .flatten()/.max()/.min()/.sum()/.product() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_flatten_max_min_sum_product() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().flatten().max(Ord).min(Ord); let s = v.iter().sum(); let p = v.iter().product(); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 报告应包含 Iterator (.flatten/.max/.min/.sum/.product): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_flatten_max_min_sum_product() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().flatten().max(Ord).min(Ord); let s = v.iter().sum(); let p = v.iter().product(); }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 报告应包含 Iterator (.flatten/.max/.min/.sum/.product): {}",
+        md
+    );
+}
+
+// ===== Session 142: 多类型混合报告 (S141 + S142) =====
+
+#[test]
+fn test_import_report_mixed_s141_s142_types() {
+    let code =
+        "fn foo() -> (System, SerialPort, EnvLoader, FdLock, Utf8PathBuf) { unimplemented!() }";
+    let report = verify_imports_report(code);
+
+    assert!(report.has_issues, "应有问题");
+    // Session 141 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "sysinfo"),
+        "应包含 sysinfo 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "serialport"),
+        "应包含 serialport 问题"
+    );
+    // Session 142 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "dotenvy"),
+        "应包含 dotenvy 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "fd_lock"),
+        "应包含 fd_lock 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "camino"),
+        "应包含 camino 问题"
+    );
+}
+
+// ===== Session 142: JSON / Markdown 双格式一致性 (S141 + S142) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s142() {
+    let code = "fn foo() -> (System, EnvLoader, FdLock, Utf8PathBuf) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.iter().flatten().max(Ord).sum(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["System", "EnvLoader", "FdLock", "Utf8PathBuf", "Iterator"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

@@ -72,6 +72,11 @@ fn build_missing_external_code(n: usize) -> String {
         ("CpuCore", "fn f() -> CpuCore { unimplemented!() }"),
         ("Disk", "fn f() -> Disk { unimplemented!() }"),
         ("SerialPort", "fn f() -> SerialPort { unimplemented!() }"),
+        // Session 142 types
+        ("EnvLoader", "fn f() -> EnvLoader { unimplemented!() }"),
+        ("FdLock", "fn f() -> FdLock { unimplemented!() }"),
+        ("NixPath", "fn f() -> NixPath { unimplemented!() }"),
+        ("Utf8PathBuf", "fn f() -> Utf8PathBuf { unimplemented!() }"),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -116,6 +121,11 @@ fn build_complete_imports_code(n: usize) -> String {
         // Session 141 imports
         "use sysinfo::System;",
         "use serialport::SerialPort;",
+        // Session 142 imports
+        "use dotenvy::EnvLoader;",
+        "use fd_lock::FdLock;",
+        "use nix::path::NixPath;",
+        "use camino::Utf8PathBuf;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -175,6 +185,12 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".cloned()",
         ".copied()",
         ".fuse()",
+        // Session 142 Iterator trait methods
+        ".flatten()",
+        ".max(Ord)",
+        ".min(Ord)",
+        ".sum()",
+        ".product()",
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -493,6 +509,25 @@ fn edge_cases(c: &mut Criterion) {
     group.bench_function("s141_iterator_methods", |b| {
         b.iter(|| {
             let code = "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 142: dotenvy/fd-lock/nix/camino 类型检测
+    group.bench_function("s142_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> (EnvLoader, FdLock, NixPath) { unimplemented!() }\n\
+                 fn bar() -> (Errno, Utf8PathBuf, Utf8Path) { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 142: .flatten()/.max()/.min()/.sum()/.product() trait 方法检测
+    group.bench_function("s142_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.iter().flatten().max(Ord).min(Ord); let s = v.iter().sum(); let p = v.iter().product(); }";
             let issues = verify_imports(black_box(code));
             black_box(issues);
         });
