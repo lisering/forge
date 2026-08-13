@@ -25,7 +25,7 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 regex = "1"
-zip = "2"
+zip = "8"
 walkdir = "2"
 sha2 = "0.10"
 async-trait = "0.1"
