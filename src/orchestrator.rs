@@ -748,6 +748,20 @@ where
     ///
     /// 默认 false (向后兼容)。
     pub fix_preview_enabled: bool,
+
+    /// 导入检查开关 — 代码写入前自动检查导入完整性 (Session 127)
+    ///
+    /// 启用后, 在从 AI 回复提取代码文件后, 对 Rust (.rs) 文件自动调用
+    /// `verify_imports` 检查缺失的导入, 并打印检查结果。
+    /// 默认 false (向后兼容)。
+    pub verify_imports_enabled: bool,
+
+    /// 彩色 diff 开关 — 终端输出使用 ANSI 颜色 diff (Session 127)
+    ///
+    /// 启用后, 在自动修复时使用 `format_diff_unified_colored` 输出彩色 diff,
+    /// 文件头粗体黄色, hunk 头青色, 新增绿色, 删除红色。
+    /// 默认 false (向后兼容)。
+    pub colored_diff_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -804,6 +818,8 @@ where
             auto_fix_enabled: false,
             clippy_check_enabled: false,
             staged_fix_enabled: false,
+            verify_imports_enabled: false,
+            colored_diff_enabled: false,
         }
     }
 }
@@ -876,6 +892,8 @@ where
             clippy_check_enabled: self.clippy_check_enabled,
             staged_fix_enabled: self.staged_fix_enabled,
             fix_preview_enabled: self.fix_preview_enabled,
+            verify_imports_enabled: self.verify_imports_enabled,
+            colored_diff_enabled: self.colored_diff_enabled,
         }
     }
 
@@ -1218,6 +1236,24 @@ where
         self
     }
 
+    /// 启用/禁用导入检查 (Session 127)
+    ///
+    /// 启用后, 在代码写入前自动调用 `verify_imports` 检查缺失的导入,
+    /// 并打印检查结果。不影响代码写入流程, 仅提供信息。
+    pub fn with_verify_imports(mut self, enabled: bool) -> Self {
+        self.verify_imports_enabled = enabled;
+        self
+    }
+
+    /// 启用/禁用彩色 diff (Session 127)
+    ///
+    /// 启用后, 在自动修复时使用 `format_diff_unified_colored` 输出彩色 diff,
+    /// 文件头粗体黄色, hunk 头青色, 新增绿色, 删除红色。
+    pub fn with_colored_diff(mut self, enabled: bool) -> Self {
+        self.colored_diff_enabled = enabled;
+        self
+    }
+
     /// 对项目运行 clippy 检查并打印结果 (Session 120)
     ///
     /// 在代码写入工作区后调用, 如果 clippy 发现问题则打印警告和错误。
@@ -1259,7 +1295,8 @@ where
     ) -> Vec<crate::extract::ExtractedFile> {
         use crate::extract::{
             apply_fixes_dry_run, apply_staged_fixes, apply_staged_fixes_preview,
-            compute_line_diff_unified, format_diff_summary, format_diff_unified_with_options,
+            compute_line_diff_unified, format_diff_summary, format_diff_unified_colored,
+            format_diff_unified_with_options, verify_imports,
         };
 
         let mut fixed_files = Vec::with_capacity(files.len());
@@ -1334,18 +1371,42 @@ where
                             println!("        {}", line);
                         }
 
-                        // Session 125: 打印统一 diff (类似 git diff)
-                        let unified = format_diff_unified_with_options(
-                            &file.content,
-                            &fixed_content,
-                            &file.path,
-                            &file.path,
-                            3,
-                        );
+                        // Session 125/127: 打印统一 diff (彩色或普通)
+                        let unified = if self.colored_diff_enabled {
+                            format_diff_unified_colored(
+                                &file.content,
+                                &fixed_content,
+                                &file.path,
+                                &file.path,
+                                3,
+                            )
+                        } else {
+                            format_diff_unified_with_options(
+                                &file.content,
+                                &fixed_content,
+                                &file.path,
+                                &file.path,
+                                3,
+                            )
+                        };
                         if !unified.is_empty() {
                             println!("        📝 统一 diff:");
                             for line in unified.lines().take(20) {
                                 println!("          {}", line);
+                            }
+                        }
+
+                        // Session 127: 导入检查
+                        if self.verify_imports_enabled {
+                            let issues = verify_imports(&fixed_content);
+                            if !issues.is_empty() {
+                                println!("        ⚠️  导入检查发现 {} 个缺失:", issues.len());
+                                for issue in &issues {
+                                    println!(
+                                        "          L{}: {} ({})",
+                                        issue.usage_line, issue.type_name, issue.module_path
+                                    );
+                                }
                             }
                         }
 
@@ -1365,18 +1426,42 @@ where
                             println!("        {}", line);
                         }
 
-                        // Session 125: 打印统一 diff
-                        let unified = format_diff_unified_with_options(
-                            &file.content,
-                            &fixed_content,
-                            &file.path,
-                            &file.path,
-                            3,
-                        );
+                        // Session 125/127: 打印统一 diff (彩色或普通)
+                        let unified = if self.colored_diff_enabled {
+                            format_diff_unified_colored(
+                                &file.content,
+                                &fixed_content,
+                                &file.path,
+                                &file.path,
+                                3,
+                            )
+                        } else {
+                            format_diff_unified_with_options(
+                                &file.content,
+                                &fixed_content,
+                                &file.path,
+                                &file.path,
+                                3,
+                            )
+                        };
                         if !unified.is_empty() {
                             println!("        📝 统一 diff:");
                             for line in unified.lines().take(20) {
                                 println!("          {}", line);
+                            }
+                        }
+
+                        // Session 127: 导入检查
+                        if self.verify_imports_enabled {
+                            let issues = verify_imports(&fixed_content);
+                            if !issues.is_empty() {
+                                println!("        ⚠️  导入检查发现 {} 个缺失:", issues.len());
+                                for issue in &issues {
+                                    println!(
+                                        "          L{}: {} ({})",
+                                        issue.usage_line, issue.type_name, issue.module_path
+                                    );
+                                }
                             }
                         }
                     }
@@ -10862,6 +10947,90 @@ mod tests {
         assert!(orch.staged_fix_enabled, "staged_fix 应启用");
         assert!(orch.fix_preview_enabled, "fix_preview 应启用");
         assert!(orch.clippy_check_enabled, "clippy_check 应启用");
+    }
+
+    // ===== Session 127: verify_imports 集成测试 =====
+
+    #[test]
+    fn test_verify_imports_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(
+            !orch.verify_imports_enabled,
+            "verify_imports_enabled 应默认为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_verify_imports_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_verify_imports(true);
+        assert!(
+            orch.verify_imports_enabled,
+            "with_verify_imports(true) 应设置 verify_imports_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_verify_imports_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch =
+            make_orchestrator(&chat, dir.path().to_str().unwrap()).with_verify_imports(false);
+        assert!(
+            !orch.verify_imports_enabled,
+            "with_verify_imports(false) 应设置 verify_imports_enabled 为 false"
+        );
+    }
+
+    // ===== Session 127: colored_diff 集成测试 =====
+
+    #[test]
+    fn test_colored_diff_disabled_by_default() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap());
+        assert!(
+            !orch.colored_diff_enabled,
+            "colored_diff_enabled 应默认为 false"
+        );
+    }
+
+    #[test]
+    fn test_with_colored_diff_enables() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_colored_diff(true);
+        assert!(
+            orch.colored_diff_enabled,
+            "with_colored_diff(true) 应设置 colored_diff_enabled 为 true"
+        );
+    }
+
+    #[test]
+    fn test_with_colored_diff_disabled() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap()).with_colored_diff(false);
+        assert!(
+            !orch.colored_diff_enabled,
+            "with_colored_diff(false) 应设置 colored_diff_enabled 为 false"
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_combined_with_auto_fix() {
+        let dir = tempdir().unwrap();
+        let chat = MockChatClient::new(vec![]);
+        let orch = make_orchestrator(&chat, dir.path().to_str().unwrap())
+            .with_auto_fix(true)
+            .with_verify_imports(true)
+            .with_colored_diff(true);
+        assert!(orch.auto_fix_enabled, "auto_fix 应启用");
+        assert!(orch.verify_imports_enabled, "verify_imports 应启用");
+        assert!(orch.colored_diff_enabled, "colored_diff 应启用");
     }
 }
 

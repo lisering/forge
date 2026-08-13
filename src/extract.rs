@@ -1945,7 +1945,9 @@ pub fn apply_fixes_with_imports(content: &str) -> String {
     // 5. 合并分散的 anyhow 导入 (Session 121)
     let anyhow_merged = merge_anyhow_imports(&anyhow_imported);
     // 6. 确保所需的 std 导入 (Session 125)
-    ensure_std_imports(&anyhow_merged)
+    let std_imported = ensure_std_imports(&anyhow_merged);
+    // 7. 确保所需的外部 crate 导入 (Session 127)
+    ensure_external_imports(&std_imported)
 }
 
 /// 修复预览 — dry-run 模式的返回值 (Session 118)
@@ -4608,6 +4610,16 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
 /// - `Sender` / `Receiver` → `use std::sync::mpsc::{Sender, Receiver};` (Session 126)
 /// - `Condvar` / `Barrier` → `use std::sync::{Condvar, Barrier};` (Session 126)
 /// - `AtomicBool` / `AtomicI32` / `AtomicU32` / ... → `use std::sync::atomic::{...};` (Session 126)
+/// - `Pin` → `use std::pin::Pin;` (Session 127)
+/// - `Ordering` → `use std::cmp::Ordering;` (Session 127)
+/// - `Range` / `RangeInclusive` → `use std::ops::{Range, RangeInclusive};` (Session 127)
+/// - `TypeId` / `Any` → `use std::any::{TypeId, Any};` (Session 127)
+/// - `Formatter` / `Display` / `Debug` → `use std::fmt::{...};` (Session 127)
+/// - `FromIterator` / `Peekable` → `use std::iter::{...};` (Session 127)
+/// - `Hash` / `Hasher` → `use std::hash::{Hash, Hasher};` (Session 127)
+/// - `mem` → `use std::mem;` (Session 127)
+/// - `NonZeroU32` / `NonZeroU64` / `NonZeroUsize` → `use std::num::{...};` (Session 127)
+/// - `Entry` → `use std::collections::hash_map::Entry;` (Session 127)
 ///
 /// # 规则
 ///
@@ -4706,6 +4718,34 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("AtomicI64", "std::sync::atomic"),
         ("AtomicU64", "std::sync::atomic"),
         ("AtomicUsize", "std::sync::atomic"),
+        // pin (Session 127)
+        ("Pin", "std::pin"),
+        // cmp (Session 127)
+        ("Ordering", "std::cmp"),
+        // ops (Session 127)
+        ("Range", "std::ops"),
+        ("RangeInclusive", "std::ops"),
+        // any (Session 127)
+        ("TypeId", "std::any"),
+        ("Any", "std::any"),
+        // fmt (Session 127)
+        ("Formatter", "std::fmt"),
+        ("Display", "std::fmt"),
+        ("Debug", "std::fmt"),
+        // iter (Session 127)
+        ("FromIterator", "std::iter"),
+        ("Peekable", "std::iter"),
+        // hash (Session 127)
+        ("Hash", "std::hash"),
+        ("Hasher", "std::hash"),
+        // mem (Session 127)
+        ("mem", "std"),
+        // num (Session 127)
+        ("NonZeroU32", "std::num"),
+        ("NonZeroU64", "std::num"),
+        ("NonZeroUsize", "std::num"),
+        // collections::hash_map (Session 127)
+        ("Entry", "std::collections::hash_map"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -4752,6 +4792,170 @@ pub fn ensure_std_imports(content: &str) -> String {
                 format!("use {}::{};", module, sorted_types[0])
             } else {
                 format!("use {}::{{{}}};", module, sorted_types.join(", "))
+            }
+        })
+        .collect();
+
+    // 找到插入位置: 第一个非注释、非属性、非空白行之前
+    let lines: Vec<&str> = content.lines().collect();
+    let mut insert_pos = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with("*")
+            || trimmed.starts_with("#![")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("///")
+        {
+            continue;
+        }
+        insert_pos = i;
+        break;
+    }
+
+    if insert_pos == 0 && !lines.is_empty() {
+        let all_comments = lines
+            .iter()
+            .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+        if all_comments {
+            insert_pos = lines.len();
+        }
+    }
+
+    let mut result_lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    for (offset, import_line) in import_lines.iter().enumerate() {
+        result_lines.insert(insert_pos + offset, import_line.clone());
+    }
+
+    result_lines.join("\n")
+}
+
+/// 检测并添加缺失的外部 crate 导入 (Session 127)
+///
+/// 与 `ensure_std_imports` 类似, 但针对常见的外部 crate 类型:
+///
+/// - `Serialize` / `Deserialize` → `use serde::{Deserialize, Serialize};`
+/// - `Regex` → `use regex::Regex;`
+/// - `DateTime` / `NaiveDateTime` / `NaiveDate` / `NaiveTime` / `TimeZone` → `use chrono::{...};`
+/// - `tracing` 宏 (`info!` / `warn!` / `error!` / `debug!` / `trace!`) → `use tracing::{...};`
+///
+/// # 规则
+///
+/// 1. 检测代码中使用了哪些外部 crate 类型 (词边界匹配)
+/// 2. 排除全限定路径 (如 `serde::Serialize`, `chrono::Utc`)
+/// 3. 缺失的导入自动添加, 已有的不重复
+/// 4. 同一 crate 的多个类型合并为 `use crate::{Type1, Type2};`
+/// 5. 幂等: 已有导入不重复添加
+/// 6. 同一 crate 的多个类型按字母序排列
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::ensure_external_imports;
+///
+/// // 使用 Serialize 但未导入
+/// let code = "#[derive(Serialize)]\nstruct Foo { x: i32 }";
+/// let result = ensure_external_imports(code);
+/// assert!(result.contains("use serde::Serialize;"), "应添加 Serialize 导入: {}", result);
+///
+/// // 已有导入不重复 (幂等)
+/// let second = ensure_external_imports(&result);
+/// assert_eq!(result, second, "二次调用不变化");
+///
+/// // 全限定路径不需要导入
+/// let code = "#[derive(serde::Serialize)]\nstruct Foo { x: i32 }";
+/// let result = ensure_external_imports(code);
+/// assert!(!result.contains("use serde::"), "全限定路径不需要导入");
+/// ```
+pub fn ensure_external_imports(content: &str) -> String {
+    // 类型检测: (type_name, crate_path)
+    let type_modules: &[(&str, &str)] = &[
+        // serde
+        ("Serialize", "serde"),
+        ("Deserialize", "serde"),
+        // regex
+        ("Regex", "regex"),
+        // chrono
+        ("DateTime", "chrono"),
+        ("NaiveDateTime", "chrono"),
+        ("NaiveDate", "chrono"),
+        ("NaiveTime", "chrono"),
+        ("TimeZone", "chrono"),
+    ];
+
+    // 收集需要的导入: crate_path -> Vec<type_name>
+    let mut needed: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+
+    for &(type_name, crate_path) in type_modules {
+        let full_path = format!("{}::{}", crate_path, type_name);
+        let bare_usage = contains_type_usage(content, type_name) && !content.contains(&full_path);
+
+        if bare_usage {
+            // 检查是否已有导入
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use {}::{}", crate_path, type_name))
+                    || (trimmed.contains(&format!("use {}::{{", crate_path))
+                        && contains_type_usage(trimmed, type_name))
+                    || trimmed.starts_with(&format!("use {}::*;", crate_path))
+            });
+
+            if !already_imported {
+                needed.entry(crate_path).or_default().push(type_name);
+            }
+        }
+    }
+
+    // 检测 tracing 宏使用 (info!, warn!, error!, debug!, trace!)
+    let tracing_macros: &[&str] = &["info", "warn", "error", "debug", "trace"];
+    let mut tracing_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in tracing_macros {
+        let macro_pattern = format!("{}!(", macro_name);
+        let full_path = format!("tracing::{}!", macro_name);
+
+        // 检测裸宏使用 (排除 tracing:: 前缀)
+        let bare_macro = content.contains(&macro_pattern) && !content.contains(&full_path);
+
+        if bare_macro {
+            // 检查是否已有导入
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use tracing::{};", macro_name))
+                    || (trimmed.contains("use tracing::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use tracing::*;")
+            });
+
+            if !already_imported {
+                tracing_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !tracing_needed.is_empty() {
+        tracing_needed.sort();
+        needed.entry("tracing").or_default().extend(tracing_needed);
+    }
+
+    if needed.is_empty() {
+        return content.to_string();
+    }
+
+    // 构建导入行 (字母序排列)
+    let import_lines: Vec<String> = needed
+        .iter()
+        .map(|(&crate_path, types)| {
+            let mut sorted_types = types.to_vec();
+            sorted_types.sort();
+            sorted_types.dedup();
+            if sorted_types.len() == 1 {
+                format!("use {}::{};", crate_path, sorted_types[0])
+            } else {
+                format!("use {}::{{{}}};", crate_path, sorted_types.join(", "))
             }
         })
         .collect();
@@ -5031,6 +5235,34 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("AtomicI64", "std::sync::atomic"),
         ("AtomicU64", "std::sync::atomic"),
         ("AtomicUsize", "std::sync::atomic"),
+        // pin (Session 127)
+        ("Pin", "std::pin"),
+        // cmp (Session 127)
+        ("Ordering", "std::cmp"),
+        // ops (Session 127)
+        ("Range", "std::ops"),
+        ("RangeInclusive", "std::ops"),
+        // any (Session 127)
+        ("TypeId", "std::any"),
+        ("Any", "std::any"),
+        // fmt (Session 127)
+        ("Formatter", "std::fmt"),
+        ("Display", "std::fmt"),
+        ("Debug", "std::fmt"),
+        // iter (Session 127)
+        ("FromIterator", "std::iter"),
+        ("Peekable", "std::iter"),
+        // hash (Session 127)
+        ("Hash", "std::hash"),
+        ("Hasher", "std::hash"),
+        // mem (Session 127)
+        ("mem", "std"),
+        // num (Session 127)
+        ("NonZeroU32", "std::num"),
+        ("NonZeroU64", "std::num"),
+        ("NonZeroUsize", "std::num"),
+        // collections::hash_map (Session 127)
+        ("Entry", "std::collections::hash_map"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -10930,5 +11162,502 @@ fn foo(
             result
         );
         assert!(result.contains("});"), "应在末行添加闭合: {}", result);
+    }
+
+    // ===== Session 127: ensure_std_imports 新增类型测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_pin() {
+        let code = "fn foo() -> Pin<Box<i32>> { Box::pin(42) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::pin::Pin;"),
+            "应添加 Pin 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_ordering() {
+        let code = "fn foo(a: i32, b: i32) -> Ordering { a.cmp(&b) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::cmp::Ordering;"),
+            "应添加 Ordering 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_range() {
+        let code = "fn foo() -> Range<i32> { 0..10 }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::ops::Range;"),
+            "应添加 Range 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_range_inclusive() {
+        let code = "fn foo() -> RangeInclusive<i32> { 0..=10 }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::ops::RangeInclusive;"),
+            "应添加 RangeInclusive 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_range_range_inclusive_merged() {
+        let code = "fn foo(r: Range<i32>, ri: RangeInclusive<i32>) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::ops::{Range, RangeInclusive};"),
+            "应合并 ops 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_type_id() {
+        let code = "fn foo() -> TypeId { TypeId::of::<i32>() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::any::TypeId;"),
+            "应添加 TypeId 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_any() {
+        let code = "fn foo() -> Box<dyn Any> { Box::new(42) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::any::Any;"),
+            "应添加 Any 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_type_id_any_merged() {
+        let code = "fn foo() -> (TypeId, Box<dyn Any>) { (TypeId::of::<i32>(), Box::new(42)) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::any::{Any, TypeId};"),
+            "应合并 any 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_formatter() {
+        let code = "fn foo(f: &mut Formatter) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::fmt::Formatter;"),
+            "应添加 Formatter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_display_debug() {
+        let code = "fn foo(d: &dyn Debug, s: &dyn Display) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::fmt::{Debug, Display};"),
+            "应合并 fmt 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_from_iterator() {
+        let code = "fn foo() -> impl FromIterator<i32> { Vec::<i32>::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::iter::FromIterator;"),
+            "应添加 FromIterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_peekable() {
+        let code = "fn foo(iter: Peekable<i32>) {}";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::iter::Peekable;"),
+            "应添加 Peekable 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_hash_hasher() {
+        let code = "fn foo(h: &mut Hasher) -> Hash { 42 }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::hash::{Hash, Hasher};"),
+            "应合并 hash 模块导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_mem() {
+        let code = "fn foo() { let x = mem::swap; }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::mem;"),
+            "应添加 mem 模块导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_nonzero_u32() {
+        let code = "fn foo() -> NonZeroU32 { NonZeroU32::new(42).unwrap() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::num::NonZeroU32;"),
+            "应添加 NonZeroU32 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_nonzero_multiple() {
+        let code = "fn foo() -> (NonZeroU32, NonZeroU64, NonZeroUsize) { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};"),
+            "应合并 num 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_entry() {
+        let code = "fn foo(m: HashMap<i32, i32>) -> Entry<'_, i32, i32> { m.entry(1) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::collections::hash_map::Entry;"),
+            "应添加 Entry 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_s127_idempotent() {
+        let code = "fn foo() -> (Pin<Box<i32>>, Ordering, NonZeroU32) { unimplemented!() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "Session 127 新增类型检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_s127_full_path_no_import() {
+        let code = "fn foo() -> std::pin::Pin<Box<i32>> { Box::pin(42) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::pin::Pin;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 127: ensure_external_imports 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_serialize() {
+        let code = "#[derive(Serialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde::Serialize;"),
+            "应添加 Serialize 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_deserialize() {
+        let code = "#[derive(Deserialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde::Deserialize;"),
+            "应添加 Deserialize 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serialize_deserialize_merged() {
+        let code = "#[derive(Serialize, Deserialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde::{Deserialize, Serialize};"),
+            "应合并 serde 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serde_full_path() {
+        let code = "#[derive(serde::Serialize, serde::Deserialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use serde::"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_regex() {
+        let code = "fn foo() -> Regex { Regex::new(r\".*\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use regex::Regex;"),
+            "应添加 Regex 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_chrono_datetime() {
+        let code = "fn foo() -> DateTime { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use chrono::DateTime;"),
+            "应添加 DateTime 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_chrono_multiple() {
+        let code = "fn foo() -> (DateTime, NaiveDateTime) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use chrono::{DateTime, NaiveDateTime};"),
+            "应合并 chrono 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tracing_info_macro() {
+        let code = "fn foo() { info!(\"hello\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tracing::info;"),
+            "应添加 tracing::info 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tracing_multiple_macros() {
+        let code = "fn foo() { info!(\"hi\"); warn!(\"warn\"); error!(\"err\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tracing::{error, info, warn};"),
+            "应合并 tracing 宏导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tracing_full_path_no_import() {
+        let code = "fn foo() { tracing::info!(\"hello\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tracing::"),
+            "全限定 tracing:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_idempotent() {
+        let code = "#[derive(Serialize, Deserialize)]\nstruct Foo { x: i32 }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "ensure_external_imports 应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_no_need() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = ensure_external_imports(code);
+        assert_eq!(result, code, "不需要外部导入不修改");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_already_imported() {
+        let code = "use serde::Serialize;\n#[derive(Serialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use serde::Serialize;").count();
+        assert_eq!(count, 1, "已有导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_insert_position() {
+        let code = "//! Module docs\n#[derive(Serialize)]\nstruct Foo { x: i32 }";
+        let result = ensure_external_imports(code);
+        let import_pos = result.find("use serde::").unwrap();
+        let struct_pos = result.find("#[derive").unwrap();
+        assert!(
+            import_pos < struct_pos,
+            "导入应在结构体之前: {} < {}",
+            import_pos,
+            struct_pos
+        );
+    }
+
+    // ===== Session 127: verify_imports 新增类型测试 =====
+
+    #[test]
+    fn test_verify_imports_pin_missing() {
+        let issues = verify_imports("fn foo() -> Pin<Box<i32>> { Box::pin(42) }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Pin" && i.module_path == "std::pin"),
+            "应检测到 Pin 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_pin_present() {
+        let code = "use std::pin::Pin;\nfn foo() -> Pin<Box<i32>> { Box::pin(42) }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues.iter().any(|i| i.type_name == "Pin"),
+            "已有 Pin 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_entry_missing() {
+        let issues =
+            verify_imports("fn foo(m: HashMap<i32, i32>) -> Entry<'_, i32, i32> { m.entry(1) }");
+        assert!(
+            issues.iter().any(|i| i.type_name == "Entry"),
+            "应检测到 Entry 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_nonzero_missing() {
+        let issues = verify_imports("fn foo() -> NonZeroU32 { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "NonZeroU32" && i.module_path == "std::num"),
+            "应检测到 NonZeroU32 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ordering_missing() {
+        let issues = verify_imports("fn foo(a: i32, b: i32) -> Ordering { a.cmp(&b) }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Ordering" && i.module_path == "std::cmp"),
+            "应检测到 Ordering 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_multiple_s127_types() {
+        let code = "fn foo() -> (Pin<Box<i32>>, Ordering, NonZeroU32) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(issues.iter().any(|i| i.type_name == "Pin"), "应有 Pin");
+        assert!(
+            issues.iter().any(|i| i.type_name == "Ordering"),
+            "应有 Ordering"
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "NonZeroU32"),
+            "应有 NonZeroU32"
+        );
+    }
+
+    // ===== Session 127: verify_imports 协作测试 (Item 12) =====
+
+    #[test]
+    fn test_verify_imports_after_ensure_std_imports_no_issues() {
+        // ensure_std_imports 应修复所有 verify_imports 能检测到的 std 类型
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let fixed = ensure_std_imports(code);
+        let issues = verify_imports(&fixed);
+        let std_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.module_path.starts_with("std"))
+            .collect();
+        assert!(
+            std_issues.is_empty(),
+            "ensure_std_imports 后不应有 std 导入问题: {:?}",
+            std_issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_after_ensure_anyhow_imports_no_issues() {
+        // ensure_anyhow_imports 应修复所有 verify_imports 能检测到的 anyhow 类型
+        let code = "fn foo() -> Result<i32, anyhow::Error> { Ok(42) }";
+        let fixed = ensure_anyhow_imports(code);
+        let issues = verify_imports(&fixed);
+        let anyhow_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.module_path == "anyhow")
+            .collect();
+        assert!(
+            anyhow_issues.is_empty(),
+            "ensure_anyhow_imports 后不应有 anyhow 导入问题: {:?}",
+            anyhow_issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_after_apply_fixes_with_imports_no_std_issues() {
+        // apply_fixes_with_imports 完成后不应有 std 导入问题
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let fixed = apply_fixes_with_imports(code);
+        let issues = verify_imports(&fixed);
+        let std_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.module_path.starts_with("std"))
+            .collect();
+        assert!(
+            std_issues.is_empty(),
+            "apply_fixes_with_imports 后不应有 std 导入问题: {:?}",
+            std_issues
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_after_apply_fixes_with_imports() {
+        // apply_fixes_with_imports 应包含 ensure_external_imports 步骤
+        let code = "#[derive(Serialize)]\nstruct Foo { x: i32 }";
+        let fixed = apply_fixes_with_imports(code);
+        assert!(
+            fixed.contains("use serde::Serialize;"),
+            "apply_fixes_with_imports 应添加外部 crate 导入: {}",
+            fixed
+        );
     }
 }

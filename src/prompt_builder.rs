@@ -117,7 +117,16 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Command/Instant/Duration/TcpListener 等类型但未导入对应 use std::process::... / use std::time::... / use std::net::... (Session 125)\n",
 );
         prompt.push_str(
-"❌ 禁止: 使用 thread/Thread/JoinHandle/PhantomData/Cow/Sender/Receiver/AtomicBool 等类型但未导入对应 use std::thread::... / use std::marker::... / use std::borrow::... / use std::sync::mpsc::... / use std::sync::atomic::... (Session 126)\n\n",
+ "❌ 禁止: 使用 thread/Thread/JoinHandle/PhantomData/Cow/Sender/Receiver/AtomicBool 等类型但未导入对应 use std::thread::... / use std::marker::... / use std::borrow::... / use std::sync::mpsc::... / use std::sync::atomic::... (Session 126)\n",
+ );
+        prompt.push_str(
+"❌ 禁止: 使用 Pin/Ordering/Range/RangeInclusive/TypeId/Any/Formatter/Display/Debug/FromIterator/Peekable/Hash/Hasher/NonZeroU32/NonZeroU64/NonZeroUsize/Entry 等类型但未导入对应 use std::pin::... / use std::cmp::... / use std::ops::... / use std::any::... / use std::fmt::... / use std::iter::... / use std::hash::... / use std::num::... / use std::collections::hash_map::... (Session 127)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 Serialize/Deserialize/Regex/DateTime/NaiveDateTime 等外部 crate 类型但未导入 use serde::... / use regex::... / use chrono::... (Session 127)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 info!/warn!/error!/debug!/trace! 等 tracing 宏但未导入 use tracing::{...}; (Session 127)\n\n",
 );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -530,6 +539,101 @@ mod tests {
         assert!(
             prompt.contains("std::sync::atomic"),
             "系统 prompt 应包含 std::sync::atomic 导入约束 (Session 126)"
+        );
+    }
+
+    // ===== Session 127: 新增 std 类型 + 外部 crate 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_pin_ordering_range_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Pin"),
+            "系统 prompt 应包含 Pin 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Ordering"),
+            "系统 prompt 应包含 Ordering 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Range"),
+            "系统 prompt 应包含 Range 导入约束 (Session 127)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_typeid_any_formatter_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("TypeId"),
+            "系统 prompt 应包含 TypeId 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Formatter"),
+            "系统 prompt 应包含 Formatter 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Display"),
+            "系统 prompt 应包含 Display 导入约束 (Session 127)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_nonzero_entry_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("NonZeroU32"),
+            "系统 prompt 应包含 NonZeroU32 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Entry"),
+            "系统 prompt 应包含 Entry 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("std::num"),
+            "系统 prompt 应包含 std::num 导入约束 (Session 127)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_external_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Serialize"),
+            "系统 prompt 应包含 Serialize 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Deserialize"),
+            "系统 prompt 应包含 Deserialize 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("Regex"),
+            "系统 prompt 应包含 Regex 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("DateTime"),
+            "系统 prompt 应包含 DateTime 导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("use serde::"),
+            "系统 prompt 应包含 use serde:: 导入约束 (Session 127)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_tracing_macro_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("info!"),
+            "系统 prompt 应包含 info! 宏导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("warn!"),
+            "系统 prompt 应包含 warn! 宏导入约束 (Session 127)"
+        );
+        assert!(
+            prompt.contains("use tracing::"),
+            "系统 prompt 应包含 use tracing:: 导入约束 (Session 127)"
         );
     }
 }

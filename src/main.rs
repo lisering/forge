@@ -316,6 +316,22 @@ enum Commands {
         #[arg(long)]
         preview: bool,
 
+        /// 启用导入检查 — 代码写入前自动检查导入完整性 (Session 127)
+        ///
+        /// 启用后, 对 Rust (.rs) 文件调用 verify_imports 检查缺失的导入,
+        /// 并打印检查结果。不影响代码写入流程, 仅提供信息。
+        /// 默认禁用。
+        #[arg(long)]
+        verify_imports: bool,
+
+        /// 启用彩色 diff — 终端输出使用 ANSI 颜色 diff (Session 127)
+        ///
+        /// 启用后, 在自动修复时使用 format_diff_unified_colored 输出彩色 diff,
+        /// 文件头粗体黄色, hunk 头青色, 新增绿色, 删除红色。
+        /// 默认禁用。
+        #[arg(long)]
+        colored_diff: bool,
+
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
         /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
@@ -883,6 +899,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             auto_fix,
             clippy_check,
             preview: fix_preview,
+            verify_imports,
+            colored_diff,
             profile: _,
             profile_output: _,
         } => {
@@ -1078,6 +1096,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         auto_fix,
                         clippy_check,
                         fix_preview,
+                        verify_imports,
+                        colored_diff,
                     )
                     .await?;
 
@@ -1113,6 +1133,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         auto_fix,
                         clippy_check,
                         fix_preview,
+                        verify_imports,
+                        colored_diff,
                     )
                     .await?;
 
@@ -1166,6 +1188,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         auto_fix,
                         clippy_check,
                         fix_preview,
+                        verify_imports,
+                        colored_diff,
                     )
                     .await?;
                 } else {
@@ -1198,6 +1222,8 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         auto_fix,
                         clippy_check,
                         fix_preview,
+                        verify_imports,
+                        colored_diff,
                     )
                     .await?;
                 }
@@ -1317,6 +1343,8 @@ async fn run_with_clarifier<C, Q>(
     auto_fix: bool,
     clippy_check: bool,
     fix_preview: bool,
+    verify_imports: bool,
+    colored_diff: bool,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1357,6 +1385,16 @@ where
     // Session 123: 修复预览
     if fix_preview {
         orch = orch.with_fix_preview(true);
+    }
+
+    // Session 127: 导入检查
+    if verify_imports {
+        orch = orch.with_verify_imports(true);
+    }
+
+    // Session 127: 彩色 diff
+    if colored_diff {
+        orch = orch.with_colored_diff(true);
     }
 
     // Session 113: Web 工具集成
