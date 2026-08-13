@@ -340,6 +340,14 @@ enum Commands {
         #[arg(long)]
         ensure_external_imports: bool,
 
+        /// 导出导入检查报告到文件 (Session 129)
+        ///
+        /// 启用后, 在代码写入前对每个 Rust (.rs) 文件调用 verify_imports,
+        /// 并将 JSON 格式的缺失导入报告导出到指定路径。
+        /// 适用于 CI/CD 集成和代码审查。
+        #[arg(long)]
+        import_report: Option<std::path::PathBuf>,
+
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
         /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
@@ -910,6 +918,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             verify_imports,
             colored_diff,
             ensure_external_imports,
+            import_report,
             profile: _,
             profile_output: _,
         } => {
@@ -1108,6 +1117,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         verify_imports,
                         colored_diff,
                         ensure_external_imports,
+                        import_report.as_deref(),
                     )
                     .await?;
 
@@ -1146,6 +1156,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         verify_imports,
                         colored_diff,
                         ensure_external_imports,
+                        import_report.as_deref(),
                     )
                     .await?;
 
@@ -1202,6 +1213,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         verify_imports,
                         colored_diff,
                         ensure_external_imports,
+                        import_report.as_deref(),
                     )
                     .await?;
                 } else {
@@ -1237,6 +1249,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         verify_imports,
                         colored_diff,
                         ensure_external_imports,
+                        import_report.as_deref(),
                     )
                     .await?;
                 }
@@ -1359,6 +1372,7 @@ async fn run_with_clarifier<C, Q>(
     verify_imports: bool,
     colored_diff: bool,
     ensure_external_imports: bool,
+    import_report: Option<&std::path::Path>,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1488,6 +1502,63 @@ where
     }
 
     run_and_package(&mut orch, workspace).await?;
+
+    // Session 129: 导出导入检查报告到文件
+    if let Some(report_path) = import_report {
+        let mut all_issues = Vec::new();
+        if workspace.exists() {
+            let walker = |entry: &walkdir::DirEntry| {
+                entry.file_type().is_file()
+                    && entry.path().extension().is_some_and(|ext| ext == "rs")
+            };
+            for entry in walkdir::WalkDir::new(workspace)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if walker(&entry) {
+                    if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                        let issues = forge::extract::verify_imports(&content);
+                        if !issues.is_empty() {
+                            all_issues.push((entry.path().display().to_string(), issues));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 生成 JSON 报告
+        let report = if all_issues.is_empty() {
+            serde_json::json!({
+                "status": "no_issues",
+                "message": "All imports are complete across all Rust files."
+            })
+        } else {
+            let total: usize = all_issues.iter().map(|(_, v)| v.len()).sum();
+            let files: Vec<_> = all_issues
+                .iter()
+                .map(|(path, issues)| {
+                    serde_json::json!({
+                        "file": path,
+                        "issue_count": issues.len(),
+                        "issues": issues,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "status": "has_issues",
+                "total_issues": total,
+                "files_affected": all_issues.len(),
+                "files": files,
+            })
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+        std::fs::write(report_path, &json)?;
+        println!(
+            "📋 导入检查报告已导出 ({} 个文件有缺失导入)",
+            all_issues.len()
+        );
+    }
 
     // 写入最终性能统计到 DevTrace (如 FailoverChatClient 的网站性能统计)
     chat.write_final_trace().await;

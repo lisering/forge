@@ -133,7 +133,13 @@ impl SystemPrompt {
 );
         prompt.push_str(
 "❌ 禁止: 使用 Client/Response/StatusCode (reqwest) / Value/json! (serde_json) / JoinHandle/spawn/join!/select! (tokio) 等外部 crate 类型或宏但未导入 use reqwest::... / use serde_json::... / use tokio::... (Session 128)\n\n",
-);
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 Child/Stdio (std::process) / OsStr/OsString (std::ffi) 等类型但未导入 use std::process::... / use std::ffi::... (Session 129)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 IterTools/iproduct!/izip!/multiunzip! (itertools) / #[derive(Error)] (thiserror) / #[async_trait] (async_trait) 等外部 crate 类型或宏但未导入 use itertools::... / use thiserror::... / use async_trait::... (Session 129)\n\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -694,6 +700,35 @@ mod tests {
         assert!(
             prompt.contains("spawn"),
             "系统 prompt 应包含 spawn 导入约束 (Session 128)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s129_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("itertools"),
+            "系统 prompt 应包含 itertools 导入约束 (Session 129)"
+        );
+        assert!(
+            prompt.contains("thiserror"),
+            "系统 prompt 应包含 thiserror 导入约束 (Session 129)"
+        );
+        assert!(
+            prompt.contains("async_trait"),
+            "系统 prompt 应包含 async_trait 导入约束 (Session 129)"
+        );
+        assert!(
+            prompt.contains("IterTools"),
+            "系统 prompt 应包含 IterTools 导入约束 (Session 129)"
+        );
+        assert!(
+            prompt.contains("Child"),
+            "系统 prompt 应包含 Child 导入约束 (Session 129)"
+        );
+        assert!(
+            prompt.contains("OsStr"),
+            "系统 prompt 应包含 OsStr 导入约束 (Session 129)"
         );
     }
 }

@@ -4587,6 +4587,39 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
     false
 }
 
+/// 检查是否存在覆盖给定模块路径的 glob 导入 (Session 129)
+///
+/// 检测 `use module::*;` 或 `use parent::*;` 形式的 glob 导入,
+/// 如果存在则该模块下的所有类型都已被导入, 不需要额外添加。
+///
+/// 例如: `use tokio::*;` 覆盖 `tokio::task::JoinHandle`,
+///       `use std::sync::*;` 覆盖 `std::sync::atomic::AtomicBool`。
+fn has_covering_glob_import(glob_imports: &[String], module_path: &str) -> bool {
+    glob_imports.iter().any(|glob| {
+        // 精确匹配: use module::*;
+        module_path == glob
+        // 父模块 glob: use parent::*; 覆盖 parent::sub::Type
+            || module_path.starts_with(&format!("{}::", glob))
+    })
+}
+
+/// 从代码中提取所有 glob 导入的模块路径 (Session 129)
+///
+/// 扫描 `use X::*;` 形式的导入, 返回模块路径列表。
+/// 用于快速判断某类型是否已被 glob 导入覆盖。
+fn extract_glob_imports(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("use ")
+                .and_then(|rest| rest.strip_suffix("::*;"))
+                .map(|s| s.to_string())
+        })
+        .collect()
+}
+
 /// 检测并添加缺失的 `std` 导入 (Session 124 + Session 125 扩展)
 ///
 /// 类似 `ensure_anyhow_imports`, 但针对 Rust 标准库常用类型:
@@ -4763,10 +4796,19 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("CStr", "std::ffi"),
         // str pattern (Session 128)
         ("Pattern", "std::str::pattern"),
+        // process additional (Session 129)
+        ("Child", "std::process"),
+        ("Stdio", "std::process"),
+        // ffi additional (Session 129)
+        ("OsStr", "std::ffi"),
+        ("OsString", "std::ffi"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
     let mut needed: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+
+    // 预计算 glob 导入用于覆盖检查 (Session 129)
+    let glob_imports = extract_glob_imports(content);
 
     for &(type_name, module_path) in type_modules {
         // 检测使用: 出现类型名作为标识符 (不是全限定路径的一部分)
@@ -4787,7 +4829,7 @@ pub fn ensure_std_imports(content: &str) -> String {
                 || trimmed.starts_with(&format!("use {}::*;", module_path))
                 // 检查 use std::collections::*; 等 (对 std::collections::HashMap 等)
                 || trimmed.starts_with("use std::*;")
-            });
+            }) || has_covering_glob_import(&glob_imports, module_path);
 
             if !already_imported {
                 needed.entry(module_path).or_default().push(type_name);
@@ -4862,6 +4904,10 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `Value` / `json!` → `use serde_json::{Value, json};` (Session 128)
 /// - `JoinHandle` → `use tokio::task::JoinHandle;` (Session 128)
 /// - `spawn` / `join!` / `select!` → `use tokio::{spawn, join, select};` (Session 128)
+/// - `IterTools` → `use itertools::IterTools;` (Session 129)
+/// - `iproduct!` / `izip!` / `multiunzip!` → `use itertools::{...};` (Session 129)
+/// - `#[derive(Error)]` → `use thiserror::Error;` (Session 129)
+/// - `#[async_trait]` → `use async_trait::async_trait;` (Session 129)
 ///
 /// # 规则
 ///
@@ -4871,6 +4917,7 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// 4. 同一 crate 的多个类型合并为 `use crate::{Type1, Type2};`
 /// 5. 幂等: 已有导入不重复添加
 /// 6. 同一 crate 的多个类型按字母序排列
+/// 7. glob 导入覆盖: `use crate::*;` 或 `use parent::*;` 覆盖子模块类型 (Session 129)
 ///
 /// # 示例
 ///
@@ -4913,10 +4960,15 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("Value", "serde_json"),
         // tokio::task (Session 128)
         ("JoinHandle", "tokio::task"),
+        // itertools (Session 129)
+        ("IterTools", "itertools"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
     let mut needed: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+
+    // 预计算 glob 导入用于覆盖检查 (Session 129)
+    let glob_imports = extract_glob_imports(content);
 
     for &(type_name, crate_path) in type_modules {
         let full_path = format!("{}::{}", crate_path, type_name);
@@ -4930,7 +4982,7 @@ pub fn ensure_external_imports(content: &str) -> String {
                     || (trimmed.contains(&format!("use {}::{{", crate_path))
                         && contains_type_usage(trimmed, type_name))
                     || trimmed.starts_with(&format!("use {}::*;", crate_path))
-            });
+            }) || has_covering_glob_import(&glob_imports, crate_path);
 
             if !already_imported {
                 needed.entry(crate_path).or_default().push(type_name);
@@ -5054,6 +5106,107 @@ pub fn ensure_external_imports(content: &str) -> String {
             .entry("tokio")
             .or_default()
             .extend(tokio_macro_needed);
+    }
+
+    // 检测 itertools 宏使用 (Session 129)
+    // iproduct!, izip!, multiunzip!
+    let itertools_macros: &[&str] = &["iproduct", "izip", "multiunzip"];
+    let mut itertools_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in itertools_macros {
+        let macro_bang = format!("{}!(", macro_name);
+        let full_path = format!("itertools::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use itertools::{};", macro_name))
+                    || (trimmed.contains("use itertools::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use itertools::*;")
+            }) || has_covering_glob_import(&glob_imports, "itertools");
+
+            if !already_imported {
+                itertools_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !itertools_macro_needed.is_empty() {
+        itertools_macro_needed.sort();
+        itertools_macro_needed.dedup();
+        needed
+            .entry("itertools")
+            .or_default()
+            .extend(itertools_macro_needed);
+    }
+
+    // 检测 thiserror::Error derive 宏使用 (Session 129)
+    // #[derive(Error)] → use thiserror::Error;
+    if content.contains("#[derive(Error)]") && !content.contains("thiserror::Error") {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use thiserror::Error;")
+                || trimmed.contains("use thiserror::{")
+                || trimmed.starts_with("use thiserror::*;")
+        }) || has_covering_glob_import(&glob_imports, "thiserror");
+
+        if !already_imported {
+            needed.entry("thiserror").or_default().push("Error");
+        }
+    }
+
+    // 检测 async_trait 属性宏使用 (Session 129)
+    // #[async_trait] → use async_trait::async_trait;
+    if content.contains("#[async_trait]") && !content.contains("async_trait::async_trait") {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use async_trait::async_trait;")
+                || trimmed.contains("use async_trait::{")
+                || trimmed.starts_with("use async_trait::*;")
+        }) || has_covering_glob_import(&glob_imports, "async_trait");
+
+        if !already_imported {
+            needed.entry("async_trait").or_default().push("async_trait");
+        }
+    }
+
+    // 检测 itertools trait 方法调用 (Session 129)
+    // .interleave( / .intersperse( / .tuples( / .group_by( / .permutations( / .combinations( 等
+    // 这些方法需要 IterTools trait 在作用域中
+    let itertools_methods: &[&str] = &[
+        "interleave",
+        "intersperse",
+        "tuples",
+        "group_by",
+        "permutations",
+        "combinations",
+        "step",
+        "multipeek",
+    ];
+    let mut itertools_method_found = false;
+    for &method_name in itertools_methods {
+        let method_call = format!(".{}(", method_name);
+        if content.contains(&method_call) {
+            itertools_method_found = true;
+            break;
+        }
+    }
+
+    if itertools_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use itertools::IterTools;")
+                || (trimmed.contains("use itertools::{")
+                    && contains_type_usage(trimmed, "IterTools"))
+                || trimmed.starts_with("use itertools::*;")
+        }) || has_covering_glob_import(&glob_imports, "itertools");
+
+        if !already_imported {
+            needed.entry("itertools").or_default().push("IterTools");
+        }
     }
 
     if needed.is_empty() {
@@ -5390,6 +5543,12 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("CStr", "std::ffi"),
         // str pattern (Session 128)
         ("Pattern", "std::str::pattern"),
+        // process additional (Session 129)
+        ("Child", "std::process"),
+        ("Stdio", "std::process"),
+        // ffi additional (Session 129)
+        ("OsStr", "std::ffi"),
+        ("OsString", "std::ffi"),
         // External crates (Session 128)
         ("Serialize", "serde"),
         ("Deserialize", "serde"),
@@ -5404,6 +5563,8 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("StatusCode", "reqwest"),
         ("Value", "serde_json"),
         ("JoinHandle", "tokio::task"),
+        // External crates (Session 129)
+        ("IterTools", "itertools"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -5434,6 +5595,52 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                     }
                 }
             }
+        }
+    }
+
+    // 检测 itertools trait 方法调用 (Session 129)
+    // .interleave( / .intersperse( / .tuples( 等方法需要 IterTools trait 在作用域中
+    let itertools_methods: &[&str] = &[
+        "interleave",
+        "intersperse",
+        "tuples",
+        "group_by",
+        "permutations",
+        "combinations",
+        "step",
+        "multipeek",
+    ];
+    let mut itertools_method_found = false;
+    let mut method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &method_name in itertools_methods {
+            let method_call = format!(".{}(", method_name);
+            if line.contains(&method_call) {
+                itertools_method_found = true;
+                method_line = i + 1;
+                break;
+            }
+        }
+        if itertools_method_found {
+            break;
+        }
+    }
+
+    if itertools_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use itertools::IterTools;")
+                || (trimmed.contains("use itertools::{")
+                    && contains_type_usage(trimmed, "IterTools"))
+                || trimmed.starts_with("use itertools::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "IterTools".to_string(),
+                module_path: "itertools".to_string(),
+                usage_line: method_line,
+            });
         }
     }
 
@@ -5540,6 +5747,78 @@ pub fn verify_imports_report(content: &str) -> ImportReport {
         has_issues: total_issues > 0,
         modules_affected: modules,
     }
+}
+
+/// 生成导入检查的 Markdown 格式报告 (Session 129)
+///
+/// 调用 `verify_imports` 检查代码中的缺失导入,
+/// 生成人类可读的 Markdown 报告, 适用于:
+/// - CI/CD 流水线输出
+/// - 代码审查报告
+/// - PR 评论自动生成
+///
+/// # 输出格式
+///
+/// ```markdown
+/// # Import Report
+///
+/// **Total Issues:** 2
+/// **Modules Affected:** std::collections, std::sync
+///
+/// ## Missing Imports
+///
+/// | # | Type | Module | Line |
+/// |---|------|--------|------|
+/// | 1 | HashMap | std::collections | 1 |
+/// | 2 | Arc | std::sync | 1 |
+/// ```
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_imports_to_markdown;
+///
+/// let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+/// let md = verify_imports_to_markdown(code);
+/// assert!(md.contains("# Import Report"), "Markdown 应包含标题: {}", md);
+/// assert!(md.contains("HashMap"), "Markdown 应包含 HashMap: {}", md);
+/// assert!(md.contains("std::collections"), "Markdown 应包含模块路径: {}", md);
+///
+/// let clean = "fn foo() -> i32 { 42 }";
+/// let md = verify_imports_to_markdown(clean);
+/// assert!(md.contains("No issues"), "无问题应显示 No issues: {}", md);
+/// ```
+pub fn verify_imports_to_markdown(content: &str) -> String {
+    let report = verify_imports_report(content);
+
+    if !report.has_issues {
+        return "# Import Report\n\n**Status:** No issues found. All imports are complete.\n"
+            .to_string();
+    }
+
+    let mut md = String::new();
+
+    md.push_str("# Import Report\n\n");
+    md.push_str(&format!("**Total Issues:** {}\n", report.total_issues));
+    md.push_str(&format!(
+        "**Modules Affected:** {}\n\n",
+        report.modules_affected.join(", ")
+    ));
+    md.push_str("## Missing Imports\n\n");
+    md.push_str("| # | Type | Module | Line |\n");
+    md.push_str("|---|------|--------|------|\n");
+
+    for (idx, issue) in report.issues.iter().enumerate() {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            idx + 1,
+            issue.type_name,
+            issue.module_path,
+            issue.usage_line
+        ));
+    }
+
+    md
 }
 
 #[cfg(test)]
@@ -12324,6 +12603,453 @@ fn foo(
                 .iter()
                 .any(|i| i.type_name == "Serialize" && i.module_path == "serde"),
             "应包含 Serialize 问题"
+        );
+    }
+
+    // ===== Session 129: ensure_std_imports 新增类型测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_child() {
+        let code = "fn foo() -> Child { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::process::Child;"),
+            "应添加 Child 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_stdio() {
+        let code = "fn foo() -> Stdio { Stdio::piped() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::process::Stdio;"),
+            "应添加 Stdio 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_child_stdio_merged() {
+        let code = "fn foo() -> (Child, Stdio) { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::process::{Child, Stdio};"),
+            "应合并 process 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_osstr_osstring() {
+        let code = "fn foo(s: &OsStr) -> OsString { s.to_os_string() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::ffi::{OsStr, OsString};"),
+            "应合并 ffi 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_s129_idempotent() {
+        let code = "fn foo() -> (Child, Stdio, OsString) { unimplemented!() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "Session 129 新增 std 类型检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_std_imports_child_full_path_no_import() {
+        let code = "fn foo() -> std::process::Child { unimplemented!() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::process::Child;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 129: ensure_std_imports glob 导入排除测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_glob_parent_exclude() {
+        let code = "use std::sync::*;\nfn foo() -> AtomicBool { AtomicBool::new(true) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::sync::atomic::AtomicBool;"),
+            "use std::sync::*; 应覆盖 std::sync::atomic::AtomicBool: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_glob_exact_exclude() {
+        let code = "use std::collections::*;\nfn foo() -> HashMap<i32, i32> { HashMap::new() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::collections::HashMap;"),
+            "use std::collections::*; 应覆盖 HashMap: {}",
+            result
+        );
+    }
+
+    // ===== Session 129: ensure_external_imports itertools 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_itertools_tools() {
+        let code = "fn foo(v: Vec<i32>) { v.interleave(v.clone()); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use itertools::IterTools;"),
+            "应添加 IterTools 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_itertools_iproduct_macro() {
+        let code = "fn foo() { let v = iproduct!(0..3, 0..3); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use itertools::iproduct;"),
+            "应添加 itertools::iproduct 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_itertools_izip_macro() {
+        let code = "fn foo() { let v = izip!(vec![1], vec![2]); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use itertools::izip;"),
+            "应添加 itertools::izip 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_itertools_multiunzip_macro() {
+        let code = "fn foo() { let (a, b): (Vec<_>, Vec<_>) = multiunzip!(vec![(1, 2)]); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use itertools::multiunzip;"),
+            "应添加 itertools::multiunzip 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_itertools_macros_merged() {
+        let code = "fn foo() { iproduct!(0..3, 0..3); izip!(vec![1], vec![2]); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use itertools::{iproduct, izip};"),
+            "应合并 itertools 宏导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_itertools_full_path_no_import() {
+        let code = "fn foo() { itertools::iproduct!(0..3, 0..3); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use itertools::iproduct;"),
+            "全限定 itertools:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 129: ensure_external_imports thiserror 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_thiserror_derive() {
+        let code = "#[derive(Error)]\nenum MyError { Test }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use thiserror::Error;"),
+            "应添加 thiserror::Error 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_thiserror_already_imported() {
+        let code = "use thiserror::Error;\n#[derive(Error)]\nenum MyError { Test }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use thiserror::Error;").count();
+        assert_eq!(count, 1, "已有 thiserror 导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_thiserror_full_path_no_import() {
+        let code = "#[derive(thiserror::Error)]\nenum MyError { Test }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use thiserror::Error;"),
+            "全限定 thiserror::Error 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 129: ensure_external_imports async_trait 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_async_trait() {
+        let code = "#[async_trait]\ntrait Foo { async fn bar(&self); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use async_trait::async_trait;"),
+            "应添加 async_trait 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_async_trait_already_imported() {
+        let code =
+            "use async_trait::async_trait;\n#[async_trait]\ntrait Foo { async fn bar(&self); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use async_trait::async_trait;").count();
+        assert_eq!(count, 1, "已有 async_trait 导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_async_trait_full_path_no_import() {
+        let code = "#[async_trait::async_trait]\ntrait Foo { async fn bar(&self); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use async_trait::async_trait;"),
+            "全限定 async_trait::async_trait 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 129: ensure_external_imports glob 导入排除测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_glob_parent_exclude() {
+        let code = "use tokio::*;\nfn foo() -> JoinHandle<i32> { spawn(|| 42) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tokio::task::JoinHandle;"),
+            "use tokio::*; 应覆盖 tokio::task::JoinHandle: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glob_exact_exclude() {
+        let code = "use itertools::*;\nfn foo(v: Vec<i32>) { v.interleave(v.clone()); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use itertools::IterTools;"),
+            "use itertools::*; 应覆盖 IterTools: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s129_idempotent() {
+        let code =
+            "#[derive(Error)]\nenum E { T }\n#[async_trait]\ntrait Foo { async fn bar(&self); }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 129 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 129: verify_imports 新增类型测试 =====
+
+    #[test]
+    fn test_verify_imports_child_missing() {
+        let issues = verify_imports("fn foo() -> Child { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Child" && i.module_path == "std::process"),
+            "应检测到 Child 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_stdio_missing() {
+        let issues = verify_imports("fn foo() -> Stdio { Stdio::piped() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Stdio" && i.module_path == "std::process"),
+            "应检测到 Stdio 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_osstr_missing() {
+        let issues = verify_imports("fn foo(s: &OsStr) {}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "OsStr" && i.module_path == "std::ffi"),
+            "应检测到 OsStr 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_itertools_missing() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.interleave(v.clone()); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "IterTools" && i.module_path == "itertools"),
+            "应检测到 IterTools 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 129: verify_imports_to_markdown 测试 =====
+
+    #[test]
+    fn test_verify_imports_to_markdown_has_issues() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let md = verify_imports_to_markdown(code);
+        assert!(
+            md.contains("# Import Report"),
+            "Markdown 应包含标题: {}",
+            md
+        );
+        assert!(
+            md.contains("**Total Issues:** 1"),
+            "Markdown 应 total_issues=1: {}",
+            md
+        );
+        assert!(md.contains("HashMap"), "Markdown 应包含 HashMap: {}", md);
+        assert!(
+            md.contains("std::collections"),
+            "Markdown 应包含 std::collections: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_to_markdown_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let md = verify_imports_to_markdown(code);
+        assert!(md.contains("No issues"), "无问题应显示 No issues: {}", md);
+    }
+
+    #[test]
+    fn test_verify_imports_to_markdown_multiple_issues() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let md = verify_imports_to_markdown(code);
+        assert!(
+            md.contains("**Total Issues:** 2"),
+            "Markdown 应 total_issues=2: {}",
+            md
+        );
+        assert!(md.contains("| 1 |"), "Markdown 应包含表格行 1: {}", md);
+        assert!(md.contains("| 2 |"), "Markdown 应包含表格行 2: {}", md);
+    }
+
+    #[test]
+    fn test_verify_imports_to_markdown_table_header() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let md = verify_imports_to_markdown(code);
+        assert!(
+            md.contains("| # | Type | Module | Line |"),
+            "Markdown 应包含表头: {}",
+            md
+        );
+        assert!(
+            md.contains("|---|------|--------|------|"),
+            "Markdown 应包含分隔行: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_to_markdown_modules_affected() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let md = verify_imports_to_markdown(code);
+        assert!(
+            md.contains("**Modules Affected:**"),
+            "Markdown 应包含 Modules Affected: {}",
+            md
+        );
+        assert!(
+            md.contains("std::collections"),
+            "Markdown 应包含 std::collections 模块: {}",
+            md
+        );
+    }
+
+    // ===== Session 129: helper 函数测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_basic() {
+        let code = "use std::collections::*;\nuse serde::Serialize;\nuse itertools::*;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::collections".to_string()),
+            "应包含 std::collections glob: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"itertools".to_string()),
+            "应包含 itertools glob: {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"serde".to_string()),
+            "不应包含 serde (非 glob): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_empty() {
+        let code = "fn foo() -> i32 { 42 }";
+        let globs = extract_glob_imports(code);
+        assert!(globs.is_empty(), "无 glob 导入应为空: {:?}", globs);
+    }
+
+    #[test]
+    fn test_has_covering_glob_import_exact() {
+        let globs = vec!["std::sync".to_string()];
+        assert!(
+            has_covering_glob_import(&globs, "std::sync"),
+            "精确匹配应返回 true"
+        );
+    }
+
+    #[test]
+    fn test_has_covering_glob_import_parent() {
+        let globs = vec!["std::sync".to_string()];
+        assert!(
+            has_covering_glob_import(&globs, "std::sync::atomic"),
+            "父模块 glob 应覆盖子模块"
+        );
+    }
+
+    #[test]
+    fn test_has_covering_glob_import_no_match() {
+        let globs = vec!["std::collections".to_string()];
+        assert!(
+            !has_covering_glob_import(&globs, "std::sync"),
+            "不相关模块应返回 false"
+        );
+    }
+
+    #[test]
+    fn test_has_covering_glob_import_empty() {
+        let globs: Vec<String> = vec![];
+        assert!(
+            !has_covering_glob_import(&globs, "std::sync"),
+            "空 glob 列表应返回 false"
         );
     }
 }
