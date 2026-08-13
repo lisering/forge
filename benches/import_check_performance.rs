@@ -1,12 +1,12 @@
 #![allow(clippy::useless_vec)]
 
-//! 导入检查大规模性能基准测试 (Session 133)
+//! 导入检查大规模性能基准测试 (Session 133 + 137)
 //!
 //! 测试目标:
 //! 1. verify_imports_large — 大规模代码导入检查性能 (10/100/500/1000 行)
 //! 2. ensure_external_imports_large — 大规模外部 crate 导入检测性能
 //! 3. glob_import_detection — 混合 glob 导入检测性能 (简单/混合/嵌套)
-//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read() 等)
+//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read()/.zip()/.chain()/.enumerate() 等)
 //! 5. edge_cases — 边界情况 (空/单行/全限定路径/已导入/Unicode)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -37,6 +37,19 @@ fn build_missing_external_code(n: usize) -> String {
         ("Message", "fn f() -> Message { unimplemented!() }"),
         ("Config", "fn f() -> Config { unimplemented() }"),
         ("Cmd", "fn f() -> Cmd { Cmd::new(\"GET\") }"),
+        // Session 136+137 types
+        ("Mailgun", "fn f() -> Mailgun { unimplemented!() }"),
+        ("Charge", "fn f() -> Charge { unimplemented!() }"),
+        (
+            "PutObjectOutput",
+            "fn f() -> PutObjectOutput { unimplemented!() }",
+        ),
+        ("SdkConfig", "fn f() -> SdkConfig { unimplemented!() }"),
+        ("BasicClient", "fn f() -> BasicClient { unimplemented!() }"),
+        ("AccessToken", "fn f() -> AccessToken { unimplemented!() }"),
+        ("Pattern", "fn f() -> Pattern { unimplemented!() }"),
+        ("Cookie", "fn f() -> Cookie { unimplemented!() }"),
+        ("CookieJar", "fn f() -> CookieJar { unimplemented!() }"),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -62,6 +75,14 @@ fn build_complete_imports_code(n: usize) -> String {
         "use lettre::Message;",
         "use config::Config;",
         "use redis::Cmd;",
+        // Session 136+137 imports
+        "use mailgun::Mailgun;",
+        "use stripe::Charge;",
+        "use aws_sdk_s3::PutObjectOutput;",
+        "use aws_config::SdkConfig;",
+        "use oauth2::BasicClient;",
+        "use glob::Pattern;",
+        "use cookie::Cookie;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -103,11 +124,24 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".try_send(42)",
         ".gen_range(0..10)",
         ".par_iter()",
+        // Session 136+137 Iterator trait methods
+        ".map(|x| x)",
+        ".filter(|x| true)",
+        ".zip(other.iter())",
+        ".chain(other.iter())",
+        ".enumerate()",
     ];
     let mut code = String::new();
     for i in 0..n {
         let method = methods[i % methods.len()];
-        code.push_str(&format!("fn func_{}() {{ let x = unit{}; }}\n", i, method));
+        if method.contains("other") {
+            code.push_str(&format!(
+                "fn func_{}(v: Vec<i32>, other: Vec<i32>) {{ let x = v.iter(){}; }}\n",
+                i, method
+            ));
+        } else {
+            code.push_str(&format!("fn func_{}() {{ let x = unit{}; }}\n", i, method));
+        }
     }
     code
 }
@@ -334,6 +368,28 @@ fn edge_cases(c: &mut Criterion) {
             let code = build_missing_external_code(500);
             let result = ensure_external_imports(black_box(&code));
             black_box(result);
+        });
+    });
+
+    // Session 137: mailgun/stripe/aws-sdk/oauth2/glob/cookie 类型检测
+    group.bench_function("s136_s137_external_types", |b| {
+        b.iter(|| {
+            let code =
+                "fn foo() -> (Mailgun, Charge, PutObjectOutput, SdkConfig) { unimplemented!() }\n\
+                 fn bar() -> (BasicClient, Pattern, Cookie) { unimplemented!() }\n\
+                 fn baz() -> (Recipient, Customer, GetObjectOutput, BehaviorVersion) { unimplemented!() }\n\
+                 fn qux() -> (AccessToken, GlobBuilder, CookieJar) { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 137: .zip()/.chain()/.enumerate() trait 方法检测
+    group.bench_function("s137_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.iter().map(|x| x).filter(|&x| x > 0).zip(v.iter()).chain(v.iter()).enumerate(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
         });
     });
 

@@ -180,7 +180,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Mailgun/Recipient (mailgun) / Charge/Customer/PaymentIntent (stripe) / PutObjectOutput/GetObjectOutput (aws-sdk-s3) / SdkConfig/BehaviorVersion (aws-config) 等外部 crate 类型但未导入 use mailgun::... / use stripe::... / use aws_sdk_s3::... / use aws_config::... (Session 136)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 调用 .map()/.filter() 但未导入 use std::iter::Iterator; (Session 136 trait 方法检测)\n\n",
+  "❌ 禁止: 调用 .map()/.filter() 但未导入 use std::iter::Iterator; (Session 136 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 BasicClient/AuthorizationCode/AccessToken/CsrfToken/PkceCodeVerifier (oauth2) / Pattern/GlobBuilder (glob) / Cookie/CookieJar (cookie) 等外部 crate 类型但未导入 use oauth2::... / use glob::... / use cookie::... (Session 137)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .zip()/.chain()/.enumerate() 但未导入 use std::iter::Iterator; (Session 137 trait 方法检测)\n\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -1126,6 +1132,58 @@ mod tests {
         assert!(
             prompt.contains("Iterator"),
             "系统 prompt 应包含 Iterator 导入约束 (Session 136)"
+        );
+    }
+
+    // ===== Session 137: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s137_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("oauth2"),
+            "系统 prompt 应包含 oauth2 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("glob"),
+            "系统 prompt 应包含 glob 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("cookie"),
+            "系统 prompt 应包含 cookie 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("BasicClient"),
+            "系统 prompt 应包含 BasicClient 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("AccessToken"),
+            "系统 prompt 应包含 AccessToken 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("Pattern"),
+            "系统 prompt 应包含 Pattern 导入约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains("Cookie"),
+            "系统 prompt 应包含 Cookie 导入约束 (Session 137)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s137_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".zip()"),
+            "系统 prompt 应包含 .zip() trait 方法检测约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains(".chain()"),
+            "系统 prompt 应包含 .chain() trait 方法检测约束 (Session 137)"
+        );
+        assert!(
+            prompt.contains(".enumerate()"),
+            "系统 prompt 应包含 .enumerate() trait 方法检测约束 (Session 137)"
         );
     }
 }

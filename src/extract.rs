@@ -5586,6 +5586,18 @@ pub fn ensure_external_imports(content: &str) -> String {
         // aws-config (Session 136)
         ("SdkConfig", "aws_config"),
         ("BehaviorVersion", "aws_config"),
+        // oauth2 (Session 137)
+        ("BasicClient", "oauth2"),
+        ("AuthorizationCode", "oauth2"),
+        ("AccessToken", "oauth2"),
+        ("CsrfToken", "oauth2"),
+        ("PkceCodeVerifier", "oauth2"),
+        // glob (Session 137)
+        ("Pattern", "glob"),
+        ("GlobBuilder", "glob"),
+        // cookie (Session 137)
+        ("Cookie", "cookie"),
+        ("CookieJar", "cookie"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6189,11 +6201,14 @@ pub struct ImportIssue {
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
 /// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
 /// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
-/// - `.map()` / `.filter()` → `use std::iter::Iterator;` (Session 136)
+/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` → `use std::iter::Iterator;` (Session 136 + 137)
 /// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
 /// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
 /// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
 /// - `SdkConfig` / `BehaviorVersion` → `use aws_config::{...};` (Session 136)
+/// - `BasicClient` / `AuthorizationCode` / `AccessToken` / `CsrfToken` / `PkceCodeVerifier` → `use oauth2::{...};` (Session 137)
+/// - `Pattern` / `GlobBuilder` → `use glob::{...};` (Session 137)
+/// - `Cookie` / `CookieJar` → `use cookie::{...};` (Session 137)
 ///
 /// # 示例
 ///
@@ -6496,6 +6511,16 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("GetObjectOutput", "aws_sdk_s3"),
         ("SdkConfig", "aws_config"),
         ("BehaviorVersion", "aws_config"),
+        // External crates (Session 137)
+        ("BasicClient", "oauth2"),
+        ("AuthorizationCode", "oauth2"),
+        ("AccessToken", "oauth2"),
+        ("CsrfToken", "oauth2"),
+        ("PkceCodeVerifier", "oauth2"),
+        ("Pattern", "glob"),
+        ("GlobBuilder", "glob"),
+        ("Cookie", "cookie"),
+        ("CookieJar", "cookie"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7014,10 +7039,10 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 .map() / .filter() → Iterator trait 方法调用 (Session 136)
-    // .map() / .filter() 方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
+    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() → Iterator trait 方法调用 (Session 136 + 137)
+    // 这些方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
     // 此检测为建议性, 帮助明确导入
-    let iterator_methods: &[&str] = &["map", "filter"];
+    let iterator_methods: &[&str] = &["map", "filter", "zip", "chain", "enumerate"];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
     'outer: for (i, line) in lines.iter().enumerate() {
@@ -17707,5 +17732,479 @@ pub fn my_macro(input: TokenStream) -> TokenStream {
 "#;
         let result = validate_rust_braces(code);
         assert!(result.is_some(), "不平衡的 proc_macro 应报告问题");
+    }
+
+    // ===== Session 137: ensure_external_imports oauth2/glob/cookie 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_oauth2_basic_client() {
+        let code = "fn foo() -> BasicClient { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use oauth2::BasicClient;"),
+            "应添加 oauth2::BasicClient 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_oauth2_multiple() {
+        let code = "fn foo() -> (BasicClient, AuthorizationCode, AccessToken) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use oauth2::{") && result.contains("BasicClient"),
+            "应合并 oauth2 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("AuthorizationCode"),
+            "应包含 AuthorizationCode: {}",
+            result
+        );
+        assert!(
+            result.contains("AccessToken"),
+            "应包含 AccessToken: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_oauth2_csrf_pkce() {
+        let code = "fn foo() -> (CsrfToken, PkceCodeVerifier) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use oauth2::{") && result.contains("CsrfToken"),
+            "应合并 oauth2 CsrfToken/PkceCodeVerifier 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("PkceCodeVerifier"),
+            "应包含 PkceCodeVerifier: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_oauth2_full_path() {
+        let code = "fn foo() -> oauth2::BasicClient { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use oauth2::"),
+            "全限定 oauth2:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glob_pattern() {
+        let code = "fn foo() -> Pattern { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use glob::Pattern;"),
+            "应添加 glob::Pattern 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glob_multiple() {
+        let code = "fn foo() -> (Pattern, GlobBuilder) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use glob::{") && result.contains("Pattern"),
+            "应合并 glob 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("GlobBuilder"),
+            "应包含 GlobBuilder: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glob_full_path() {
+        let code = "fn foo() -> glob::Pattern { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use glob::"),
+            "全限定 glob:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cookie() {
+        let code = "fn foo() -> Cookie { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use cookie::Cookie;"),
+            "应添加 cookie::Cookie 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cookie_jar() {
+        let code = "fn foo() -> CookieJar { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use cookie::CookieJar;"),
+            "应添加 cookie::CookieJar 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cookie_multiple() {
+        let code = "fn foo() -> (Cookie, CookieJar) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use cookie::{") && result.contains("Cookie"),
+            "应合并 cookie 导入: {}",
+            result
+        );
+        assert!(result.contains("CookieJar"), "应包含 CookieJar: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cookie_full_path() {
+        let code = "fn foo() -> cookie::Cookie { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use cookie::"),
+            "全限定 cookie:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s137_idempotent() {
+        let code = "fn foo() -> (BasicClient, Pattern, Cookie) { unimplemented!() }\nfn bar() -> (AccessToken, GlobBuilder, CookieJar) { unimplemented!() }\nfn baz() -> (AuthorizationCode, CsrfToken, PkceCodeVerifier) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 137 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 137: verify_imports oauth2/glob/cookie 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_oauth2_missing() {
+        let issues = verify_imports("fn foo() -> BasicClient { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "BasicClient" && i.module_path == "oauth2"),
+            "应检测到 BasicClient 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_oauth2_access_token_missing() {
+        let issues = verify_imports("fn foo() -> AccessToken { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "AccessToken" && i.module_path == "oauth2"),
+            "应检测到 AccessToken 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_glob_missing() {
+        let issues = verify_imports("fn foo() -> Pattern { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Pattern" && i.module_path == "glob"),
+            "应检测到 Pattern 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cookie_missing() {
+        let issues = verify_imports("fn foo() -> Cookie { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Cookie" && i.module_path == "cookie"),
+            "应检测到 Cookie 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cookie_jar_missing() {
+        let issues = verify_imports("fn foo() -> CookieJar { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "CookieJar" && i.module_path == "cookie"),
+            "应检测到 CookieJar 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_oauth2_already_imported() {
+        let code = "use oauth2::BasicClient;\nfn foo() -> BasicClient { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "BasicClient" && i.module_path == "oauth2"),
+            "已有 oauth2::BasicClient 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_glob_already_imported() {
+        let code = "use glob::Pattern;\nfn foo() -> Pattern { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Pattern" && i.module_path == "glob"),
+            "已有 glob::Pattern 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cookie_already_imported() {
+        let code = "use cookie::Cookie;\nfn foo() -> Cookie { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Cookie" && i.module_path == "cookie"),
+            "已有 cookie::Cookie 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s137_combined() {
+        let code = "fn foo() -> (BasicClient, Pattern, Cookie) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "BasicClient"),
+            "应检测到 BasicClient: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Pattern"),
+            "应检测到 Pattern: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Cookie"),
+            "应检测到 Cookie: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 137: verify_imports .zip()/.chain()/.enumerate() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_zip_method_iterator() {
+        let issues = verify_imports("fn foo(a: Vec<i32>, b: Vec<i32>) { a.iter().zip(b.iter()); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .zip() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_chain_method_iterator() {
+        let issues =
+            verify_imports("fn foo(a: Vec<i32>, b: Vec<i32>) { a.iter().chain(b.iter()); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .chain() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_enumerate_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().enumerate(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .enumerate() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_zip_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(a: Vec<i32>, b: Vec<i32>) { a.iter().zip(b.iter()); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .zip() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_chain_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(a: Vec<i32>, b: Vec<i32>) { a.iter().chain(b.iter()); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .chain() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_enumerate_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().enumerate(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .enumerate() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_zip_glob_import() {
+        let code =
+            "use std::iter::*;\nfn foo(a: Vec<i32>, b: Vec<i32>) { a.iter().zip(b.iter()); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator (.zip): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_zip_chain_enumerate_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().zip(v.iter()).chain(v.iter()).enumerate(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (.zip+.chain+.enumerate 组合): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_all_iterator_methods_combined() {
+        let code =
+            "fn foo(v: Vec<i32>) { v.iter().map(|x| x).filter(|&x| x > 0).zip(v.iter()).chain(v.iter()).enumerate(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (全部方法组合): {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 137: validate_rust_braces const fn 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_basic() {
+        let code = "const fn foo(x: i32) -> i32 { x + 1 }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const fn 基本语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_with_generics() {
+        let code = "const fn foo<T: Copy>(x: T) -> T { x }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const fn 泛型应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_complex_body() {
+        let code = r#"
+const fn factorial(n: usize) -> usize {
+    if n <= 1 {
+        1
+    } else {
+        n * factorial(n - 1)
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const fn 复杂函数体应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_unbalanced() {
+        let code = "const fn foo(x: i32) -> i32 { x + 1";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 const fn 应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_with_array() {
+        let code = r#"
+const fn build_array() -> [i32; 3] {
+    [1, 2, 3]
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "const fn 返回数组应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_const_fn_nested() {
+        let code = r#"
+struct Foo {
+    x: i32,
+}
+
+impl Foo {
+    const fn new() -> Self {
+        Foo { x: 0 }
+    }
+
+    const fn with_x(mut self, x: i32) -> Self {
+        self.x = x;
+        self
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "impl 中的 const fn 应通过验证"
+        );
     }
 }
