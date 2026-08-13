@@ -279,6 +279,10 @@ harness = false
 name = "import_check_performance"
 harness = false
 
+[[bench]]
+name = "validate_braces_performance"
+harness = false
+
 # ── docs.rs 官方文档配置 ──────────────────────────────────
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]

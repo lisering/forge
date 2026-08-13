@@ -4882,6 +4882,11 @@ fn extract_glob_imports(content: &str) -> Vec<String> {
         if !trimmed.starts_with("use ") {
             continue;
         }
+        // Session 135: 移除行注释后再解析 (支持 use 语句中的 // 注释)
+        let trimmed = strip_use_line_comments(trimmed);
+        if !trimmed.starts_with("use ") {
+            continue;
+        }
         let rest = &trimmed[4..]; // skip "use "
         if !rest.ends_with(';') {
             continue;
@@ -4908,6 +4913,27 @@ fn extract_glob_imports(content: &str) -> Vec<String> {
     globs
 }
 
+/// 从 use 语句行中移除行注释 (Session 135)
+///
+/// use 语句中不包含字符串字面量, 因此可以安全地移除 `// ...` 注释。
+/// 排除 URL 中的 `://` 协议分隔符 (如 `http://`)。
+fn strip_use_line_comments(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            // 排除 :// (URL 中的协议分隔符)
+            if i > 0 && bytes[i - 1] == b':' {
+                i += 1;
+                continue;
+            }
+            return s[..i].trim_end().to_string();
+        }
+        i += 1;
+    }
+    s.to_string()
+}
+
 /// 将多行 use 语句合并为单行 (Session 134)
 ///
 /// 扫描代码中的 `use` 语句, 如果以 `{` 开头但未在同一行以 `};` 结束,
@@ -4929,11 +4955,14 @@ fn join_multiline_use_statements(content: &str) -> String {
 
             if open_count > close_count {
                 // 多行 use 语句: 合并后续行
-                let mut joined = line.to_string();
+                // Session 135: 对首行也移除行注释
+                let mut joined = strip_use_line_comments(line);
                 i += 1;
                 while i < lines.len() {
                     joined.push(' ');
-                    joined.push_str(lines[i]);
+                    // Session 135: 移除每行的注释后再合并
+                    let cleaned = strip_use_line_comments(lines[i]);
+                    joined.push_str(&cleaned);
                     let joined_trimmed = joined.trim();
                     let o = joined_trimmed.chars().filter(|&c| c == '{').count();
                     let c = joined_trimmed.chars().filter(|&c| c == '}').count();
@@ -5330,6 +5359,10 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `TypedHeader` → `use axum_extra::...;` (Session 133)
 /// - `Message` / `Transport` / `SmtpTransport` / `AsyncTransport` → `use lettre::{...};` (Session 133)
 /// - `Config` → `use config::Config;` (Session 133)
+/// - `Filter` / `Reply` → `use warp::{...};` (Session 135)
+/// - `HttpResponse` / `HttpRequest` / `Responder` / `HttpServer` → `use actix_web::{...};` (Session 135)
+/// - `EntityTrait` / `Database` / `DbConn` / `PaginatorTrait` → `use sea_orm::{...};` (Session 135)
+/// - `QueryDsl` / `RunQueryDsl` / `ExpressionMethods` / `PgConnection` / `SqliteConnection` → `use diesel::{...};` (Session 135)
 ///
 /// # 规则
 ///
@@ -5468,6 +5501,25 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("ItemFn", "syn"),
         ("ItemStruct", "syn"),
         ("ItemEnum", "syn"),
+        // warp (Session 135)
+        ("Filter", "warp"),
+        ("Reply", "warp"),
+        // actix-web (Session 135)
+        ("HttpResponse", "actix_web"),
+        ("HttpRequest", "actix_web"),
+        ("Responder", "actix_web"),
+        ("HttpServer", "actix_web"),
+        // sea-orm (Session 135)
+        ("EntityTrait", "sea_orm"),
+        ("Database", "sea_orm"),
+        ("DbConn", "sea_orm"),
+        ("PaginatorTrait", "sea_orm"),
+        // diesel (Session 135)
+        ("QueryDsl", "diesel"),
+        ("RunQueryDsl", "diesel"),
+        ("ExpressionMethods", "diesel"),
+        ("PgConnection", "diesel"),
+        ("SqliteConnection", "diesel"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6069,6 +6121,8 @@ pub struct ImportIssue {
 /// - `.try_send()` → `use std::sync::mpsc::Sender;` (Session 133)
 /// - `.await?` → `use anyhow::Result;` (Session 134)
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
+/// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
+/// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
 ///
 /// # 示例
 ///
@@ -6345,6 +6399,22 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("ItemFn", "syn"),
         ("ItemStruct", "syn"),
         ("ItemEnum", "syn"),
+        // External crates (Session 135)
+        ("Filter", "warp"),
+        ("Reply", "warp"),
+        ("HttpResponse", "actix_web"),
+        ("HttpRequest", "actix_web"),
+        ("Responder", "actix_web"),
+        ("HttpServer", "actix_web"),
+        ("EntityTrait", "sea_orm"),
+        ("Database", "sea_orm"),
+        ("DbConn", "sea_orm"),
+        ("PaginatorTrait", "sea_orm"),
+        ("QueryDsl", "diesel"),
+        ("RunQueryDsl", "diesel"),
+        ("ExpressionMethods", "diesel"),
+        ("PgConnection", "diesel"),
+        ("SqliteConnection", "diesel"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -6787,6 +6857,78 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                 type_name: "parse_quote".to_string(),
                 module_path: "syn".to_string(),
                 usage_line: syn_verify_macro_line,
+            });
+        }
+    }
+
+    // 检测 .collect() → FromIterator trait 方法调用 (Session 135)
+    // .collect() 方法需要 FromIterator trait 在作用域中 (通常通过 prelude 自动可用)
+    // 此检测为建议性, 帮助明确导入
+    let mut collect_method_found = false;
+    let mut collect_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // 跳过注释行和导入行
+        if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+            continue;
+        }
+        if line.contains(".collect(") {
+            collect_method_found = true;
+            collect_method_line = i + 1;
+            break;
+        }
+    }
+
+    if collect_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::iter::FromIterator;")
+                || (trimmed.contains("use std::iter::{")
+                    && contains_type_usage(trimmed, "FromIterator"))
+                || trimmed.starts_with("use std::iter::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "FromIterator".to_string(),
+                module_path: "std::iter".to_string(),
+                usage_line: collect_method_line,
+            });
+        }
+    }
+
+    // 检测 .into_iter() → IntoIterator trait 方法调用 (Session 135)
+    // .into_iter() 方法需要 IntoIterator trait 在作用域中 (通常通过 prelude 自动可用)
+    let mut into_iter_method_found = false;
+    let mut into_iter_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+            continue;
+        }
+        if line.contains(".into_iter()") {
+            into_iter_method_found = true;
+            into_iter_method_line = i + 1;
+            break;
+        }
+    }
+
+    if into_iter_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::iter::IntoIterator;")
+                || (trimmed.contains("use std::iter::{")
+                    && contains_type_usage(trimmed, "IntoIterator"))
+                || trimmed.starts_with("use std::iter::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "IntoIterator".to_string(),
+                module_path: "std::iter".to_string(),
+                usage_line: into_iter_method_line,
             });
         }
     }
@@ -16300,6 +16442,664 @@ fn foo(
         assert!(
             validate_rust_braces(code).is_none(),
             "字节字符串中的 {{ }} 不应被计数"
+        );
+    }
+
+    // ===== Session 135: ensure_external_imports warp/actix-web/sea-orm/diesel 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_warp_filter() {
+        let code = "fn foo() -> Filter { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use warp::Filter;"),
+            "应添加 warp::Filter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_warp_reply() {
+        let code = "fn foo() -> Reply { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use warp::Reply;"),
+            "应添加 warp::Reply 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_actix_http_response() {
+        let code = "fn foo() -> HttpResponse { HttpResponse::Ok().finish() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use actix_web::HttpResponse;"),
+            "应添加 actix_web::HttpResponse 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_actix_http_request() {
+        let code = "fn foo(req: HttpRequest) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use actix_web::HttpRequest;"),
+            "应添加 actix_web::HttpRequest 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_actix_responder() {
+        let code = "fn foo() -> impl Responder { \"hello\" }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use actix_web::Responder;"),
+            "应添加 actix_web::Responder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_actix_http_server() {
+        let code = "fn foo() -> HttpServer { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use actix_web::HttpServer;"),
+            "应添加 actix_web::HttpServer 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sea_orm_entity_trait() {
+        let code = "fn foo() -> EntityTrait { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sea_orm::EntityTrait;"),
+            "应添加 sea_orm::EntityTrait 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sea_orm_database() {
+        let code = "fn foo() -> Database { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sea_orm::Database;"),
+            "应添加 sea_orm::Database 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sea_orm_dbconn() {
+        let code = "fn foo() -> DbConn { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sea_orm::DbConn;"),
+            "应添加 sea_orm::DbConn 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_diesel_query_dsl() {
+        let code = "fn foo() -> QueryDsl { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use diesel::QueryDsl;"),
+            "应添加 diesel::QueryDsl 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_diesel_pg_connection() {
+        let code = "fn foo() -> PgConnection { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use diesel::PgConnection;"),
+            "应添加 diesel::PgConnection 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_diesel_sqlite_connection() {
+        let code = "fn foo() -> SqliteConnection { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use diesel::SqliteConnection;"),
+            "应添加 diesel::SqliteConnection 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_warp_full_path_no_import() {
+        let code = "fn foo() -> warp::Filter { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use warp::Filter;"),
+            "全限定 warp::Filter 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_actix_full_path_no_import() {
+        let code = "fn foo() -> actix_web::HttpResponse { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use actix_web::HttpResponse;"),
+            "全限定 actix_web::HttpResponse 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_diesel_full_path_no_import() {
+        let code = "fn foo() -> diesel::PgConnection { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use diesel::PgConnection;"),
+            "全限定 diesel::PgConnection 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_multiple_actix_merged() {
+        let code = "fn foo(req: HttpRequest) -> HttpResponse { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use actix_web::{HttpRequest, HttpResponse};"),
+            "多个 actix_web 类型应合并导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_multiple_diesel_merged() {
+        let code = "fn foo() -> (QueryDsl, PgConnection) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use diesel::{PgConnection, QueryDsl};"),
+            "多个 diesel 类型应合并导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s135_idempotent() {
+        let code =
+            "fn foo() -> (Filter, HttpResponse, EntityTrait, PgConnection) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 135 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 135: verify_imports warp/actix-web/sea-orm/diesel 测试 =====
+
+    #[test]
+    fn test_verify_imports_warp_filter_missing() {
+        let issues = verify_imports("fn foo() -> Filter { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Filter" && i.module_path == "warp"),
+            "应检测到 warp::Filter 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_actix_http_response_missing() {
+        let issues = verify_imports("fn foo() -> HttpResponse { HttpResponse::Ok().finish() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "HttpResponse" && i.module_path == "actix_web"),
+            "应检测到 actix_web::HttpResponse 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sea_orm_entity_trait_missing() {
+        let issues = verify_imports("fn foo() -> EntityTrait { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "EntityTrait" && i.module_path == "sea_orm"),
+            "应检测到 sea_orm::EntityTrait 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_diesel_query_dsl_missing() {
+        let issues = verify_imports("fn foo() -> QueryDsl { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "QueryDsl" && i.module_path == "diesel"),
+            "应检测到 diesel::QueryDsl 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_diesel_pg_connection_missing() {
+        let issues = verify_imports("fn foo() -> PgConnection { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "PgConnection" && i.module_path == "diesel"),
+            "应检测到 diesel::PgConnection 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_actix_already_imported() {
+        let code = "use actix_web::HttpResponse;\nfn foo() -> HttpResponse { HttpResponse::Ok().finish() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "HttpResponse" && i.module_path == "actix_web"),
+            "已有 actix_web::HttpResponse 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_diesel_already_imported() {
+        let code = "use diesel::PgConnection;\nfn foo() -> PgConnection { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "PgConnection" && i.module_path == "diesel"),
+            "已有 diesel::PgConnection 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 135: verify_imports .collect() / .into_iter() 测试 =====
+
+    #[test]
+    fn test_verify_imports_collect_method_fromiterator() {
+        let issues =
+            verify_imports("fn foo(v: Vec<i32>) { let x: Vec<i32> = v.iter().collect(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "FromIterator" && i.module_path == "std::iter"),
+            "应通过 .collect() 方法检测到 FromIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_collect_already_imported() {
+        let code = "use std::iter::FromIterator;\nfn foo(v: Vec<i32>) { let x: Vec<i32> = v.iter().collect(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "FromIterator" && i.module_path == "std::iter"),
+            "已有 FromIterator 导入不应通过 .collect() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_collect_glob_import() {
+        let code =
+            "use std::iter::*;\nfn foo(v: Vec<i32>) { let x: Vec<i32> = v.iter().collect(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "FromIterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 FromIterator: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_into_iter_method_intoiterator() {
+        let issues = verify_imports(
+            "fn foo(v: Vec<i32>) { for x in v.into_iter() { println!(\"{}\", x); } }",
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "IntoIterator" && i.module_path == "std::iter"),
+            "应通过 .into_iter() 方法检测到 IntoIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_into_iter_already_imported() {
+        let code = "use std::iter::IntoIterator;\nfn foo(v: Vec<i32>) { for x in v.into_iter() { println!(\"{}\", x); } }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "IntoIterator" && i.module_path == "std::iter"),
+            "已有 IntoIterator 导入不应通过 .into_iter() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_into_iter_glob_import() {
+        let code = "use std::iter::*;\nfn foo(v: Vec<i32>) { for x in v.into_iter() { println!(\"{}\", x); } }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "IntoIterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 IntoIterator: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_collect_and_into_iter_combined() {
+        let code = "fn foo(v: Vec<i32>) { let x: Vec<i32> = v.into_iter().collect(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "FromIterator" && i.module_path == "std::iter"),
+            "应检测到 FromIterator: {:?}",
+            issues
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "IntoIterator" && i.module_path == "std::iter"),
+            "应检测到 IntoIterator: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 135: extract_glob_imports 注释支持测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_with_line_comment() {
+        let code = "use std::{\n    // io module\n    io::*,\n    sync::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "带注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "带注释的 use 语句应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_multiple_comments() {
+        let code =
+            "use std::{\n    // first comment\n    io::*,\n    // second comment\n    sync::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "多个注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "多个注释的 use 语句应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_trailing_comment() {
+        let code = "use std::{\n    io::*, // trailing comment\n    sync::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "尾注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "尾注释的 use 语句应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_comment_and_type() {
+        let code =
+            "use std::{\n    // collection types\n    HashMap,\n    // io glob\n    io::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "混合注释和类型的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"std::collections".to_string()),
+            "HashMap 不是 glob, 不应包含: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_comment_only_line() {
+        let code = "use std::{\n    // just a comment\n    // another comment\n    io::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "纯注释行的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+    }
+
+    // ===== Session 135: strip_use_line_comments 测试 =====
+
+    #[test]
+    fn test_strip_use_line_comments_basic() {
+        assert_eq!(
+            strip_use_line_comments("use std::io::*; // comment"),
+            "use std::io::*;"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_line_comments_no_comment() {
+        assert_eq!(
+            strip_use_line_comments("use std::io::*;"),
+            "use std::io::*;"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_line_comments_url_not_stripped() {
+        // URL 中的 :// 不应被误判为注释
+        assert_eq!(
+            strip_use_line_comments("use example::http://example.com::*;"),
+            "use example::http://example.com::*;"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_line_comments_multiple_comments() {
+        let input = "use std::{io::*, sync::*}; // trailing // nested";
+        let result = strip_use_line_comments(input);
+        assert_eq!(result, "use std::{io::*, sync::*};");
+    }
+
+    // ===== Session 135: validate_rust_braces macro_rules! 增强测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_repetition() {
+        // $( $x:expr ),* 重复语法
+        let code = r#"
+macro_rules! vec_of {
+    ( $( $x:expr ),* ) => {
+        {
+            let mut v = Vec::new();
+            $( v.push($x); )*
+            v
+        }
+    };
+}
+
+fn main() {
+    let v = vec_of!(1, 2, 3);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "macro_rules! 重复语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_tt_muncher() {
+        // TT muncher 模式
+        let code = r#"
+macro_rules! parse_tokens {
+    (@parse $head:tt) => { $head };
+    (@parse $head:tt $($tail:tt)*) => {
+        parse_tokens!(@parse $($tail)*)
+    };
+    ($($tokens:tt)*) => {
+        parse_tokens!(@parse $($tokens)*)
+    };
+}
+
+fn main() {
+    let x = parse_tokens!(1 2 3);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "macro_rules! TT muncher 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_with_attrs() {
+        // 宏内含属性
+        let code = r#"
+macro_rules! make_struct {
+    ($name:ident) => {
+        #[derive(Debug, Clone)]
+        struct $name {
+            value: i32,
+        }
+    };
+}
+
+fn main() {
+    make_struct!(Foo);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "macro_rules! 含属性应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_nested_macros() {
+        // 嵌套宏调用
+        let code = r#"
+macro_rules! inner {
+    ($e:expr) => { $e + 1 };
+}
+
+macro_rules! outer {
+    ($e:expr) => {
+        {
+            let x = inner!($e);
+            x * 2
+        }
+    };
+}
+
+fn main() {
+    let y = outer!(5);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "嵌套 macro_rules! 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_complex_matchers() {
+        // 复杂匹配器: 多种 token 类型
+        let code = r#"
+macro_rules! complex {
+    ($name:ident, $ty:ty, $default:expr, $($field:ident: $ftype:ty),* $(,)?) => {
+        struct $name {
+            value: $ty,
+            default: $default,
+            $($field: $ftype,)*
+        }
+    };
+}
+
+fn main() {
+    complex!(MyStruct, i32, 0, x: String, y: bool);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "复杂 macro_rules! 匹配器应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_unbalanced() {
+        // 不平衡的 macro_rules! (缺少闭合大括号)
+        let code = r#"
+macro_rules! bad_macro {
+    () => {
+        println!("hello");
+"#;
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 macro_rules! 应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_macro_rules_with_raw_string() {
+        // 宏内含 raw string
+        let code = r##"
+macro_rules! regex_macro {
+    () => {
+        let pattern = r#"\{[^}]+\}"#;
+        println!("{}", pattern);
+    };
+}
+
+fn main() {
+    regex_macro!();
+}
+"##;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "含 raw string 的 macro_rules! 应通过验证"
         );
     }
 }

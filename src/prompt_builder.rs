@@ -168,7 +168,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Body/HeaderMap/Uri/Method (hyper) / Service/ServiceExt/Layer/BoxError (tower) / Status/Code/Channel (tonic) / TokenStream/Span/Ident/Literal (proc_macro2) / DeriveInput/ItemFn/ItemStruct/ItemEnum (syn) / quote!/format_ident!/parse_quote!/parse_str! (quote/syn 宏) 等外部 crate 类型或宏但未导入 use hyper::... / use tower::... / use tonic::... / use proc_macro2::... / use syn::... / use quote::... (Session 134)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 使用 .await? 但函数未返回 Result / 调用 .spawn() 但未导入 use tokio::spawn; (Session 134 trait 方法检测)\n\n",
+  "❌ 禁止: 使用 .await? 但函数未返回 Result / 调用 .spawn() 但未导入 use tokio::spawn; (Session 134 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 Filter/Reply (warp) / HttpResponse/HttpRequest/Responder/HttpServer (actix-web) / EntityTrait/Database/DbConn/PaginatorTrait (sea-orm) / QueryDsl/RunQueryDsl/ExpressionMethods/PgConnection/SqliteConnection (diesel) 等外部 crate 类型但未导入 use warp::... / use actix_web::... / use sea_orm::... / use diesel::... (Session 135)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .collect() 但未导入 use std::iter::FromIterator; / 调用 .into_iter() 但未导入 use std::iter::IntoIterator; (Session 135 trait 方法检测)\n\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -998,6 +1004,66 @@ mod tests {
         assert!(
             prompt.contains(".spawn()"),
             "系统 prompt 应包含 .spawn() trait 方法检测约束 (Session 134)"
+        );
+    }
+
+    // ===== Session 135: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s135_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("warp"),
+            "系统 prompt 应包含 warp 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("actix_web"),
+            "系统 prompt 应包含 actix_web 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("sea_orm"),
+            "系统 prompt 应包含 sea_orm 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("diesel"),
+            "系统 prompt 应包含 diesel 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("Filter"),
+            "系统 prompt 应包含 Filter 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("HttpResponse"),
+            "系统 prompt 应包含 HttpResponse 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("EntityTrait"),
+            "系统 prompt 应包含 EntityTrait 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("PgConnection"),
+            "系统 prompt 应包含 PgConnection 导入约束 (Session 135)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s135_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".collect()"),
+            "系统 prompt 应包含 .collect() trait 方法检测约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains(".into_iter()"),
+            "系统 prompt 应包含 .into_iter() trait 方法检测约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("FromIterator"),
+            "系统 prompt 应包含 FromIterator 导入约束 (Session 135)"
+        );
+        assert!(
+            prompt.contains("IntoIterator"),
+            "系统 prompt 应包含 IntoIterator 导入约束 (Session 135)"
         );
     }
 }
