@@ -201,6 +201,12 @@ impl SystemPrompt {
   "❌ 禁止: 调用 .take()/.rev()/.step_by() 但未导入 use std::iter::Iterator; (Session 139 trait 方法检测)\n",
   );
         prompt.push_str(
+"❌ 禁止: 使用 System/CpuCore/Disk (sysinfo) / SerialPort (serialport) / machine_uid (machine-uid) 等外部 crate 类型但未导入 use sysinfo::... / use serialport::... / use machine_uid::... (Session 141)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .cloned()/.copied()/.fuse() 但未导入 use std::iter::Iterator; (Session 141 trait 方法检测)\n",
+  );
+        prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
 
@@ -1304,6 +1310,50 @@ mod tests {
         assert!(
             prompt.contains(".step_by()"),
             "系统 prompt 应包含 .step_by() trait 方法检测约束 (Session 139)"
+        );
+    }
+
+    // ===== Session 141: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s141_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("sysinfo"),
+            "系统 prompt 应包含 sysinfo 导入约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains("serialport"),
+            "系统 prompt 应包含 serialport 导入约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains("machine_uid"),
+            "系统 prompt 应包含 machine_uid 导入约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains("System"),
+            "系统 prompt 应包含 System 导入约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains("SerialPort"),
+            "系统 prompt 应包含 SerialPort 导入约束 (Session 141)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s141_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".cloned()"),
+            "系统 prompt 应包含 .cloned() trait 方法检测约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains(".copied()"),
+            "系统 prompt 应包含 .copied() trait 方法检测约束 (Session 141)"
+        );
+        assert!(
+            prompt.contains(".fuse()"),
+            "系统 prompt 应包含 .fuse() trait 方法检测约束 (Session 141)"
         );
     }
 

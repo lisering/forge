@@ -1,12 +1,12 @@
 #![allow(clippy::useless_vec)]
 
-//! 导入检查大规模性能基准测试 (Session 133 + 137 + 138 + 139)
+//! 导入检查大规模性能基准测试 (Session 133 + 137 + 138 + 139 + 141)
 //!
 //! 测试目标:
 //! 1. verify_imports_large — 大规模代码导入检查性能 (10/100/500/1000 行)
 //! 2. ensure_external_imports_large — 大规模外部 crate 导入检测性能
 //! 3. glob_import_detection — 混合 glob 导入检测性能 (简单/混合/嵌套)
-//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read()/.zip()/.chain()/.enumerate()/.flat_map()/.peekable()/.skip()/.take()/.rev()/.step_by() 等)
+//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read()/.zip()/.chain()/.enumerate()/.flat_map()/.peekable()/.skip()/.take()/.rev()/.step_by()/.cloned()/.copied()/.fuse() 等)
 //! 5. edge_cases — 边界情况 (空/单行/全限定路径/已导入/Unicode)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -67,6 +67,11 @@ fn build_missing_external_code(n: usize) -> String {
             "ShadowBuilder",
             "fn f() -> ShadowBuilder { unimplemented!() }",
         ),
+        // Session 141 types
+        ("System", "fn f() -> System { System::new() }"),
+        ("CpuCore", "fn f() -> CpuCore { unimplemented!() }"),
+        ("Disk", "fn f() -> Disk { unimplemented!() }"),
+        ("SerialPort", "fn f() -> SerialPort { unimplemented!() }"),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -108,6 +113,9 @@ fn build_complete_imports_code(n: usize) -> String {
         "use env_logger::Builder;",
         "use notify::Watcher;",
         "use shadow_rs::ShadowBuilder;",
+        // Session 141 imports
+        "use sysinfo::System;",
+        "use serialport::SerialPort;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -163,6 +171,10 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".take(2)",
         ".rev()",
         ".step_by(3)",
+        // Session 141 Iterator trait methods
+        ".cloned()",
+        ".copied()",
+        ".fuse()",
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -462,6 +474,25 @@ fn edge_cases(c: &mut Criterion) {
     group.bench_function("s139_iterator_methods", |b| {
         b.iter(|| {
             let code = "fn foo(v: Vec<i32>) { v.iter().take(3).rev().step_by(2); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 141: sysinfo/serialport 类型检测
+    group.bench_function("s141_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> (System, CpuCore, Disk) { unimplemented!() }\n\
+                 fn bar() -> SerialPort { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 141: .cloned()/.copied()/.fuse() trait 方法检测
+    group.bench_function("s141_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
             let issues = verify_imports(black_box(code));
             black_box(issues);
         });

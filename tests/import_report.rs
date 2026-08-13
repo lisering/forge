@@ -819,3 +819,195 @@ fn test_import_report_json_markdown_consistency_s139() {
         );
     }
 }
+
+// ===== Session 141: JSON 报告 — sysinfo/serialport/machine-uid 测试 =====
+
+#[test]
+fn test_import_report_json_sysinfo_missing() {
+    let code = "fn foo() -> System { System::new() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("System"), "JSON 报告应包含 System: {}", json);
+    assert!(
+        json.contains("sysinfo"),
+        "JSON 报告应包含 sysinfo 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_sysinfo_cpu_core_missing() {
+    let code = "fn foo() -> CpuCore { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("CpuCore"),
+        "JSON 报告应包含 CpuCore: {}",
+        json
+    );
+    assert!(
+        json.contains("sysinfo"),
+        "JSON 报告应包含 sysinfo 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_sysinfo_disk_missing() {
+    let code = "fn foo() -> Disk { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Disk"), "JSON 报告应包含 Disk: {}", json);
+    assert!(
+        json.contains("sysinfo"),
+        "JSON 报告应包含 sysinfo 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_serialport_missing() {
+    let code = "fn foo() -> SerialPort { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("SerialPort"),
+        "JSON 报告应包含 SerialPort: {}",
+        json
+    );
+    assert!(
+        json.contains("serialport"),
+        "JSON 报告应包含 serialport 模块: {}",
+        json
+    );
+}
+
+// ===== Session 141: Markdown 报告 — sysinfo/serialport 测试 =====
+
+#[test]
+fn test_import_report_markdown_sysinfo_serialport() {
+    let code =
+        "fn foo() -> (System, CpuCore, Disk) { unimplemented!() }\nfn bar() -> SerialPort { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("sysinfo"),
+        "Markdown 报告应包含 sysinfo: {}",
+        md
+    );
+    assert!(
+        md.contains("serialport"),
+        "Markdown 报告应包含 serialport: {}",
+        md
+    );
+    assert!(md.contains("System"), "Markdown 报告应包含 System: {}", md);
+    assert!(
+        md.contains("SerialPort"),
+        "Markdown 报告应包含 SerialPort: {}",
+        md
+    );
+}
+
+// ===== Session 141: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s141_issues() {
+    let code = "fn foo() -> (System, CpuCore, Disk, SerialPort) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s141_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "sysinfo"
+                || i.module_path == "serialport"
+                || i.module_path == "machine_uid"
+        })
+        .collect();
+
+    assert!(
+        s141_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 141 外部 crate 导入问题: {:?}",
+        s141_issues
+    );
+}
+
+// ===== Session 141: .cloned()/.copied()/.fuse() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_cloned_copied_fuse() {
+    let code = "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 报告应包含 Iterator (.cloned/.copied/.fuse): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_cloned_copied_fuse() {
+    let code = "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 报告应包含 Iterator (.cloned/.copied/.fuse): {}",
+        md
+    );
+}
+
+// ===== Session 141: 多类型混合报告 (S139 + S141) =====
+
+#[test]
+fn test_import_report_mixed_s139_s141_types() {
+    let code = "fn foo() -> (Builder, Watcher, ShadowBuilder, System, CpuCore, Disk, SerialPort) { unimplemented!() }";
+    let report = verify_imports_report(code);
+
+    assert!(report.has_issues, "应有问题");
+    // Session 139 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "env_logger"),
+        "应包含 env_logger 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "notify"),
+        "应包含 notify 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "shadow_rs"),
+        "应包含 shadow_rs 问题"
+    );
+    // Session 141 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "sysinfo"),
+        "应包含 sysinfo 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "serialport"),
+        "应包含 serialport 问题"
+    );
+}
+
+// ===== Session 141: JSON / Markdown 双格式一致性 (S139 + S141) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s141() {
+    let code = "fn foo() -> (Builder, System, SerialPort, ShadowBuilder) { unimplemented!() }\nfn bar(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "Builder",
+        "System",
+        "SerialPort",
+        "ShadowBuilder",
+        "Iterator",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

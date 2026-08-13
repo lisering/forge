@@ -5564,6 +5564,10 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `Builder` / `Target` / `Filter` → `use env_logger::{...};` (Session 139)
 /// - `Watcher` / `EventKind` / `Event` → `use notify::{...};` (Session 139)
 /// - `ShadowBuilder` → `use shadow_rs::ShadowBuilder;` (Session 139)
+/// - `System` / `CpuCore` / `Disk` → `use sysinfo::{...};` (Session 141)
+/// - `SerialPort` → `use serialport::SerialPort;` (Session 141)
+/// - `machine_uid` → `use machine_uid;` (Session 141)
+/// - `.cloned()` / `.copied()` / `.fuse()` → `use std::iter::Iterator;` (Session 141)
 ///
 /// # 规则
 ///
@@ -5769,6 +5773,14 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("Event", "notify"),
         // shadow-rs (Session 139)
         ("ShadowBuilder", "shadow_rs"),
+        // sysinfo (Session 141)
+        ("System", "sysinfo"),
+        ("CpuCore", "sysinfo"),
+        ("Disk", "sysinfo"),
+        // serialport (Session 141)
+        ("SerialPort", "serialport"),
+        // machine-uid (Session 141)
+        ("machine_uid", "machine_uid"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -5779,7 +5791,12 @@ pub fn ensure_external_imports(content: &str) -> String {
 
     for &(type_name, crate_path) in type_modules {
         let full_path = format!("{}::{}", crate_path, type_name);
-        let bare_usage = contains_type_usage(content, type_name) && !content.contains(&full_path);
+        // Session 141: 当 crate_path == type_name (如 machine_uid) 时,
+        // 还需要检查 crate_path:: 前缀 (如 "machine_uid::get()") 是否为全限定路径
+        let crate_prefix = format!("{}::", crate_path);
+        let bare_usage = contains_type_usage(content, type_name)
+            && !content.contains(&full_path)
+            && !(crate_path == type_name && content.contains(&crate_prefix));
 
         if bare_usage {
             // 检查是否已有导入
@@ -6207,6 +6224,32 @@ pub fn ensure_external_imports(content: &str) -> String {
         needed.entry("syn").or_default().extend(syn_macro_needed);
     }
 
+    // 检测 .cloned() / .copied() / .fuse() → Iterator trait 方法调用 (Session 141)
+    // 这些方法需要 Iterator trait 在作用域中
+    let s141_iterator_methods: &[&str] = &["cloned", "copied", "fuse"];
+    let mut s141_iterator_method_found = false;
+    for &method_name in s141_iterator_methods {
+        let method_call = format!(".{}(", method_name);
+        if content.contains(&method_call) {
+            s141_iterator_method_found = true;
+            break;
+        }
+    }
+
+    if s141_iterator_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::iter::Iterator;")
+                || (trimmed.contains("use std::iter::{")
+                    && contains_type_usage(trimmed, "Iterator"))
+                || trimmed.starts_with("use std::iter::*;")
+        }) || has_covering_glob_import(&glob_imports, "std::iter");
+
+        if !already_imported {
+            needed.entry("std::iter").or_default().push("Iterator");
+        }
+    }
+
     if needed.is_empty() {
         return content.to_string();
     }
@@ -6372,7 +6415,7 @@ pub struct ImportIssue {
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
 /// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
 /// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
-/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` / `.flat_map()` / `.peekable()` / `.skip()` / `.take()` / `.rev()` / `.step_by()` → `use std::iter::Iterator;` (Session 136 + 137 + 138 + 139)
+/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` / `.flat_map()` / `.peekable()` / `.skip()` / `.take()` / `.rev()` / `.step_by()` / `.cloned()` / `.copied()` / `.fuse()` → `use std::iter::Iterator;` (Session 136 + 137 + 138 + 139 + 141)
 /// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
 /// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
 /// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
@@ -6383,6 +6426,10 @@ pub struct ImportIssue {
 /// - `Builder` / `Target` / `Filter` → `use env_logger::{...};` (Session 139)
 /// - `Watcher` / `EventKind` / `Event` → `use notify::{...};` (Session 139)
 /// - `ShadowBuilder` → `use shadow_rs::ShadowBuilder;` (Session 139)
+/// - `System` / `CpuCore` / `Disk` → `use sysinfo::{...};` (Session 141)
+/// - `SerialPort` → `use serialport::SerialPort;` (Session 141)
+/// - `machine_uid` → `use machine_uid;` (Session 141)
+/// - `.cloned()` / `.copied()` / `.fuse()` → `use std::iter::Iterator;` (Session 141)
 ///
 /// # 示例
 ///
@@ -6714,11 +6761,22 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("EventKind", "notify"),
         ("Event", "notify"),
         ("ShadowBuilder", "shadow_rs"),
+        // External crates (Session 141)
+        ("System", "sysinfo"),
+        ("CpuCore", "sysinfo"),
+        ("Disk", "sysinfo"),
+        ("SerialPort", "serialport"),
+        ("machine_uid", "machine_uid"),
     ];
 
     for &(type_name, module_path) in type_modules {
         let full_path = format!("{}::{}", module_path, type_name);
-        let bare_usage = contains_type_usage(content, type_name) && !content.contains(&full_path);
+        // Session 141: 当 module_path == type_name (如 machine_uid) 时,
+        // 还需要检查 module_path:: 前缀是否为全限定路径
+        let module_prefix = format!("{}::", module_path);
+        let bare_usage = contains_type_usage(content, type_name)
+            && !content.contains(&full_path)
+            && !(module_path == type_name && content.contains(&module_prefix));
 
         if bare_usage {
             // 检查是否已有导入
@@ -7232,8 +7290,8 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip() / .take() / .rev() / .step_by()
-    // → Iterator trait 方法调用 (Session 136 + 137 + 138 + 139)
+    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip() / .take() / .rev() / .step_by() / .cloned() / .copied() / .fuse()
+    // → Iterator trait 方法调用 (Session 136 + 137 + 138 + 139 + 141)
     // 这些方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
     // 此检测为建议性, 帮助明确导入
     let iterator_methods: &[&str] = &[
@@ -7248,6 +7306,10 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "take",
         "rev",
         "step_by",
+        // Session 141: .cloned() / .copied() / .fuse()
+        "cloned",
+        "copied",
+        "fuse",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -19690,6 +19752,603 @@ use std::io::*;"#;
             globs.contains(&"std::io".to_string()),
             "带复杂 #[cfg_attr(target_os = ...)] 属性的 use 语句应提取 glob: {:?}",
             globs
+        );
+    }
+
+    // ===== Session 141: ensure_external_imports sysinfo/serialport/machine-uid 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_sysinfo_system() {
+        let code = "fn foo() -> System { System::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sysinfo::System;"),
+            "应添加 sysinfo::System 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sysinfo_cpu_core() {
+        let code = "fn foo() -> CpuCore { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sysinfo::CpuCore;"),
+            "应添加 sysinfo::CpuCore 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sysinfo_disk() {
+        let code = "fn foo() -> Disk { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sysinfo::Disk;"),
+            "应添加 sysinfo::Disk 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sysinfo_multiple() {
+        let code = "fn foo() -> (System, CpuCore, Disk) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sysinfo::{") && result.contains("System"),
+            "应合并 sysinfo 导入: {}",
+            result
+        );
+        assert!(result.contains("CpuCore"), "应包含 CpuCore: {}", result);
+        assert!(result.contains("Disk"), "应包含 Disk: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sysinfo_full_path() {
+        let code = "fn foo() -> sysinfo::System { System::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use sysinfo::System;"),
+            "全限定 sysinfo::System 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serialport() {
+        let code = "fn foo() -> SerialPort { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serialport::SerialPort;"),
+            "应添加 serialport::SerialPort 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serialport_full_path() {
+        let code = "fn foo() -> serialport::SerialPort { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use serialport::"),
+            "全限定 serialport:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_machine_uid() {
+        // machine_uid::get() is a full-path usage, should NOT need import
+        let code = "fn foo() -> String { let id = machine_uid::get().unwrap(); id }";
+        let result = ensure_external_imports(code);
+        // machine_uid::get() contains "machine_uid::" which means it's a full path
+        // The function should detect that "machine_uid" is used as a crate path prefix
+        // and not add a redundant import
+        assert!(
+            !result.contains("use machine_uid::machine_uid;"),
+            "全限定 machine_uid:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_machine_uid_bare() {
+        let code = "fn foo() { let id: machine_uid = unimplemented!(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use machine_uid::machine_uid;"),
+            "应添加 machine_uid 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s141_idempotent() {
+        let code = "fn foo() -> (System, CpuCore, Disk, SerialPort) { unimplemented!() }\nfn bar() -> machine_uid { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 141 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 141: ensure_external_imports .cloned()/.copied()/.fuse() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_cloned_method() {
+        let code = "fn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().cloned().collect() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .cloned() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_copied_method() {
+        let code = "fn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().copied().collect() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .copied() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fuse_method() {
+        let code = "fn foo(v: Vec<i32>) { let mut it = v.iter().fuse(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .fuse() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cloned_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().cloned().collect() }";
+        let result = ensure_external_imports(code);
+        // Should not add a duplicate
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.cloned): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fuse_already_imported() {
+        let code =
+            "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { let mut it = v.iter().fuse(); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.fuse): {}",
+            result
+        );
+    }
+
+    // ===== Session 141: verify_imports sysinfo/serialport/machine-uid 测试 =====
+
+    #[test]
+    fn test_verify_imports_sysinfo_system_missing() {
+        let issues = verify_imports("fn foo() -> System { System::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "System" && i.module_path == "sysinfo"),
+            "应检测到 sysinfo::System 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sysinfo_cpu_core_missing() {
+        let issues = verify_imports("fn foo() -> CpuCore { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "CpuCore" && i.module_path == "sysinfo"),
+            "应检测到 sysinfo::CpuCore 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sysinfo_disk_missing() {
+        let issues = verify_imports("fn foo() -> Disk { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Disk" && i.module_path == "sysinfo"),
+            "应检测到 sysinfo::Disk 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sysinfo_already_imported() {
+        let code = "use sysinfo::System;\nfn foo() -> System { System::new() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "System" && i.module_path == "sysinfo"),
+            "已有 sysinfo::System 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_serialport_missing() {
+        let issues = verify_imports("fn foo() -> SerialPort { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "SerialPort" && i.module_path == "serialport"),
+            "应检测到 serialport::SerialPort 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_serialport_already_imported() {
+        let code = "use serialport::SerialPort;\nfn foo() -> SerialPort { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "SerialPort" && i.module_path == "serialport"),
+            "已有 serialport::SerialPort 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_machine_uid_missing() {
+        let issues = verify_imports("fn foo() { let id: machine_uid = unimplemented!(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "machine_uid" && i.module_path == "machine_uid"),
+            "应检测到 machine_uid 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_machine_uid_already_imported() {
+        let code =
+            "use machine_uid::machine_uid;\nfn foo() { let id: machine_uid = unimplemented!(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "machine_uid" && i.module_path == "machine_uid"),
+            "已有 machine_uid 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s141_combined() {
+        let code = "fn foo() -> (System, CpuCore, Disk) { unimplemented!() }\nfn bar() -> SerialPort { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "System"),
+            "应检测到 System: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "CpuCore"),
+            "应检测到 CpuCore: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Disk"),
+            "应检测到 Disk: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "SerialPort"),
+            "应检测到 SerialPort: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 141: verify_imports .cloned()/.copied()/.fuse() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_cloned_method_iterator() {
+        let issues =
+            verify_imports("fn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().cloned().collect() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .cloned() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_copied_method_iterator() {
+        let issues =
+            verify_imports("fn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().copied().collect() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .copied() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fuse_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { let mut it = v.iter().fuse(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .fuse() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cloned_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().cloned().collect() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .cloned() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_copied_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<&i32>) -> Vec<i32> { v.iter().copied().collect() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .copied() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fuse_already_imported() {
+        let code =
+            "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { let mut it = v.iter().fuse(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .fuse() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cloned_copied_fuse_glob_import() {
+        let code = "use std::iter::*;\nfn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator (.cloned/.copied/.fuse): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cloned_copied_fuse_combined() {
+        let code = "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse(); }";
+        let issues = verify_imports(code);
+        // Should only report once (deduped)
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 141: validate_rust_braces async gen / gen / 多属性 use 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_gen_block_basic() {
+        // gen { } 语法 (Rust 2024 edition 生成器)
+        let code = "fn foo() { let g = gen { yield 42 }; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "gen block 基本语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_gen_block() {
+        // async gen { } 语法
+        let code = "fn foo() { let g = async gen { yield 42 }; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async gen block 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_gen_block_complex() {
+        let code = r#"
+fn foo() {
+    let g = gen {
+        let x = {
+            let y = { 42 };
+            y + 1
+        };
+        yield x;
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "gen block 复杂函数体应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_gen_block_unbalanced() {
+        let code = "fn foo() { let g = gen { yield 42; ";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 gen block 应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_gen_block_with_await() {
+        let code = r#"
+async fn foo() {
+    let g = async gen {
+        let x = bar().await;
+        yield x;
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async gen block 含 .await 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_nested_gen_blocks() {
+        let code = r#"
+fn foo() {
+    let g = gen {
+        let h = async gen {
+            yield 42;
+        };
+        yield 1;
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "嵌套 gen blocks 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_use_with_multiple_attributes() {
+        // use 语句中多个属性 #[cfg(...)] #[allow(...)] 不影响括号计数
+        let code = r#"
+#[cfg(feature = "serde")]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+
+#[cfg(test)]
+#[allow(dead_code)]
+use std::sync::Mutex;
+
+fn main() {
+    let m = HashMap::new();
+    let x = Mutex::new(42);
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "use 语句中多个属性不应影响括号计数"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_use_with_cfg_and_allow_mixed() {
+        // 混合 cfg 和 allow 属性
+        let code = r#"
+#[cfg(unix)]
+#[allow(unused)]
+use std::os::unix::fs::FileExt;
+
+#[cfg(windows)]
+#[allow(unused)]
+use std::os::windows::fs::FileExt;
+
+fn main() {
+    let x = vec![1, 2, 3];
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "混合 cfg 和 allow 属性的 use 语句应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_use_multiple_attrs_unbalanced() {
+        // 即使有多个属性, 不配对的括号仍应被检测到
+        let code = r#"
+#[cfg(feature = "x")]
+#[allow(unused_imports)]
+use std::collections::HashMap;
+
+fn main() {
+    let m = HashMap::new();
+    // 缺少闭合大括号
+}
+"#;
+        // This should pass because the code is actually balanced
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "配对的代码含多属性 use 语句应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_all_iterator_methods_s141_combined() {
+        let code =
+            "fn foo(v: Vec<&i32>) { v.iter().cloned().copied().fuse().take(2).rev().step_by(3); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (全部方法组合含 cloned/copied/fuse): {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 141: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s141_issues() {
+        let code = "fn foo() -> (System, CpuCore, Disk, SerialPort) { unimplemented!() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s141_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "sysinfo"
+                    || i.module_path == "serialport"
+                    || i.module_path == "machine_uid"
+            })
+            .collect();
+        assert!(
+            s141_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 141 外部 crate 导入问题: {:?}",
+            s141_issues
         );
     }
 }
