@@ -126,7 +126,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Serialize/Deserialize/Regex/DateTime/NaiveDateTime 等外部 crate 类型但未导入 use serde::... / use regex::... / use chrono::... (Session 127)\n",
 );
         prompt.push_str(
-"❌ 禁止: 使用 info!/warn!/error!/debug!/trace! 等 tracing 宏但未导入 use tracing::{...}; (Session 127)\n\n",
+"❌ 禁止: 使用 info!/warn!/error!/debug!/trace! 等 tracing 宏但未导入 use tracing::{...}; (Session 127)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 Future/Poll/Waker/Layout/CString/CStr/Pattern 等类型但未导入 use std::future::... / use std::task::... / use std::alloc::... / use std::ffi::... / use std::str::pattern::... (Session 128)\n",
+);
+        prompt.push_str(
+"❌ 禁止: 使用 Client/Response/StatusCode (reqwest) / Value/json! (serde_json) / JoinHandle/spawn/join!/select! (tokio) 等外部 crate 类型或宏但未导入 use reqwest::... / use serde_json::... / use tokio::... (Session 128)\n\n",
 );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -634,6 +640,60 @@ mod tests {
         assert!(
             prompt.contains("use tracing::"),
             "系统 prompt 应包含 use tracing:: 导入约束 (Session 127)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s128_std_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Future"),
+            "系统 prompt 应包含 Future 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("Poll"),
+            "系统 prompt 应包含 Poll 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("Waker"),
+            "系统 prompt 应包含 Waker 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("std::future"),
+            "系统 prompt 应包含 std::future 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("std::task"),
+            "系统 prompt 应包含 std::task 导入约束 (Session 128)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s128_external_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("reqwest"),
+            "系统 prompt 应包含 reqwest 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("serde_json"),
+            "系统 prompt 应包含 serde_json 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("tokio"),
+            "系统 prompt 应包含 tokio 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("Client"),
+            "系统 prompt 应包含 Client 导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("json!"),
+            "系统 prompt 应包含 json! 宏导入约束 (Session 128)"
+        );
+        assert!(
+            prompt.contains("spawn"),
+            "系统 prompt 应包含 spawn 导入约束 (Session 128)"
         );
     }
 }

@@ -263,6 +263,10 @@ harness = false
 name = "myers_diff_performance"
 harness = false
 
+[[bench]]
+name = "ensure_imports_performance"
+harness = false
+
 # ── docs.rs 官方文档配置 ──────────────────────────────────
 # https://docs.rs/about/metadata
 [package.metadata.docs.rs]

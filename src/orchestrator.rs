@@ -762,6 +762,13 @@ where
     /// 文件头粗体黄色, hunk 头青色, 新增绿色, 删除红色。
     /// 默认 false (向后兼容)。
     pub colored_diff_enabled: bool,
+
+    /// 外部 crate 导入自动检测开关 — 代码修复后自动添加缺失的外部 crate 导入 (Session 128)
+    ///
+    /// 启用后, 在自动修复时调用 `ensure_external_imports` 检测并添加
+    /// reqwest/serde_json/tokio 等外部 crate 的缺失导入。
+    /// 默认 false (向后兼容)。
+    pub ensure_external_imports_enabled: bool,
 }
 
 /// 默认构造 — 使用 HeuristicClarificationChecker
@@ -820,6 +827,7 @@ where
             staged_fix_enabled: false,
             verify_imports_enabled: false,
             colored_diff_enabled: false,
+            ensure_external_imports_enabled: false,
         }
     }
 }
@@ -894,6 +902,7 @@ where
             fix_preview_enabled: self.fix_preview_enabled,
             verify_imports_enabled: self.verify_imports_enabled,
             colored_diff_enabled: self.colored_diff_enabled,
+            ensure_external_imports_enabled: self.ensure_external_imports_enabled,
         }
     }
 
@@ -1254,6 +1263,15 @@ where
         self
     }
 
+    /// 启用/禁用外部 crate 导入自动检测 (Session 128)
+    ///
+    /// 启用后, 自动修复时会调用 `ensure_external_imports` 检测并添加
+    /// reqwest/serde_json/tokio 等外部 crate 的缺失导入。
+    pub fn with_ensure_external_imports(mut self, enabled: bool) -> Self {
+        self.ensure_external_imports_enabled = enabled;
+        self
+    }
+
     /// 对项目运行 clippy 检查并打印结果 (Session 120)
     ///
     /// 在代码写入工作区后调用, 如果 clippy 发现问题则打印警告和错误。
@@ -1295,8 +1313,8 @@ where
     ) -> Vec<crate::extract::ExtractedFile> {
         use crate::extract::{
             apply_fixes_dry_run, apply_staged_fixes, apply_staged_fixes_preview,
-            compute_line_diff_unified, format_diff_summary, format_diff_unified_colored,
-            format_diff_unified_with_options, verify_imports,
+            compute_line_diff_unified, ensure_external_imports, format_diff_summary,
+            format_diff_unified_colored, format_diff_unified_with_options, verify_imports,
         };
 
         let mut fixed_files = Vec::with_capacity(files.len());
@@ -1334,7 +1352,7 @@ where
                 }
 
                 // Session 121: 分阶段修复时直接使用 apply_staged_fixes
-                let fixed_content = if self.staged_fix_enabled {
+                let mut fixed_content = if self.staged_fix_enabled {
                     apply_staged_fixes(&file.content)
                 } else {
                     let preview = apply_fixes_dry_run(&file.content);
@@ -1358,7 +1376,15 @@ where
                     }
                 };
 
-                // 分阶段修复模式: 检查是否有变化
+                // Session 128: 外部 crate 导入自动检测
+                if self.ensure_external_imports_enabled {
+                    let external_fixed = ensure_external_imports(&fixed_content);
+                    if external_fixed != fixed_content {
+                        println!("    📦 外部 crate 导入检测 {}: 添加缺失导入", file.path);
+                        fixed_content = external_fixed;
+                    }
+                }
+
                 if self.staged_fix_enabled {
                     if fixed_content != file.content {
                         fixed_count += 1;

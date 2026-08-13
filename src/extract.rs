@@ -4620,6 +4620,11 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
 /// - `mem` → `use std::mem;` (Session 127)
 /// - `NonZeroU32` / `NonZeroU64` / `NonZeroUsize` → `use std::num::{...};` (Session 127)
 /// - `Entry` → `use std::collections::hash_map::Entry;` (Session 127)
+/// - `Future` → `use std::future::Future;` (Session 128)
+/// - `Poll` / `Waker` → `use std::task::{Poll, Waker};` (Session 128)
+/// - `Layout` → `use std::alloc::Layout;` (Session 128)
+/// - `CString` / `CStr` → `use std::ffi::{CStr, CString};` (Session 128)
+/// - `Pattern` → `use std::str::pattern::Pattern;` (Session 128)
 ///
 /// # 规则
 ///
@@ -4746,6 +4751,18 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("NonZeroUsize", "std::num"),
         // collections::hash_map (Session 127)
         ("Entry", "std::collections::hash_map"),
+        // future (Session 128)
+        ("Future", "std::future"),
+        // task (Session 128)
+        ("Poll", "std::task"),
+        ("Waker", "std::task"),
+        // alloc (Session 128)
+        ("Layout", "std::alloc"),
+        // ffi (Session 128)
+        ("CString", "std::ffi"),
+        ("CStr", "std::ffi"),
+        // str pattern (Session 128)
+        ("Pattern", "std::str::pattern"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -4833,7 +4850,7 @@ pub fn ensure_std_imports(content: &str) -> String {
     result_lines.join("\n")
 }
 
-/// 检测并添加缺失的外部 crate 导入 (Session 127)
+/// 检测并添加缺失的外部 crate 导入 (Session 127 + Session 128 扩展)
 ///
 /// 与 `ensure_std_imports` 类似, 但针对常见的外部 crate 类型:
 ///
@@ -4841,6 +4858,10 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `Regex` → `use regex::Regex;`
 /// - `DateTime` / `NaiveDateTime` / `NaiveDate` / `NaiveTime` / `TimeZone` → `use chrono::{...};`
 /// - `tracing` 宏 (`info!` / `warn!` / `error!` / `debug!` / `trace!`) → `use tracing::{...};`
+/// - `Client` / `Response` / `StatusCode` → `use reqwest::{...};` (Session 128)
+/// - `Value` / `json!` → `use serde_json::{Value, json};` (Session 128)
+/// - `JoinHandle` → `use tokio::task::JoinHandle;` (Session 128)
+/// - `spawn` / `join!` / `select!` → `use tokio::{spawn, join, select};` (Session 128)
 ///
 /// # 规则
 ///
@@ -4884,6 +4905,14 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("NaiveDate", "chrono"),
         ("NaiveTime", "chrono"),
         ("TimeZone", "chrono"),
+        // reqwest (Session 128)
+        ("Client", "reqwest"),
+        ("Response", "reqwest"),
+        ("StatusCode", "reqwest"),
+        // serde_json (Session 128)
+        ("Value", "serde_json"),
+        // tokio::task (Session 128)
+        ("JoinHandle", "tokio::task"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -4939,6 +4968,92 @@ pub fn ensure_external_imports(content: &str) -> String {
     if !tracing_needed.is_empty() {
         tracing_needed.sort();
         needed.entry("tracing").or_default().extend(tracing_needed);
+    }
+
+    // 检测 serde_json::json! 宏使用 (Session 128)
+    let serde_json_macros: &[&str] = &["json"];
+    let mut serde_json_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in serde_json_macros {
+        let macro_pattern = format!("{}!(", macro_name);
+        let full_path = format!("serde_json::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_pattern) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use serde_json::{};", macro_name))
+                    || (trimmed.contains("use serde_json::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use serde_json::*;")
+            });
+
+            if !already_imported {
+                serde_json_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !serde_json_macro_needed.is_empty() {
+        serde_json_macro_needed.sort();
+        needed
+            .entry("serde_json")
+            .or_default()
+            .extend(serde_json_macro_needed);
+    }
+
+    // 检测 tokio 宏和函数使用 (Session 128)
+    // tokio::spawn (函数), tokio::join! / tokio::select! (宏)
+    // 注意: join! 通常使用 () 调用, select! 使用 {} 调用, 可能有空格
+    let tokio_macros: &[&str] = &["join", "select"];
+    let mut tokio_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in tokio_macros {
+        let macro_bang = format!("{}!", macro_name);
+        let full_path = format!("tokio::{}!", macro_name);
+
+        // 检测裸宏使用: "macro_name!" 存在且不 preceded by "tokio::"
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use tokio::{};", macro_name))
+                    || (trimmed.contains("use tokio::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use tokio::*;")
+            });
+
+            if !already_imported {
+                tokio_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    // 检测 tokio::spawn 函数使用 (排除 tokio::spawn 全限定路径)
+    let spawn_bare = contains_type_usage(content, "spawn") && !content.contains("tokio::spawn");
+    if spawn_bare {
+        // 检查是否已有导入
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use tokio::spawn;")
+                || (trimmed.contains("use tokio::{") && contains_type_usage(trimmed, "spawn"))
+                || trimmed.starts_with("use tokio::*;")
+        });
+
+        if !already_imported {
+            tokio_macro_needed.push("spawn");
+        }
+    }
+
+    if !tokio_macro_needed.is_empty() {
+        tokio_macro_needed.sort();
+        tokio_macro_needed.dedup();
+        needed
+            .entry("tokio")
+            .or_default()
+            .extend(tokio_macro_needed);
     }
 
     if needed.is_empty() {
@@ -5263,6 +5378,32 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("NonZeroUsize", "std::num"),
         // collections::hash_map (Session 127)
         ("Entry", "std::collections::hash_map"),
+        // future (Session 128)
+        ("Future", "std::future"),
+        // task (Session 128)
+        ("Poll", "std::task"),
+        ("Waker", "std::task"),
+        // alloc (Session 128)
+        ("Layout", "std::alloc"),
+        // ffi (Session 128)
+        ("CString", "std::ffi"),
+        ("CStr", "std::ffi"),
+        // str pattern (Session 128)
+        ("Pattern", "std::str::pattern"),
+        // External crates (Session 128)
+        ("Serialize", "serde"),
+        ("Deserialize", "serde"),
+        ("Regex", "regex"),
+        ("DateTime", "chrono"),
+        ("NaiveDateTime", "chrono"),
+        ("NaiveDate", "chrono"),
+        ("NaiveTime", "chrono"),
+        ("TimeZone", "chrono"),
+        ("Client", "reqwest"),
+        ("Response", "reqwest"),
+        ("StatusCode", "reqwest"),
+        ("Value", "serde_json"),
+        ("JoinHandle", "tokio::task"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -5304,6 +5445,101 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
     });
 
     issues
+}
+
+/// 导入检查报告 — JSON 格式导出 (Session 128)
+///
+/// 包含缺失导入的完整信息, 可序列化为 JSON 格式,
+/// 适用于 CI/CD 集成、IDE 插件和报告生成。
+///
+/// # 字段
+///
+/// - `total_issues`: 缺失导入总数
+/// - `issues`: 所有缺失导入的详细列表
+/// - `has_issues`: 是否有缺失导入 (`total_issues > 0`)
+/// - `modules_affected`: 受影响的模块路径列表 (去重)
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImportReport {
+    /// 缺失导入总数
+    pub total_issues: usize,
+    /// 所有缺失导入的详细列表
+    pub issues: Vec<ImportIssue>,
+    /// 是否有缺失导入
+    pub has_issues: bool,
+    /// 受影响的模块路径列表 (去重, 按字母序排列)
+    pub modules_affected: Vec<String>,
+}
+
+/// 生成导入检查的 JSON 格式报告 (Session 128)
+///
+/// 调用 `verify_imports` 检查代码中的缺失导入,
+/// 生成结构化的 `ImportReport` 并序列化为 JSON 字符串。
+///
+/// # 输出格式
+///
+/// ```json
+/// {
+///   "total_issues": 2,
+///   "issues": [
+///     {"type_name": "HashMap", "module_path": "std::collections", "usage_line": 1},
+///     {"type_name": "Arc", "module_path": "std::sync", "usage_line": 1}
+///   ],
+///   "has_issues": true,
+///   "modules_affected": ["std::collections", "std::sync"]
+/// }
+/// ```
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_imports_to_json;
+///
+/// let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+/// let json = verify_imports_to_json(code);
+/// assert!(json.contains("HashMap"), "JSON 应包含 HashMap: {}", json);
+/// assert!(json.contains("total_issues"), "JSON 应包含 total_issues: {}", json);
+///
+/// let clean = "fn foo() -> i32 { 42 }";
+/// let json = verify_imports_to_json(clean);
+/// assert!(json.contains("\"total_issues\": 0"), "无问题 JSON 应 total_issues=0: {}", json);
+/// ```
+pub fn verify_imports_to_json(content: &str) -> String {
+    let report = verify_imports_report(content);
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// 生成导入检查报告 (Session 128)
+///
+/// 与 `verify_imports_to_json` 相同逻辑, 但返回 `ImportReport` 结构体,
+/// 适用于程序化处理而非 JSON 序列化。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::verify_imports_report;
+///
+/// let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+/// let report = verify_imports_report(code);
+/// assert!(report.has_issues, "应有问题");
+/// assert_eq!(report.total_issues, 1, "应有 1 个问题");
+/// assert!(report.modules_affected.contains(&"std::collections".to_string()));
+/// ```
+pub fn verify_imports_report(content: &str) -> ImportReport {
+    let issues = verify_imports(content);
+
+    // 收集受影响的模块路径 (去重 + 排序)
+    let mut modules: Vec<String> = issues.iter().map(|i| i.module_path.clone()).collect();
+    modules.sort();
+    modules.dedup();
+
+    let total_issues = issues.len();
+
+    ImportReport {
+        total_issues,
+        issues,
+        has_issues: total_issues > 0,
+        modules_affected: modules,
+    }
 }
 
 #[cfg(test)]
@@ -11658,6 +11894,436 @@ fn foo(
             fixed.contains("use serde::Serialize;"),
             "apply_fixes_with_imports 应添加外部 crate 导入: {}",
             fixed
+        );
+    }
+
+    // ===== Session 128: ensure_external_imports reqwest 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_reqwest_client() {
+        let code = "fn foo() -> Client { Client::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use reqwest::Client;"),
+            "应添加 reqwest::Client 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_reqwest_response() {
+        let code = "fn foo(resp: Response) {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use reqwest::Response;"),
+            "应添加 reqwest::Response 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_reqwest_multiple() {
+        let code = "fn foo() -> (Client, Response) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use reqwest::{Client, Response};"),
+            "应合并 reqwest 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_reqwest_full_path() {
+        let code = "fn foo() -> reqwest::Client { reqwest::Client::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use reqwest::"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 128: ensure_external_imports serde_json 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_serde_json_value() {
+        let code = "fn foo() -> Value { Value::Null }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde_json::Value;"),
+            "应添加 serde_json::Value 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serde_json_macro() {
+        let code = "fn foo() { let v = json!({\"key\": 1}); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde_json::json;"),
+            "应添加 serde_json::json 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serde_json_value_and_macro_merged() {
+        let code = "fn foo() -> Value { json!({\"key\": 1}) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use serde_json::{Value, json};"),
+            "应合并 serde_json 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_serde_json_full_path() {
+        let code = "fn foo() -> serde_json::Value { serde_json::Value::Null }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use serde_json::"),
+            "全限定 serde_json 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 128: ensure_external_imports tokio 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_tokio_join_handle() {
+        let code = "fn foo() -> JoinHandle<i32> { spawn(|| 42) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio::task::JoinHandle;"),
+            "应添加 tokio::task::JoinHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_spawn() {
+        let code = "fn foo() { spawn(async {}); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio::spawn;"),
+            "应添加 tokio::spawn 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_join_macro() {
+        let code = "fn foo() { join!(bar(), baz()); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio::join;"),
+            "应添加 tokio::join 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_select_macro() {
+        let code = "fn foo() { select! { _ = bar() => {} } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio::select;"),
+            "应添加 tokio::select 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_multiple_merged() {
+        let code = "fn foo() { join!(bar(), baz()); select! { _ = baz() => {} } spawn(async {}); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tokio::{join, select, spawn};"),
+            "应合并 tokio 导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tokio_full_path_no_import() {
+        let code = "fn foo() { tokio::spawn(async {}); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tokio::spawn;"),
+            "全限定 tokio::spawn 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s128_idempotent() {
+        let code = "fn foo() -> (Client, Value) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 128 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 128: ensure_std_imports 新增类型测试 =====
+
+    #[test]
+    fn test_ensure_std_imports_future() {
+        let code = "fn foo() -> impl Future<Output = i32> { async { 42 } }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::future::Future;"),
+            "应添加 Future 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_poll_waker() {
+        let code = "fn foo(w: &Waker) -> Poll<i32> { Poll::Ready(42) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::task::{Poll, Waker};"),
+            "应合并 task 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_layout() {
+        let code = "fn foo() -> Layout { Layout::new::<i32>() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::alloc::Layout;"),
+            "应添加 Layout 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_cstring_cstr() {
+        let code = "fn foo(s: &CStr) -> CString { s.to_owned() }";
+        let result = ensure_std_imports(code);
+        assert!(
+            result.contains("use std::ffi::{CStr, CString};"),
+            "应合并 ffi 模块导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_future_full_path_no_import() {
+        let code = "fn foo() -> std::future::Future<Output = i32> { async { 42 } }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::future::Future;"),
+            "全限定路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_s128_idempotent() {
+        let code = "fn foo() -> (impl Future<Output = i32>, Poll<i32>) { unimplemented!() }";
+        let first = ensure_std_imports(code);
+        let second = ensure_std_imports(&first);
+        assert_eq!(first, second, "Session 128 新增 std 类型检测应幂等");
+    }
+
+    // ===== Session 128: verify_imports 新增类型测试 =====
+
+    #[test]
+    fn test_verify_imports_future_missing() {
+        let issues = verify_imports("fn foo() -> impl Future<Output = i32> { async { 42 } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Future" && i.module_path == "std::future"),
+            "应检测到 Future 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_poll_missing() {
+        let issues = verify_imports("fn foo() -> Poll<i32> { Poll::Ready(42) }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Poll" && i.module_path == "std::task"),
+            "应检测到 Poll 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_external_serde_missing() {
+        let issues = verify_imports("#[derive(Serialize)]\nstruct Foo { x: i32 }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Serialize" && i.module_path == "serde"),
+            "应检测到 Serialize 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_external_reqwest_missing() {
+        let issues = verify_imports("fn foo() -> Client { Client::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Client" && i.module_path == "reqwest"),
+            "应检测到 Client 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 128: verify_imports_to_json 测试 =====
+
+    #[test]
+    fn test_verify_imports_to_json_has_issues() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let json = verify_imports_to_json(code);
+        assert!(
+            json.contains("\"total_issues\": 1"),
+            "JSON 应 total_issues=1: {}",
+            json
+        );
+        assert!(
+            json.contains("\"has_issues\": true"),
+            "JSON 应 has_issues=true: {}",
+            json
+        );
+        assert!(json.contains("HashMap"), "JSON 应包含 HashMap: {}", json);
+        assert!(
+            json.contains("std::collections"),
+            "JSON 应包含 std::collections: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_to_json_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let json = verify_imports_to_json(code);
+        assert!(
+            json.contains("\"total_issues\": 0"),
+            "无问题 JSON 应 total_issues=0: {}",
+            json
+        );
+        assert!(
+            json.contains("\"has_issues\": false"),
+            "无问题 JSON 应 has_issues=false: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_to_json_multiple_issues() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let json = verify_imports_to_json(code);
+        assert!(
+            json.contains("\"total_issues\": 2"),
+            "JSON 应 total_issues=2: {}",
+            json
+        );
+        assert!(
+            json.contains("std::collections"),
+            "JSON 应包含 std::collections: {}",
+            json
+        );
+        assert!(
+            json.contains("std::sync"),
+            "JSON 应包含 std::sync: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_to_json_modules_affected() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let json = verify_imports_to_json(code);
+        assert!(
+            json.contains("modules_affected"),
+            "JSON 应包含 modules_affected: {}",
+            json
+        );
+        assert!(
+            json.contains("std::collections"),
+            "modules_affected 应包含 std::collections: {}",
+            json
+        );
+    }
+
+    // ===== Session 128: verify_imports_report 测试 =====
+
+    #[test]
+    fn test_verify_imports_report_has_issues() {
+        let code = "fn foo() -> HashMap<String, i32> { HashMap::new() }";
+        let report = verify_imports_report(code);
+        assert!(report.has_issues, "应有问题");
+        assert_eq!(report.total_issues, 1, "应有 1 个问题");
+        assert!(!report.issues.is_empty(), "issues 不应为空");
+        assert!(
+            report
+                .modules_affected
+                .contains(&"std::collections".to_string()),
+            "modules_affected 应包含 std::collections"
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_report_no_issues() {
+        let code = "fn foo() -> i32 { 42 }";
+        let report = verify_imports_report(code);
+        assert!(!report.has_issues, "不应有问题");
+        assert_eq!(report.total_issues, 0, "应有 0 个问题");
+        assert!(report.issues.is_empty(), "issues 应为空");
+        assert!(
+            report.modules_affected.is_empty(),
+            "modules_affected 应为空"
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_report_multiple_issues() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let report = verify_imports_report(code);
+        assert_eq!(report.total_issues, 2, "应有 2 个问题");
+        assert!(
+            report.modules_affected.len() >= 2,
+            "至少 2 个受影响模块: {:?}",
+            report.modules_affected
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_report_modules_sorted() {
+        let code = "fn foo() -> HashMap<String, Arc<i32>> { HashMap::new() }";
+        let report = verify_imports_report(code);
+        // modules_affected 应按字母序排列
+        for i in 1..report.modules_affected.len() {
+            assert!(
+                report.modules_affected[i - 1] <= report.modules_affected[i],
+                "modules_affected 应按字母序排列: {:?}",
+                report.modules_affected
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_imports_report_serde_issue() {
+        let code = "#[derive(Serialize)]\nstruct Foo { x: i32 }";
+        let report = verify_imports_report(code);
+        assert!(report.has_issues, "应有问题");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.type_name == "Serialize" && i.module_path == "serde"),
+            "应包含 Serialize 问题"
         );
     }
 }

@@ -217,9 +217,10 @@ pub use extract::{
     format_diff_unified_colored, format_diff_unified_with_options, generate_fix,
     merge_anyhow_imports, run_clippy_check, strip_string_content, validate_rust_braces,
     validate_rust_code_quality, validate_rust_code_quality_detailed, verify_idempotent,
-    verify_idempotent_detailed, verify_imports, wrap_last_expression_in_ok,
-    wrap_return_statements_in_ok, DefaultExtractor, DiffAlgorithm, FixPreview, IdempotencyResult,
-    ImportIssue, IssueType, LineDiff, LineDiffType, QualityIssue, StagedFixPreview,
+    verify_idempotent_detailed, verify_imports, verify_imports_report, verify_imports_to_json,
+    wrap_last_expression_in_ok, wrap_return_statements_in_ok, DefaultExtractor, DiffAlgorithm,
+    FixPreview, IdempotencyResult, ImportIssue, ImportReport, IssueType, LineDiff, LineDiffType,
+    QualityIssue, StagedFixPreview,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{

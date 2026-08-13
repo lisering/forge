@@ -332,6 +332,14 @@ enum Commands {
         #[arg(long)]
         colored_diff: bool,
 
+        /// 启用外部 crate 导入自动检测 (Session 128)
+        ///
+        /// 启用后, 在自动修复时调用 ensure_external_imports 检测并添加
+        /// reqwest/serde_json/tokio 等外部 crate 的缺失导入。
+        /// 默认禁用。
+        #[arg(long)]
+        ensure_external_imports: bool,
+
         /// 启用 pprof 火焰图分析 (需编译时 --features pprof)
         ///
         /// 启用后, 程序退出时自动生成火焰图 SVG 到指定路径。
@@ -901,6 +909,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
             preview: fix_preview,
             verify_imports,
             colored_diff,
+            ensure_external_imports,
             profile: _,
             profile_output: _,
         } => {
@@ -1098,6 +1107,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         fix_preview,
                         verify_imports,
                         colored_diff,
+                        ensure_external_imports,
                     )
                     .await?;
 
@@ -1135,6 +1145,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         fix_preview,
                         verify_imports,
                         colored_diff,
+                        ensure_external_imports,
                     )
                     .await?;
 
@@ -1190,6 +1201,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         fix_preview,
                         verify_imports,
                         colored_diff,
+                        ensure_external_imports,
                     )
                     .await?;
                 } else {
@@ -1224,6 +1236,7 @@ async fn run_command(cli: Cli, config: ForgeConfig) -> Result<()> {
                         fix_preview,
                         verify_imports,
                         colored_diff,
+                        ensure_external_imports,
                     )
                     .await?;
                 }
@@ -1345,6 +1358,7 @@ async fn run_with_clarifier<C, Q>(
     fix_preview: bool,
     verify_imports: bool,
     colored_diff: bool,
+    ensure_external_imports: bool,
 ) -> Result<()>
 where
     C: ChatClient,
@@ -1395,6 +1409,11 @@ where
     // Session 127: 彩色 diff
     if colored_diff {
         orch = orch.with_colored_diff(true);
+    }
+
+    // Session 128: 外部 crate 导入检测
+    if ensure_external_imports {
+        orch = orch.with_ensure_external_imports(true);
     }
 
     // Session 113: Web 工具集成
