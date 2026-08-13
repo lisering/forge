@@ -627,3 +627,195 @@ fn test_import_report_json_markdown_consistency_s138() {
         );
     }
 }
+
+// ===== Session 139: JSON 报告 — env_logger/notify/shadow-rs 测试 =====
+
+#[test]
+fn test_import_report_json_env_logger_missing() {
+    let code = "fn foo() -> Builder { Builder::new() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Builder"),
+        "JSON 报告应包含 Builder: {}",
+        json
+    );
+    assert!(
+        json.contains("env_logger"),
+        "JSON 报告应包含 env_logger 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_notify_missing() {
+    let code = "fn foo(w: &Watcher) { w.watch(); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Watcher"),
+        "JSON 报告应包含 Watcher: {}",
+        json
+    );
+    assert!(
+        json.contains("notify"),
+        "JSON 报告应包含 notify 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_shadow_rs_missing() {
+    let code = "fn foo() -> ShadowBuilder { ShadowBuilder::new() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("ShadowBuilder"),
+        "JSON 报告应包含 ShadowBuilder: {}",
+        json
+    );
+    assert!(
+        json.contains("shadow_rs"),
+        "JSON 报告应包含 shadow_rs 模块: {}",
+        json
+    );
+}
+
+// ===== Session 139: Markdown 报告 — env_logger/notify/shadow-rs 测试 =====
+
+#[test]
+fn test_import_report_markdown_env_logger_notify_shadow_rs() {
+    let code = "fn foo() -> (Builder, Watcher, ShadowBuilder) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Builder"),
+        "Markdown 报告应包含 Builder: {}",
+        md
+    );
+    assert!(
+        md.contains("env_logger"),
+        "Markdown 报告应包含 env_logger: {}",
+        md
+    );
+    assert!(
+        md.contains("Watcher"),
+        "Markdown 报告应包含 Watcher: {}",
+        md
+    );
+    assert!(md.contains("notify"), "Markdown 报告应包含 notify: {}", md);
+    assert!(
+        md.contains("ShadowBuilder"),
+        "Markdown 报告应包含 ShadowBuilder: {}",
+        md
+    );
+    assert!(
+        md.contains("shadow_rs"),
+        "Markdown 报告应包含 shadow_rs: {}",
+        md
+    );
+}
+
+// ===== Session 139: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s139_issues() {
+    let code = "fn foo() -> (Builder, Watcher, ShadowBuilder) { unimplemented!() }\nfn bar() -> (Target, EventKind) { unimplemented!() }\nfn baz() -> (Filter, Event) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+
+    let s139_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "env_logger"
+                || i.module_path == "notify"
+                || i.module_path == "shadow_rs"
+        })
+        .collect();
+
+    assert!(
+        s139_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 139 外部 crate 导入问题: {:?}",
+        s139_issues
+    );
+}
+
+// ===== Session 139: .take()/.rev()/.step_by() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_take_rev_step_by() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().take(3).rev().step_by(2); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 报告应包含 Iterator (.take/.rev/.step_by): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_take_rev_step_by() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().take(3).rev().step_by(2); }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 报告应包含 Iterator (.take/.rev/.step_by): {}",
+        md
+    );
+}
+
+// ===== Session 139: 多类型混合报告 (S138 + S139) =====
+
+#[test]
+fn test_import_report_mixed_s138_s139_types() {
+    let code = "fn foo() -> (EnvError, AppBuilder, Device, Builder, Watcher, ShadowBuilder) { unimplemented!() }";
+    let report = verify_imports_report(code);
+
+    assert!(report.has_issues, "应有问题");
+    // Session 138 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "dotenv"),
+        "应包含 dotenv 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "tauri"),
+        "应包含 tauri 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "wgpu"),
+        "应包含 wgpu 问题"
+    );
+    // Session 139 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "env_logger"),
+        "应包含 env_logger 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "notify"),
+        "应包含 notify 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "shadow_rs"),
+        "应包含 shadow_rs 问题"
+    );
+}
+
+// ===== Session 139: JSON / Markdown 双格式一致性 (S138 + S139) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s139() {
+    let code = "fn foo() -> (Builder, Device, EnvError, ShadowBuilder) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.iter().take(3).rev().step_by(1); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["Builder", "Device", "EnvError", "ShadowBuilder", "Iterator"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

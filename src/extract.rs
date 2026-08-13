@@ -5416,6 +5416,9 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
 /// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
 /// - `SdkConfig` / `BehaviorVersion` → `use aws_config::{...};` (Session 136)
+/// - `Builder` / `Target` / `Filter` → `use env_logger::{...};` (Session 139)
+/// - `Watcher` / `EventKind` / `Event` → `use notify::{...};` (Session 139)
+/// - `ShadowBuilder` → `use shadow_rs::ShadowBuilder;` (Session 139)
 ///
 /// # 规则
 ///
@@ -5611,6 +5614,16 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("Surface", "wgpu"),
         ("SurfaceConfiguration", "wgpu"),
         ("ShaderModule", "wgpu"),
+        // env_logger (Session 139)
+        ("Builder", "env_logger"),
+        ("Target", "env_logger"),
+        ("Filter", "env_logger"),
+        // notify (Session 139)
+        ("Watcher", "notify"),
+        ("EventKind", "notify"),
+        ("Event", "notify"),
+        // shadow-rs (Session 139)
+        ("ShadowBuilder", "shadow_rs"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6214,7 +6227,7 @@ pub struct ImportIssue {
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
 /// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
 /// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
-/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` / `.flat_map()` / `.peekable()` / `.skip()` → `use std::iter::Iterator;` (Session 136 + 137 + 138)
+/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` / `.flat_map()` / `.peekable()` / `.skip()` / `.take()` / `.rev()` / `.step_by()` → `use std::iter::Iterator;` (Session 136 + 137 + 138 + 139)
 /// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
 /// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
 /// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
@@ -6222,6 +6235,9 @@ pub struct ImportIssue {
 /// - `BasicClient` / `AuthorizationCode` / `AccessToken` / `CsrfToken` / `PkceCodeVerifier` → `use oauth2::{...};` (Session 137)
 /// - `Pattern` / `GlobBuilder` → `use glob::{...};` (Session 137)
 /// - `Cookie` / `CookieJar` → `use cookie::{...};` (Session 137)
+/// - `Builder` / `Target` / `Filter` → `use env_logger::{...};` (Session 139)
+/// - `Watcher` / `EventKind` / `Event` → `use notify::{...};` (Session 139)
+/// - `ShadowBuilder` → `use shadow_rs::ShadowBuilder;` (Session 139)
 ///
 /// # 示例
 ///
@@ -6545,6 +6561,14 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("Surface", "wgpu"),
         ("SurfaceConfiguration", "wgpu"),
         ("ShaderModule", "wgpu"),
+        // External crates (Session 139)
+        ("Builder", "env_logger"),
+        ("Target", "env_logger"),
+        ("Filter", "env_logger"),
+        ("Watcher", "notify"),
+        ("EventKind", "notify"),
+        ("Event", "notify"),
+        ("ShadowBuilder", "shadow_rs"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7063,8 +7087,8 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip()
-    // → Iterator trait 方法调用 (Session 136 + 137 + 138)
+    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip() / .take() / .rev() / .step_by()
+    // → Iterator trait 方法调用 (Session 136 + 137 + 138 + 139)
     // 这些方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
     // 此检测为建议性, 帮助明确导入
     let iterator_methods: &[&str] = &[
@@ -7076,6 +7100,9 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "flat_map",
         "peekable",
         "skip",
+        "take",
+        "rev",
+        "step_by",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -18794,5 +18821,534 @@ use std::io::*;"#;
         let code = "#[cfg(feature = \"x\")]\nuse std::fmt::Display;";
         let globs = extract_glob_imports(code);
         assert!(globs.is_empty(), "非 glob use 语句不应被提取: {:?}", globs);
+    }
+
+    // ===== Session 139: ensure_external_imports env_logger/notify/shadow-rs 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_env_logger_builder() {
+        let code = "fn foo() -> Builder { Builder::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use env_logger::Builder;"),
+            "应添加 env_logger::Builder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_env_logger_target() {
+        let code = "fn foo(t: &Target) { t.set_level(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use env_logger::Target;"),
+            "应添加 env_logger::Target 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_env_logger_filter() {
+        let code = "fn foo() -> Filter { Filter::new(\"info\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use env_logger::Filter;"),
+            "应添加 env_logger::Filter 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_env_logger_multiple() {
+        let code = "fn foo() -> (Builder, Target, Filter) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use env_logger::{") && result.contains("Builder"),
+            "应合并 env_logger 导入: {}",
+            result
+        );
+        assert!(result.contains("Filter"), "应包含 Filter: {}", result);
+        assert!(result.contains("Target"), "应包含 Target: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_env_logger_full_path() {
+        let code = "fn foo() -> env_logger::Builder { env_logger::Builder::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use env_logger::"),
+            "全限定 env_logger:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_notify_watcher() {
+        let code = "fn foo(w: &Watcher) { w.watch(Path::new(\".\"), RecursiveMode::Recursive); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use notify::Watcher;"),
+            "应添加 notify::Watcher 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_notify_event_kind() {
+        let code = "fn foo() -> EventKind { EventKind::Create(CreateKind::File) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use notify::EventKind;"),
+            "应添加 notify::EventKind 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_notify_event() {
+        let code = "fn foo(e: &Event) { println!(\"{:?}\", e); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use notify::Event;"),
+            "应添加 notify::Event 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_notify_multiple() {
+        let code = "fn foo() -> (Watcher, EventKind, Event) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use notify::{") && result.contains("Event"),
+            "应合并 notify 导入: {}",
+            result
+        );
+        assert!(result.contains("EventKind"), "应包含 EventKind: {}", result);
+        assert!(result.contains("Watcher"), "应包含 Watcher: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_notify_full_path() {
+        let code = "fn foo(w: &notify::Watcher) { w.watch(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use notify::"),
+            "全限定 notify:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_shadow_rs() {
+        let code = "fn foo() -> ShadowBuilder { ShadowBuilder::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use shadow_rs::ShadowBuilder;"),
+            "应添加 shadow_rs::ShadowBuilder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_shadow_rs_full_path() {
+        let code = "fn foo() -> shadow_rs::ShadowBuilder { shadow_rs::ShadowBuilder::new() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use shadow_rs::"),
+            "全限定 shadow_rs:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s139_idempotent() {
+        let code = "fn foo() -> (Builder, Watcher, ShadowBuilder) { unimplemented!() }\nfn bar() -> (Target, EventKind) { unimplemented!() }\nfn baz() -> (Filter, Event) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 139 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 139: verify_imports env_logger/notify/shadow-rs 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_env_logger_builder_missing() {
+        let issues = verify_imports("fn foo() -> Builder { Builder::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Builder" && i.module_path == "env_logger"),
+            "应检测到 env_logger::Builder 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_env_logger_already_imported() {
+        let code = "use env_logger::Builder;\nfn foo() -> Builder { Builder::new() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Builder" && i.module_path == "env_logger"),
+            "已有 env_logger::Builder 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_notify_watcher_missing() {
+        let issues = verify_imports("fn foo(w: &Watcher) { w.watch(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Watcher" && i.module_path == "notify"),
+            "应检测到 notify::Watcher 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_notify_already_imported() {
+        let code = "use notify::Watcher;\nfn foo(w: &Watcher) { w.watch(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Watcher" && i.module_path == "notify"),
+            "已有 notify::Watcher 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_shadow_rs_missing() {
+        let issues = verify_imports("fn foo() -> ShadowBuilder { ShadowBuilder::new() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ShadowBuilder" && i.module_path == "shadow_rs"),
+            "应检测到 shadow_rs::ShadowBuilder 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_shadow_rs_already_imported() {
+        let code =
+            "use shadow_rs::ShadowBuilder;\nfn foo() -> ShadowBuilder { ShadowBuilder::new() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "ShadowBuilder" && i.module_path == "shadow_rs"),
+            "已有 shadow_rs::ShadowBuilder 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 139: verify_imports .take()/.rev()/.step_by() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_take_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().take(3); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .take() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rev_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().rev(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .rev() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_step_by_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().step_by(2); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .step_by() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_take_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().take(3); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .take() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rev_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().rev(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .rev() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_step_by_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().step_by(2); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .step_by() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_take_glob_import() {
+        let code = "use std::iter::*;\nfn foo(v: Vec<i32>) { v.iter().take(3); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator (.take): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_take_rev_step_by_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().take(3).rev().step_by(2); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (.take+.rev+.step_by 组合): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_all_iterator_methods_s139_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().map(|x| x).filter(|&x| x > 0).zip(v.iter()).chain(v.iter()).enumerate().flat_map(|x| Some(x)).peekable().skip(1).take(2).rev().step_by(3); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (全部方法组合含 take/rev/step_by): {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 139: validate_rust_braces async block 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_async_block_basic() {
+        let code = "fn foo() { let f = async { 42 }; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async block 基本语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_move_block() {
+        let code = "fn foo() { let x = 42; let f = async move { x + 1 }; }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async move block 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_with_await() {
+        let code = r#"
+async fn foo() -> i32 {
+    let x = async { bar().await };
+    x.await
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async block 含 .await 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_complex_body() {
+        let code = r#"
+fn foo() {
+    let f = async {
+        let x = {
+            let y = { 42 };
+            y + 1
+        };
+        x
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async block 复杂函数体应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_with_match() {
+        let code = r#"
+fn foo() {
+    let f = async {
+        match Some(42) {
+            Some(x) => x + 1,
+            None => 0,
+        }
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async block 含 match 表达式应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_unbalanced() {
+        let code = "fn foo() { let f = async { 42; ";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 async block 应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_nested() {
+        let code = r#"
+fn foo() {
+    let f = async {
+        let g = async move {
+            let h = async { 42 };
+            h
+        };
+        g
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "嵌套 async block 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_block_with_closure() {
+        let code = r#"
+fn foo() {
+    let f = async {
+        let f = |x: i32| { x * 2 };
+        f(42)
+    };
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async block 含闭包应通过验证"
+        );
+    }
+
+    // ===== Session 139: extract_glob_imports cfg_attr 属性测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_attr() {
+        let code = r#"#[cfg_attr(feature = "x", derive(Debug))]
+use std::io::*;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "带 #[cfg_attr] 属性的 use 语句应提取 glob: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_attr_multiple() {
+        let code = r#"#[cfg_attr(feature = "x", derive(Debug))]
+use std::io::*;
+#[cfg_attr(feature = "y", derive(Clone))]
+use std::sync::*;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含 std::io (cfg_attr): {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "应包含 std::sync (cfg_attr): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_cfg_attr_and_cfg_mixed() {
+        let code = r#"#[cfg(feature = "a")]
+use std::fmt::*;
+#[cfg_attr(feature = "b", derive(Debug))]
+use std::io::*;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::fmt".to_string()),
+            "应包含 std::fmt (cfg): {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含 std::io (cfg_attr): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_cfg_attr_not_affecting_non_glob() {
+        let code = r#"#[cfg_attr(feature = "x", derive(Debug))]
+use std::fmt::Display;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.is_empty(),
+            "非 glob use 语句 (带 cfg_attr) 不应被提取: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_cfg_attr_complex() {
+        let code = r#"#[cfg_attr(target_os = "linux", derive(Debug))]
+use std::io::*;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "带复杂 #[cfg_attr(target_os = ...)] 属性的 use 语句应提取 glob: {:?}",
+            globs
+        );
     }
 }

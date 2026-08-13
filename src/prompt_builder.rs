@@ -192,7 +192,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 EnvError (dotenv) / AppBuilder/AppHandle/Manager/Invoke (tauri) / Device/Queue/Surface/SurfaceConfiguration/ShaderModule (wgpu) 等外部 crate 类型但未导入 use dotenv::... / use tauri::... / use wgpu::... (Session 138)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 调用 .flat_map()/.peekable()/.skip() 但未导入 use std::iter::Iterator; (Session 138 trait 方法检测)\n\n",
+  "❌ 禁止: 调用 .flat_map()/.peekable()/.skip() 但未导入 use std::iter::Iterator; (Session 138 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 Builder/Target/Filter (env_logger) / Watcher/EventKind/Event (notify) / ShadowBuilder (shadow-rs) 等外部 crate 类型但未导入 use env_logger::... / use notify::... / use shadow_rs::... (Session 139)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .take()/.rev()/.step_by() 但未导入 use std::iter::Iterator; (Session 139 trait 方法检测)\n\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -1246,6 +1252,52 @@ mod tests {
         assert!(
             prompt.contains(".skip()"),
             "系统 prompt 应包含 .skip() trait 方法检测约束 (Session 138)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s139_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("env_logger"),
+            "系统 prompt 应包含 env_logger 导入约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains("notify"),
+            "系统 prompt 应包含 notify 导入约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains("shadow_rs"),
+            "系统 prompt 应包含 shadow_rs 导入约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains("Builder"),
+            "系统 prompt 应包含 Builder 导入约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains("Watcher"),
+            "系统 prompt 应包含 Watcher 导入约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains("ShadowBuilder"),
+            "系统 prompt 应包含 ShadowBuilder 导入约束 (Session 139)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s139_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".take()"),
+            "系统 prompt 应包含 .take() trait 方法检测约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains(".rev()"),
+            "系统 prompt 应包含 .rev() trait 方法检测约束 (Session 139)"
+        );
+        assert!(
+            prompt.contains(".step_by()"),
+            "系统 prompt 应包含 .step_by() trait 方法检测约束 (Session 139)"
         );
     }
 }
