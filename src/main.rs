@@ -127,7 +127,8 @@ enum Commands {
         /// 工作区目录 (默认: ./projects/develop)
         #[arg(short, long, default_value = "./projects/develop")]
         workspace: PathBuf,
-        #[arg(short, long, default_value = "3")]
+        /// 每个任务最大修复轮次 (默认: 5, Session 140 从 3 提升到 5)
+        #[arg(short, long, default_value = "5")]
         max_rounds: u32,
         #[arg(long, default_value = "180")]
         timeout: u64,
@@ -143,8 +144,8 @@ enum Commands {
         /// 工作区目录 (默认: ./projects/forge-project — AI 生成的源代码存放于此)
         #[arg(short, long, default_value = "./projects/forge-project")]
         workspace: PathBuf,
-        /// 每个任务最大修复轮次
-        #[arg(short, long, default_value = "3")]
+        /// 每个任务最大修复轮次 (默认: 5, Session 140 从 3 提升到 5)
+        #[arg(short, long, default_value = "5")]
         max_rounds: u32,
         /// 每次 AI 对话超时 (秒)
         #[arg(long, default_value = "180")]

@@ -4827,6 +4827,39 @@ where
                 println!("      {} ({}字符)", f.path, f.content.len());
             }
 
+            // === Session 140: 写入前预验证 — 检查 Rust 文件括号配对 ===
+            // 如果括号不配对, 说明文件可能被截断, 跳过写入直接进入修复轮
+            // 这比"写入后编译失败再修复"更高效, 节省 1 轮修复
+            let truncated = crate::extract::detect_truncated_files(&files);
+            if !truncated.is_empty() {
+                let truncation_msg: Vec<String> = truncated
+                    .iter()
+                    .map(|(path, issue)| format!("  文件 {} 括号不配对: {}", path, issue))
+                    .collect();
+                println!("    ⚠ 检测到 {} 个文件可能被截断:", truncated.len());
+                for msg in &truncation_msg {
+                    println!("{}", msg);
+                }
+
+                if attempt < self.max_rounds_per_task {
+                    // 构建修复 prompt, 明确告知 AI 哪些文件被截断
+                    let truncation_list = truncated
+                        .iter()
+                        .map(|(path, issue)| format!("  - {}: {}", path, issue))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    last_feedback = format!(
+                        "以下文件可能被截断 (括号不配对), 请重新输出完整文件内容:\n{}\n\n请确保每个文件的代码完整, 不要省略任何中间部分。",
+                        truncation_list
+                    );
+                    attempt += 1;
+                    continue;
+                } else {
+                    // 最终轮次, 仍然写入并尝试编译
+                    println!("    (最终轮次, 仍然写入并尝试编译)");
+                }
+            }
+
             // === 自动修复: 对 Rust 文件应用 apply_fixes (Session 118) ===
             let files = if self.auto_fix_enabled {
                 self.apply_auto_fixes_to_files(files)

@@ -198,7 +198,10 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Builder/Target/Filter (env_logger) / Watcher/EventKind/Event (notify) / ShadowBuilder (shadow-rs) 等外部 crate 类型但未导入 use env_logger::... / use notify::... / use shadow_rs::... (Session 139)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 调用 .take()/.rev()/.step_by() 但未导入 use std::iter::Iterator; (Session 139 trait 方法检测)\n\n",
+  "❌ 禁止: 调用 .take()/.rev()/.step_by() 但未导入 use std::iter::Iterator; (Session 139 trait 方法检测)\n",
+  );
+        prompt.push_str(
+  "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -210,7 +213,10 @@ impl SystemPrompt {
         prompt.push_str("✅ 必须: 确保所有 { } ( ) [ ] 配对 — 输出前逐个检查\n");
         prompt.push_str("✅ 必须: 公共 API (pub fn/struct/enum/trait) 有 /// 文档注释\n");
         prompt.push_str(
-            "✅ 必须: 返回 Result/Option/bool/Vec/String/&str/Box/Rc/Arc/Cow/PathBuf 的公共函数添加 #[must_use] 属性\n\n",
+            "✅ 必须: 返回 Result/Option/bool/Vec/String/&str/Box/Rc/Arc/Cow/PathBuf 的公共函数添加 #[must_use] 属性\n",
+        );
+        prompt.push_str(
+            "✅ 必须: 每个文件输出完整 — 从 use 语句到最后的 } 闭合, 不要省略任何中间代码 (Session 140)\n\n",
         );
 
         prompt.push_str("📎 附件内容 (必须逐条执行):\n");
@@ -1298,6 +1304,25 @@ mod tests {
         assert!(
             prompt.contains(".step_by()"),
             "系统 prompt 应包含 .step_by() trait 方法检测约束 (Session 139)"
+        );
+    }
+
+    // ===== Session 140: 代码完整性约束测试 =====
+
+    #[test]
+    fn test_build_contains_s140_completeness_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("不完整的文件"),
+            "系统 prompt 应包含不完整文件禁止约束 (Session 140)"
+        );
+        assert!(
+            prompt.contains("完整输出"),
+            "系统 prompt 应包含完整输出要求 (Session 140)"
+        );
+        assert!(
+            prompt.contains("不要省略任何中间代码"),
+            "系统 prompt 应包含不省略中间代码约束 (Session 140)"
         );
     }
 }

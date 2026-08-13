@@ -18,7 +18,11 @@ fn normalize_file_markers_regex() -> &'static Regex {
     })
 }
 
-/// 预编译正则: 模式1 — ```file:path\n...``` 或 ```lang:path\n...```
+/// 预编译正则: 模式1 — ```file:path\n...``` 或 ```lang:path\n...``` (已弃用, 改用逐行解析)
+///
+/// Session 140: `extract_tagged_files` 已改用逐行解析 (`parse_code_fence_open` +
+/// `is_code_fence_close`), 正确处理代码内容中的嵌套反引号。此正则保留供测试参考。
+#[allow(dead_code)]
 fn tagged_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -484,25 +488,122 @@ pub fn extract_files(text: &str) -> Vec<ExtractedFile> {
     // 验证提取的文件
     validate_extracted_files(&result);
 
+    // Session 140: 截断检测 — 对 .rs 文件检查括号配对
+    let truncated = detect_truncated_files(&result);
+    if !truncated.is_empty() {
+        for (path, issue) in &truncated {
+            warn!("⚠ 文件 {} 可能被截断: {}", path, issue);
+        }
+    }
+
     result
 }
 
+/// 检查行是否是代码块开始标记 (```file:path 或 ```lang:path)
+///
+/// 返回 Some((path, fence_backtick_count)) 如果是开始标记, 否则 None。
+/// fence_backtick_count 是开头的反引号数量 (3 或更多)。
+fn parse_code_fence_open(line: &str) -> Option<(String, usize)> {
+    let trimmed = line.trim_start();
+    // 统计开头的反引号数量
+    let backtick_count = trimmed.chars().take_while(|&c| c == '`').count();
+    if backtick_count < 3 {
+        return None;
+    }
+    let rest = &trimmed[backtick_count..];
+    // 检查是否是 file:path 或 lang:path 格式
+    if rest.is_empty() {
+        return None; // 普通 ``` 开始标记 (无路径), 不是 tagged 格式
+    }
+    // 必须有冒号分隔符: file:path 或 lang:path
+    if let Some(colon_pos) = rest.find(':') {
+        let _lang_part = &rest[..colon_pos];
+        let path_part = &rest[colon_pos + 1..].trim();
+        if !path_part.is_empty() {
+            return Some((path_part.to_string(), backtick_count));
+        }
+    }
+    None
+}
+
+/// 检查行是否是代码块结束标记 (``` 或更多反引号, 后面可选附加文本)
+///
+/// 返回 true 如果行的开头 (去除空白后) 反引号数量 >= fence_backtick_count。
+fn is_code_fence_close(line: &str, fence_backtick_count: usize) -> bool {
+    let trimmed = line.trim_start();
+    let backtick_count = trimmed.chars().take_while(|&c| c == '`').count();
+    // 结束标记的反引号数量必须 >= 开始标记的数量 (CommonMark 规范)
+    // 且行中反引号之后只能有空白或无内容
+    if backtick_count >= fence_backtick_count {
+        let after_backticks = &trimmed[backtick_count..];
+        return after_backticks.trim().is_empty();
+    }
+    false
+}
+
 /// 模式1: 提取标记代码块 ` ```file:path\n...``` ` 或 ` ```lang:path\n...``` `
+///
+/// 使用逐行解析代替正则表达式, 正确处理代码内容中包含 ``` 的情况。
+/// 这解决了正则非贪婪匹配 `(.*?)``` 在代码含嵌套反引号时截断的问题。
+///
+/// 解析规则 (CommonMark 兼容):
+/// 1. 行首 ``` (3+ 反引号) + `lang:path` → 开始代码块
+/// 2. 行首 ``` (N+ 反引号), N >= 开始反引号数, 后面无内容 → 结束代码块
+/// 3. 代码块内的 ``` 不被视为结束标记 (除非满足条件 2)
 fn extract_tagged_files(text: &str) -> Vec<ExtractedFile> {
-    let re_tagged = tagged_regex();
+    let lines: Vec<&str> = text.lines().collect();
     let mut files = Vec::new();
+    let mut i = 0;
 
-    for cap in re_tagged.captures_iter(text) {
-        let path = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-        let content = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-        let lang = guess_language_from_path(path);
+    while i < lines.len() {
+        // 检查当前行是否是代码块开始标记
+        if let Some((path, fence_count)) = parse_code_fence_open(lines[i]) {
+            // 收集代码块内容, 直到找到匹配的结束标记
+            let mut content_lines: Vec<&str> = Vec::new();
+            let mut found_close = false;
+            let mut j = i + 1;
 
-        if !path.is_empty() && !content.is_empty() {
-            files.push(ExtractedFile {
-                path: path.to_string(),
-                content: content.to_string(),
-                language: lang,
-            });
+            while j < lines.len() {
+                if is_code_fence_close(lines[j], fence_count) {
+                    found_close = true;
+                    break;
+                }
+                content_lines.push(lines[j]);
+                j += 1;
+            }
+
+            if found_close {
+                let content = content_lines.join("\n");
+                let lang = guess_language_from_path(&path);
+                if !path.is_empty() && !content.is_empty() {
+                    files.push(ExtractedFile {
+                        path: path.to_string(),
+                        content: content.to_string(),
+                        language: lang,
+                    });
+                }
+                i = j + 1; // 跳过结束标记行
+            } else {
+                // 没有找到结束标记 — 代码块未闭合 (可能被截断)
+                // 仍然提取已收集的内容, 但标记为可能截断
+                let content = content_lines.join("\n");
+                let lang = guess_language_from_path(&path);
+                if !path.is_empty() && !content.is_empty() {
+                    warn!(
+                        "⚠ 代码块 [{}] 未找到结束标记, 可能被截断 (收集 {} 行)",
+                        path,
+                        content_lines.len()
+                    );
+                    files.push(ExtractedFile {
+                        path: path.to_string(),
+                        content: content.to_string(),
+                        language: lang,
+                    });
+                }
+                i = j; // 继续从当前位置
+            }
+        } else {
+            i += 1;
         }
     }
 
@@ -578,6 +679,50 @@ fn extract_file_marker_format(text: &str) -> Vec<ExtractedFile> {
     }
 
     files
+}
+
+/// 检测被截断的 Rust 文件
+///
+/// 对每个 .rs 文件调用 `validate_rust_braces` 检查括号配对。
+/// 如果括号不配对, 说明文件可能被截断 (AI 回复提取时丢失了中间内容)。
+///
+/// 返回被截断的文件路径列表 (路径 + 验证错误信息)。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::{detect_truncated_files, ExtractedFile};
+///
+/// // 正常文件 — 不截断
+/// let files = vec![ExtractedFile {
+///     path: "src/main.rs".to_string(),
+///     content: "fn main() { println!(\"hello\"); }".to_string(),
+///     language: "rust".to_string(),
+/// }];
+/// let truncated = detect_truncated_files(&files);
+/// assert!(truncated.is_empty());
+///
+/// // 截断文件 — 括号不配对
+/// let files = vec![ExtractedFile {
+///     path: "src/main.rs".to_string(),
+///     content: "fn main() {\n    // code here".to_string(),
+///     language: "rust".to_string(),
+/// }];
+/// let truncated = detect_truncated_files(&files);
+/// assert!(!truncated.is_empty());
+/// assert!(truncated[0].0.contains("main.rs"));
+/// ```
+pub fn detect_truncated_files(files: &[ExtractedFile]) -> Vec<(String, String)> {
+    let mut truncated = Vec::new();
+    for f in files {
+        if f.path.ends_with(".rs") {
+            if let Some(issue) = validate_rust_braces(&f.content) {
+                warn!("⚠ 文件 [{}] 可能被截断: {}", f.path, issue);
+                truncated.push((f.path.clone(), issue));
+            }
+        }
+    }
+    truncated
 }
 
 /// 去重: 同一路径取最后一个
@@ -8140,6 +8285,202 @@ fn foo() -> Result<i32, String> {
     #[test]
     fn test_extract_tagged_files_empty() {
         assert!(extract_tagged_files("no code blocks here").is_empty());
+    }
+
+    // ===== Session 140: 逐行解析 + 截断检测 测试 =====
+
+    #[test]
+    fn test_extract_tagged_files_nested_backticks_doc_comment() {
+        // 代码内容包含 doc comment 中的 ``` 示例 — 正则非贪婪匹配会截断
+        let text = "```file:src/main.rs
+/// Example:
+/// ```
+/// let x = 42;
+/// ```
+///
+/// This is a function.
+fn main() {
+    println!(\"hello\");
+}
+```";
+        let files = extract_tagged_files(text);
+        assert_eq!(files.len(), 1, "应提取 1 个文件");
+        let content = &files[0].content;
+        assert!(
+            content.contains("fn main()"),
+            "内容应包含 fn main(), got: {}",
+            content
+        );
+        assert!(content.contains("/// Example:"), "内容应包含 doc comment");
+        assert!(
+            content.contains("let x = 42;"),
+            "内容应包含嵌套 ``` 内的代码"
+        );
+        assert!(
+            content.contains("println!"),
+            "内容应包含 println!, got: {}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_extract_tagged_files_nested_backticks_string() {
+        // 代码内容包含字符串中的 ```
+        let text = "```file:src/main.rs
+fn main() {
+    let code = \"```\";
+    println!(\"{}\", code);
+}
+```";
+        let files = extract_tagged_files(text);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("let code"));
+        assert!(files[0].content.contains("println!"));
+    }
+
+    #[test]
+    fn test_extract_tagged_files_4_backticks_fence() {
+        // 使用 4 个反引号作为代码块标记, 内容中有 3 个反引号
+        let text = "````file:src/main.rs
+/// ```
+/// code here
+/// ```
+fn foo() {}
+````";
+        let files = extract_tagged_files(text);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("fn foo()"));
+        assert!(files[0].content.contains("code here"));
+    }
+
+    #[test]
+    fn test_extract_tagged_files_unclosed_fence_truncation() {
+        // 代码块未闭合 — 可能被截断
+        let text = "```file:src/main.rs
+fn main() {
+    // code continues...
+    let x = 42;
+    // but no closing fence";
+        let files = extract_tagged_files(text);
+        // 未闭合的代码块仍然提取内容 (带警告)
+        assert_eq!(files.len(), 1, "未闭合代码块应仍提取内容");
+        assert!(files[0].content.contains("fn main()"));
+        assert!(files[0].content.contains("let x = 42"));
+    }
+
+    #[test]
+    fn test_extract_tagged_files_multiple_with_nested() {
+        // 多个文件, 第一个包含嵌套 ```
+        let text = "```file:src/lib.rs
+/// Example:
+/// ```
+/// foo()
+/// ```
+pub fn foo() -> i32 { 42 }
+```
+```file:Cargo.toml
+[package]
+name = \"test\"
+```";
+        let files = extract_tagged_files(text);
+        assert_eq!(files.len(), 2, "应提取 2 个文件");
+        let lib = files.iter().find(|f| f.path == "src/lib.rs").unwrap();
+        assert!(lib.content.contains("pub fn foo()"));
+        assert!(lib.content.contains("/// Example:"));
+        let cargo = files.iter().find(|f| f.path == "Cargo.toml").unwrap();
+        assert!(cargo.content.contains("[package]"));
+    }
+
+    #[test]
+    fn test_parse_code_fence_open_basic() {
+        assert_eq!(
+            parse_code_fence_open("```file:src/main.rs").unwrap().0,
+            "src/main.rs"
+        );
+        assert_eq!(
+            parse_code_fence_open("```rust:src/lib.rs").unwrap().0,
+            "src/lib.rs"
+        );
+        assert_eq!(parse_code_fence_open("````file:src/main.rs").unwrap().1, 4);
+    }
+
+    #[test]
+    fn test_parse_code_fence_open_not_fence() {
+        assert!(parse_code_fence_open("fn main() {}").is_none());
+        assert!(parse_code_fence_open("```rust").is_none()); // 无冒号路径
+        assert!(parse_code_fence_open("  text").is_none());
+    }
+
+    #[test]
+    fn test_is_code_fence_close_basic() {
+        assert!(is_code_fence_close("```", 3));
+        assert!(is_code_fence_close("````", 3)); // 4 >= 3
+        assert!(is_code_fence_close("  ```", 3)); // 前导空格 OK
+    }
+
+    #[test]
+    fn test_is_code_fence_close_not_close() {
+        assert!(!is_code_fence_close("```text", 3)); // 后面有文本
+        assert!(!is_code_fence_close("``", 3)); // 反引号不够
+        assert!(!is_code_fence_close("fn code() {}", 3));
+    }
+
+    #[test]
+    fn test_detect_truncated_files_normal() {
+        let files = vec![ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn main() { println!(\"hello\"); }".to_string(),
+            language: "rust".to_string(),
+        }];
+        let result = detect_truncated_files(&files);
+        assert!(result.is_empty(), "正常文件不应被标记为截断");
+    }
+
+    #[test]
+    fn test_detect_truncated_files_missing_brace() {
+        let files = vec![ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn main() {\n    // code here".to_string(),
+            language: "rust".to_string(),
+        }];
+        let result = detect_truncated_files(&files);
+        assert!(!result.is_empty(), "缺少闭合大括号应被检测为截断");
+        assert!(result[0].0.contains("main.rs"));
+    }
+
+    #[test]
+    fn test_detect_truncated_files_skips_non_rust() {
+        let files = vec![ExtractedFile {
+            path: "Cargo.toml".to_string(),
+            content: "[package]\nname = \"test\"".to_string(),
+            language: "toml".to_string(),
+        }];
+        let result = detect_truncated_files(&files);
+        assert!(result.is_empty(), "非 .rs 文件不应被检查");
+    }
+
+    #[test]
+    fn test_detect_truncated_files_multiple() {
+        let files = vec![
+            ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "fn main() {}".to_string(),
+                language: "rust".to_string(),
+            },
+            ExtractedFile {
+                path: "src/lib.rs".to_string(),
+                content: "pub fn foo() {\n    // missing close".to_string(),
+                language: "rust".to_string(),
+            },
+        ];
+        let result = detect_truncated_files(&files);
+        assert_eq!(result.len(), 1, "只有 1 个文件被截断");
+        assert!(result[0].0.contains("lib.rs"));
+    }
+
+    #[test]
+    fn test_detect_truncated_files_empty() {
+        assert!(detect_truncated_files(&[]).is_empty());
     }
 
     #[test]
