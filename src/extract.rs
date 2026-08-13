@@ -5598,6 +5598,19 @@ pub fn ensure_external_imports(content: &str) -> String {
         // cookie (Session 137)
         ("Cookie", "cookie"),
         ("CookieJar", "cookie"),
+        // dotenv (Session 138)
+        ("EnvError", "dotenv"),
+        // tauri (Session 138)
+        ("AppBuilder", "tauri"),
+        ("AppHandle", "tauri"),
+        ("Manager", "tauri"),
+        ("Invoke", "tauri"),
+        // wgpu (Session 138)
+        ("Device", "wgpu"),
+        ("Queue", "wgpu"),
+        ("Surface", "wgpu"),
+        ("SurfaceConfiguration", "wgpu"),
+        ("ShaderModule", "wgpu"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6201,7 +6214,7 @@ pub struct ImportIssue {
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
 /// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
 /// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
-/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` → `use std::iter::Iterator;` (Session 136 + 137)
+/// - `.map()` / `.filter()` / `.zip()` / `.chain()` / `.enumerate()` / `.flat_map()` / `.peekable()` / `.skip()` → `use std::iter::Iterator;` (Session 136 + 137 + 138)
 /// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
 /// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
 /// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
@@ -6521,6 +6534,17 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("GlobBuilder", "glob"),
         ("Cookie", "cookie"),
         ("CookieJar", "cookie"),
+        // External crates (Session 138)
+        ("EnvError", "dotenv"),
+        ("AppBuilder", "tauri"),
+        ("AppHandle", "tauri"),
+        ("Manager", "tauri"),
+        ("Invoke", "tauri"),
+        ("Device", "wgpu"),
+        ("Queue", "wgpu"),
+        ("Surface", "wgpu"),
+        ("SurfaceConfiguration", "wgpu"),
+        ("ShaderModule", "wgpu"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7039,10 +7063,20 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() → Iterator trait 方法调用 (Session 136 + 137)
+    // 检测 .map() / .filter() / .zip() / .chain() / .enumerate() / .flat_map() / .peekable() / .skip()
+    // → Iterator trait 方法调用 (Session 136 + 137 + 138)
     // 这些方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
     // 此检测为建议性, 帮助明确导入
-    let iterator_methods: &[&str] = &["map", "filter", "zip", "chain", "enumerate"];
+    let iterator_methods: &[&str] = &[
+        "map",
+        "filter",
+        "zip",
+        "chain",
+        "enumerate",
+        "flat_map",
+        "peekable",
+        "skip",
+    ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
     'outer: for (i, line) in lines.iter().enumerate() {
@@ -18206,5 +18240,559 @@ impl Foo {
             validate_rust_braces(code).is_none(),
             "impl 中的 const fn 应通过验证"
         );
+    }
+
+    // ===== Session 138: ensure_external_imports dotenv/tauri/wgpu 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_dotenv_env_error() {
+        let code = "fn foo() -> EnvError { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use dotenv::EnvError;"),
+            "应添加 dotenv::EnvError 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_dotenv_full_path() {
+        let code = "fn foo() -> dotenv::EnvError { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use dotenv::"),
+            "全限定 dotenv:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tauri_app_builder() {
+        let code = "fn foo() -> AppBuilder { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tauri::AppBuilder;"),
+            "应添加 tauri::AppBuilder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tauri_multiple() {
+        let code = "fn foo() -> (AppBuilder, AppHandle, Manager, Invoke) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tauri::{") && result.contains("AppBuilder"),
+            "应合并 tauri 导入: {}",
+            result
+        );
+        assert!(result.contains("AppHandle"), "应包含 AppHandle: {}", result);
+        assert!(result.contains("Manager"), "应包含 Manager: {}", result);
+        assert!(result.contains("Invoke"), "应包含 Invoke: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tauri_full_path() {
+        let code = "fn foo() -> tauri::AppHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tauri::"),
+            "全限定 tauri:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_wgpu_device() {
+        let code = "fn foo() -> Device { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use wgpu::Device;"),
+            "应添加 wgpu::Device 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_wgpu_multiple() {
+        let code = "fn foo() -> (Device, Queue, Surface) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use wgpu::{") && result.contains("Device"),
+            "应合并 wgpu 导入: {}",
+            result
+        );
+        assert!(result.contains("Queue"), "应包含 Queue: {}", result);
+        assert!(result.contains("Surface"), "应包含 Surface: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_wgpu_surface_config() {
+        let code = "fn foo() -> SurfaceConfiguration { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use wgpu::SurfaceConfiguration;"),
+            "应添加 wgpu::SurfaceConfiguration 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_wgpu_shader_module() {
+        let code = "fn foo() -> ShaderModule { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use wgpu::ShaderModule;"),
+            "应添加 wgpu::ShaderModule 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_wgpu_full_path() {
+        let code = "fn foo() -> wgpu::Device { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use wgpu::"),
+            "全限定 wgpu:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s138_idempotent() {
+        let code = "fn foo() -> (EnvError, AppBuilder, Device) { unimplemented!() }\nfn bar() -> (AppHandle, Queue, Surface) { unimplemented!() }\nfn baz() -> (Manager, Invoke, SurfaceConfiguration, ShaderModule) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 138 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 138: verify_imports dotenv/tauri/wgpu 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_dotenv_env_error_missing() {
+        let issues = verify_imports("fn foo() -> EnvError { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "EnvError" && i.module_path == "dotenv"),
+            "应检测到 EnvError 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_dotenv_already_imported() {
+        let code = "use dotenv::EnvError;\nfn foo() -> EnvError { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "EnvError" && i.module_path == "dotenv"),
+            "已有 dotenv::EnvError 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tauri_app_builder_missing() {
+        let issues = verify_imports("fn foo() -> AppBuilder { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "AppBuilder" && i.module_path == "tauri"),
+            "应检测到 AppBuilder 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tauri_manager_missing() {
+        let issues = verify_imports("fn foo() -> Manager { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Manager" && i.module_path == "tauri"),
+            "应检测到 Manager 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tauri_already_imported() {
+        let code = "use tauri::AppHandle;\nfn foo() -> AppHandle { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "AppHandle" && i.module_path == "tauri"),
+            "已有 tauri::AppHandle 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_wgpu_device_missing() {
+        let issues = verify_imports("fn foo() -> Device { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Device" && i.module_path == "wgpu"),
+            "应检测到 Device 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_wgpu_queue_missing() {
+        let issues = verify_imports("fn foo() -> Queue { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Queue" && i.module_path == "wgpu"),
+            "应检测到 Queue 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_wgpu_surface_config_missing() {
+        let issues = verify_imports("fn foo() -> SurfaceConfiguration { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "SurfaceConfiguration" && i.module_path == "wgpu"),
+            "应检测到 SurfaceConfiguration 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_wgpu_already_imported() {
+        let code = "use wgpu::Device;\nfn foo() -> Device { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Device" && i.module_path == "wgpu"),
+            "已有 wgpu::Device 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s138_combined() {
+        let code = "fn foo() -> (EnvError, AppBuilder, Device) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "EnvError"),
+            "应检测到 EnvError: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "AppBuilder"),
+            "应检测到 AppBuilder: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Device"),
+            "应检测到 Device: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 138: verify_imports .flat_map()/.peekable()/.skip() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_flat_map_method_iterator() {
+        let issues =
+            verify_imports("fn foo(v: Vec<Vec<i32>>) { v.iter().flat_map(|x| x.iter()); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .flat_map() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_peekable_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { let mut p = v.iter().peekable(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .peekable() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_skip_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().skip(3); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .skip() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_flat_map_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<Vec<i32>>) { v.iter().flat_map(|x| x.iter()); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .flat_map() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_peekable_already_imported() {
+        let code =
+            "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { let mut p = v.iter().peekable(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .peekable() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_skip_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().skip(3); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .skip() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_flat_map_glob_import() {
+        let code =
+            "use std::iter::*;\nfn foo(v: Vec<Vec<i32>>) { v.iter().flat_map(|x| x.iter()); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator (.flat_map): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_flat_map_peekable_skip_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().flat_map(|x| Some(x)).peekable().skip(1); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (.flat_map+.peekable+.skip 组合): {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_all_iterator_methods_s138_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().map(|x| x).filter(|&x| x > 0).zip(v.iter()).chain(v.iter()).enumerate().flat_map(|x| Some(x)).peekable().skip(1); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (全部方法组合含 flat_map/peekable/skip): {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 138: validate_rust_braces async fn 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_basic() {
+        let code = "async fn foo() -> i32 { 42 }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 基本语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_with_generics() {
+        let code = "async fn foo<T: Send>(x: T) -> T { x }";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 泛型应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_with_await() {
+        let code = r#"
+async fn foo() -> i32 {
+    let x = bar().await;
+    x + 1
+}
+
+async fn bar() -> i32 { 42 }
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 含 .await 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_await_chain() {
+        let code = r#"
+async fn foo() -> i32 {
+    let x = bar().await.unwrap_or(0);
+    let y = baz(x).await?;
+    y
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 含 .await 链式调用应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_complex_body() {
+        let code = r#"
+async fn fetch_and_process(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let response = fetch(url).await?;
+    let data: Vec<u8> = response.json().await?;
+    let result = process(&data).await?;
+    Ok(result)
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 复杂函数体应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_nested_block() {
+        let code = r#"
+async fn foo() -> i32 {
+    let x = {
+        let y = { 42 };
+        y + 1
+    };
+    x
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "async fn 嵌套块应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_unbalanced() {
+        let code = "async fn foo() -> i32 { 42";
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 async fn 应报告问题");
+    }
+
+    #[test]
+    fn test_validate_rust_braces_async_fn_with_struct() {
+        let code = r#"
+struct Foo { x: i32 }
+
+impl Foo {
+    async fn fetch(&self) -> i32 {
+        self.x + 1
+    }
+
+    async fn update(&mut self, v: i32) {
+        self.x = v;
+    }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "impl 中的 async fn 应通过验证"
+        );
+    }
+
+    // ===== Session 138: extract_glob_imports cfg 属性条件编译测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_attribute() {
+        let code = "#[cfg(feature = \"async\")]\nuse std::io::*;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "带 #[cfg] 属性的 use 语句应提取 glob: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_multiple() {
+        let code = "#[cfg(feature = \"async\")]\nuse std::io::*;\n#[cfg(feature = \"sync\")]\nuse std::sync::*;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_nested() {
+        let code = r#"#[cfg(all(feature = "async", not(target_os = "wasm32")))]
+use std::io::*;"#;
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "带复杂 #[cfg(all(...))] 属性的 use 语句应提取 glob: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_cfg_and_normal() {
+        let code = "use std::fmt::*;\n#[cfg(feature = \"debug\")]\nuse std::io::*;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::fmt".to_string()),
+            "应包含普通 use std::fmt::*: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含带 cfg 属性的 use std::io::*: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_cfg_not_affecting_glob() {
+        let code = "#[cfg(feature = \"x\")]\nuse std::fmt::Display;";
+        let globs = extract_glob_imports(code);
+        assert!(globs.is_empty(), "非 glob use 语句不应被提取: {:?}", globs);
     }
 }

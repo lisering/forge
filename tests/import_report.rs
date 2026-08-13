@@ -341,3 +341,289 @@ fn test_import_report_mixed_s135_and_earlier_types() {
         "应包含 actix_web 问题"
     );
 }
+
+// ===== Session 137: JSON 报告 — oauth2/glob/cookie 测试 =====
+
+#[test]
+fn test_import_report_json_oauth2_missing() {
+    let code = "fn foo() -> BasicClient { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("BasicClient"),
+        "JSON 报告应包含 BasicClient: {}",
+        json
+    );
+    assert!(
+        json.contains("oauth2"),
+        "JSON 报告应包含 oauth2 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_glob_missing() {
+    let code = "fn foo() -> Pattern { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Pattern"),
+        "JSON 报告应包含 Pattern: {}",
+        json
+    );
+    assert!(json.contains("glob"), "JSON 报告应包含 glob 模块: {}", json);
+}
+
+#[test]
+fn test_import_report_json_cookie_missing() {
+    let code = "fn foo() -> Cookie { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Cookie"), "JSON 报告应包含 Cookie: {}", json);
+    assert!(
+        json.contains("cookie"),
+        "JSON 报告应包含 cookie 模块: {}",
+        json
+    );
+}
+
+// ===== Session 137: Markdown 报告 — oauth2/glob/cookie 测试 =====
+
+#[test]
+fn test_import_report_markdown_oauth2_missing() {
+    let code = "fn foo() -> BasicClient { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("BasicClient"),
+        "Markdown 报告应包含 BasicClient: {}",
+        md
+    );
+    assert!(md.contains("oauth2"), "Markdown 报告应包含 oauth2: {}", md);
+}
+
+#[test]
+fn test_import_report_markdown_glob_cookie_missing() {
+    let code = "fn foo() -> (Pattern, Cookie) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Pattern"),
+        "Markdown 报告应包含 Pattern: {}",
+        md
+    );
+    assert!(md.contains("glob"), "Markdown 报告应包含 glob: {}", md);
+    assert!(md.contains("Cookie"), "Markdown 报告应包含 Cookie: {}", md);
+    assert!(md.contains("cookie"), "Markdown 报告应包含 cookie: {}", md);
+}
+
+// ===== Session 137: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s137_issues() {
+    let code = "fn foo() -> (BasicClient, Pattern, Cookie) { unimplemented!() }\nfn bar() -> (AccessToken, GlobBuilder, CookieJar) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+
+    let s137_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "oauth2" || i.module_path == "glob" || i.module_path == "cookie"
+        })
+        .collect();
+
+    assert!(
+        s137_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 137 外部 crate 导入问题: {:?}",
+        s137_issues
+    );
+}
+
+// ===== Session 137: .zip()/.chain()/.enumerate() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_zip_chain_enumerate() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().zip(v.iter()).chain(v.iter()).enumerate(); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 报告应包含 Iterator (.zip/.chain/.enumerate): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_zip_chain_enumerate() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().zip(v.iter()).chain(v.iter()).enumerate(); }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 报告应包含 Iterator (.zip/.chain/.enumerate): {}",
+        md
+    );
+}
+
+// ===== Session 138: JSON 报告 — dotenv/tauri/wgpu 测试 =====
+
+#[test]
+fn test_import_report_json_dotenv_missing() {
+    let code = "fn foo() -> EnvError { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("EnvError"),
+        "JSON 报告应包含 EnvError: {}",
+        json
+    );
+    assert!(
+        json.contains("dotenv"),
+        "JSON 报告应包含 dotenv 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_tauri_missing() {
+    let code = "fn foo() -> AppBuilder { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("AppBuilder"),
+        "JSON 报告应包含 AppBuilder: {}",
+        json
+    );
+    assert!(
+        json.contains("tauri"),
+        "JSON 报告应包含 tauri 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_wgpu_missing() {
+    let code = "fn foo() -> Device { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Device"), "JSON 报告应包含 Device: {}", json);
+    assert!(json.contains("wgpu"), "JSON 报告应包含 wgpu 模块: {}", json);
+}
+
+// ===== Session 138: Markdown 报告 — dotenv/tauri/wgpu 测试 =====
+
+#[test]
+fn test_import_report_markdown_dotenv_tauri_wgpu_missing() {
+    let code = "fn foo() -> (EnvError, AppBuilder, Device) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("EnvError"),
+        "Markdown 报告应包含 EnvError: {}",
+        md
+    );
+    assert!(md.contains("dotenv"), "Markdown 报告应包含 dotenv: {}", md);
+    assert!(
+        md.contains("AppBuilder"),
+        "Markdown 报告应包含 AppBuilder: {}",
+        md
+    );
+    assert!(md.contains("tauri"), "Markdown 报告应包含 tauri: {}", md);
+    assert!(md.contains("Device"), "Markdown 报告应包含 Device: {}", md);
+    assert!(md.contains("wgpu"), "Markdown 报告应包含 wgpu: {}", md);
+}
+
+// ===== Session 138: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s138_issues() {
+    let code = "fn foo() -> (EnvError, AppBuilder, Device) { unimplemented!() }\nfn bar() -> (AppHandle, Queue, Surface) { unimplemented!() }\nfn baz() -> (Manager, Invoke, SurfaceConfiguration, ShaderModule) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+
+    let s138_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "dotenv" || i.module_path == "tauri" || i.module_path == "wgpu"
+        })
+        .collect();
+
+    assert!(
+        s138_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 138 外部 crate 导入问题: {:?}",
+        s138_issues
+    );
+}
+
+// ===== Session 138: .flat_map()/.peekable()/.skip() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_flat_map_peekable_skip() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().flat_map(|x| Some(x)).peekable().skip(1); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 报告应包含 Iterator (.flat_map/.peekable/.skip): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_flat_map_peekable_skip() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().flat_map(|x| Some(x)).peekable().skip(1); }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 报告应包含 Iterator (.flat_map/.peekable/.skip): {}",
+        md
+    );
+}
+
+// ===== Session 138: 多类型混合报告 (S137 + S138) =====
+
+#[test]
+fn test_import_report_mixed_s137_s138_types() {
+    let code = "fn foo() -> (BasicClient, Pattern, Cookie, EnvError, AppBuilder, Device) { unimplemented!() }";
+    let report = verify_imports_report(code);
+
+    assert!(report.has_issues, "应有问题");
+    // Session 137 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "oauth2"),
+        "应包含 oauth2 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "glob"),
+        "应包含 glob 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "cookie"),
+        "应包含 cookie 问题"
+    );
+    // Session 138 types
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "dotenv"),
+        "应包含 dotenv 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "tauri"),
+        "应包含 tauri 问题"
+    );
+    assert!(
+        report.issues.iter().any(|i| i.module_path == "wgpu"),
+        "应包含 wgpu 问题"
+    );
+}
+
+// ===== Session 138: JSON / Markdown 双格式一致性 (S137 + S138) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s138() {
+    let code = "fn foo() -> (BasicClient, Device, EnvError) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.iter().flat_map(|x| Some(x)).skip(1); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["BasicClient", "Device", "EnvError", "Iterator"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

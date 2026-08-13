@@ -1,12 +1,12 @@
 #![allow(clippy::useless_vec)]
 
-//! 导入检查大规模性能基准测试 (Session 133 + 137)
+//! 导入检查大规模性能基准测试 (Session 133 + 137 + 138)
 //!
 //! 测试目标:
 //! 1. verify_imports_large — 大规模代码导入检查性能 (10/100/500/1000 行)
 //! 2. ensure_external_imports_large — 大规模外部 crate 导入检测性能
 //! 3. glob_import_detection — 混合 glob 导入检测性能 (简单/混合/嵌套)
-//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read()/.zip()/.chain()/.enumerate() 等)
+//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read()/.zip()/.chain()/.enumerate()/.flat_map()/.peekable()/.skip() 等)
 //! 5. edge_cases — 边界情况 (空/单行/全限定路径/已导入/Unicode)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -50,6 +50,12 @@ fn build_missing_external_code(n: usize) -> String {
         ("Pattern", "fn f() -> Pattern { unimplemented!() }"),
         ("Cookie", "fn f() -> Cookie { unimplemented!() }"),
         ("CookieJar", "fn f() -> CookieJar { unimplemented!() }"),
+        // Session 138 types
+        ("EnvError", "fn f() -> EnvError { unimplemented!() }"),
+        ("AppBuilder", "fn f() -> AppBuilder { unimplemented!() }"),
+        ("Device", "fn f() -> Device { unimplemented!() }"),
+        ("Queue", "fn f() -> Queue { unimplemented!() }"),
+        ("Surface", "fn f() -> Surface { unimplemented!() }"),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -83,6 +89,10 @@ fn build_complete_imports_code(n: usize) -> String {
         "use oauth2::BasicClient;",
         "use glob::Pattern;",
         "use cookie::Cookie;",
+        // Session 138 imports
+        "use dotenv::EnvError;",
+        "use tauri::AppBuilder;",
+        "use wgpu::Device;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -130,6 +140,10 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".zip(other.iter())",
         ".chain(other.iter())",
         ".enumerate()",
+        // Session 138 Iterator trait methods
+        ".flat_map(|x| Some(x))",
+        ".peekable()",
+        ".skip(1)",
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -388,6 +402,27 @@ fn edge_cases(c: &mut Criterion) {
     group.bench_function("s137_iterator_methods", |b| {
         b.iter(|| {
             let code = "fn foo(v: Vec<i32>) { v.iter().map(|x| x).filter(|&x| x > 0).zip(v.iter()).chain(v.iter()).enumerate(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 138: dotenv/tauri/wgpu 类型检测
+    group.bench_function("s138_external_types", |b| {
+        b.iter(|| {
+            let code =
+                "fn foo() -> (EnvError, AppBuilder, Device) { unimplemented!() }\n\
+                 fn bar() -> (AppHandle, Queue, Surface) { unimplemented!() }\n\
+                 fn baz() -> (Manager, Invoke, SurfaceConfiguration, ShaderModule) { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 138: .flat_map()/.peekable()/.skip() trait 方法检测
+    group.bench_function("s138_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.iter().flat_map(|x| Some(x)).peekable().skip(1); }";
             let issues = verify_imports(black_box(code));
             black_box(issues);
         });

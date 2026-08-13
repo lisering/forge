@@ -186,7 +186,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 BasicClient/AuthorizationCode/AccessToken/CsrfToken/PkceCodeVerifier (oauth2) / Pattern/GlobBuilder (glob) / Cookie/CookieJar (cookie) 等外部 crate 类型但未导入 use oauth2::... / use glob::... / use cookie::... (Session 137)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 调用 .zip()/.chain()/.enumerate() 但未导入 use std::iter::Iterator; (Session 137 trait 方法检测)\n\n",
+  "❌ 禁止: 调用 .zip()/.chain()/.enumerate() 但未导入 use std::iter::Iterator; (Session 137 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 EnvError (dotenv) / AppBuilder/AppHandle/Manager/Invoke (tauri) / Device/Queue/Surface/SurfaceConfiguration/ShaderModule (wgpu) 等外部 crate 类型但未导入 use dotenv::... / use tauri::... / use wgpu::... (Session 138)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .flat_map()/.peekable()/.skip() 但未导入 use std::iter::Iterator; (Session 138 trait 方法检测)\n\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -1184,6 +1190,62 @@ mod tests {
         assert!(
             prompt.contains(".enumerate()"),
             "系统 prompt 应包含 .enumerate() trait 方法检测约束 (Session 137)"
+        );
+    }
+
+    // ===== Session 138: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s138_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("dotenv"),
+            "系统 prompt 应包含 dotenv 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("tauri"),
+            "系统 prompt 应包含 tauri 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("wgpu"),
+            "系统 prompt 应包含 wgpu 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("EnvError"),
+            "系统 prompt 应包含 EnvError 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("AppBuilder"),
+            "系统 prompt 应包含 AppBuilder 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("Device"),
+            "系统 prompt 应包含 Device 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("SurfaceConfiguration"),
+            "系统 prompt 应包含 SurfaceConfiguration 导入约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains("ShaderModule"),
+            "系统 prompt 应包含 ShaderModule 导入约束 (Session 138)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s138_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".flat_map()"),
+            "系统 prompt 应包含 .flat_map() trait 方法检测约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains(".peekable()"),
+            "系统 prompt 应包含 .peekable() trait 方法检测约束 (Session 138)"
+        );
+        assert!(
+            prompt.contains(".skip()"),
+            "系统 prompt 应包含 .skip() trait 方法检测约束 (Session 138)"
         );
     }
 }
