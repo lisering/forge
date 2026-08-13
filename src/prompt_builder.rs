@@ -174,7 +174,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 Filter/Reply (warp) / HttpResponse/HttpRequest/Responder/HttpServer (actix-web) / EntityTrait/Database/DbConn/PaginatorTrait (sea-orm) / QueryDsl/RunQueryDsl/ExpressionMethods/PgConnection/SqliteConnection (diesel) 等外部 crate 类型但未导入 use warp::... / use actix_web::... / use sea_orm::... / use diesel::... (Session 135)\n",
         );
         prompt.push_str(
-  "❌ 禁止: 调用 .collect() 但未导入 use std::iter::FromIterator; / 调用 .into_iter() 但未导入 use std::iter::IntoIterator; (Session 135 trait 方法检测)\n\n",
+  "❌ 禁止: 调用 .collect() 但未导入 use std::iter::FromIterator; / 调用 .into_iter() 但未导入 use std::iter::IntoIterator; (Session 135 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 Mailgun/Recipient (mailgun) / Charge/Customer/PaymentIntent (stripe) / PutObjectOutput/GetObjectOutput (aws-sdk-s3) / SdkConfig/BehaviorVersion (aws-config) 等外部 crate 类型但未导入 use mailgun::... / use stripe::... / use aws_sdk_s3::... / use aws_config::... (Session 136)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .map()/.filter() 但未导入 use std::iter::Iterator; (Session 136 trait 方法检测)\n\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -1064,6 +1070,62 @@ mod tests {
         assert!(
             prompt.contains("IntoIterator"),
             "系统 prompt 应包含 IntoIterator 导入约束 (Session 135)"
+        );
+    }
+
+    // ===== Session 136: 新增外部 crate + trait 方法检测约束测试 =====
+
+    #[test]
+    fn test_build_contains_s136_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("mailgun"),
+            "系统 prompt 应包含 mailgun 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("stripe"),
+            "系统 prompt 应包含 stripe 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("aws_sdk_s3"),
+            "系统 prompt 应包含 aws_sdk_s3 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("aws_config"),
+            "系统 prompt 应包含 aws_config 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("Mailgun"),
+            "系统 prompt 应包含 Mailgun 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("PaymentIntent"),
+            "系统 prompt 应包含 PaymentIntent 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("PutObjectOutput"),
+            "系统 prompt 应包含 PutObjectOutput 导入约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("SdkConfig"),
+            "系统 prompt 应包含 SdkConfig 导入约束 (Session 136)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s136_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".map()"),
+            "系统 prompt 应包含 .map() trait 方法检测约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains(".filter()"),
+            "系统 prompt 应包含 .filter() trait 方法检测约束 (Session 136)"
+        );
+        assert!(
+            prompt.contains("Iterator"),
+            "系统 prompt 应包含 Iterator 导入约束 (Session 136)"
         );
     }
 }

@@ -4870,7 +4870,7 @@ fn has_covering_glob_import(glob_imports: &[String], module_path: &str) -> bool 
 /// - `use module::{*, sub::*};` → `module` + `module::sub` (Session 133)
 /// - `use module::{Type, sub::*};` → `module::sub` (Session 133)
 /// - `use module::{sub::{*, inner::*}};` → `module::sub` + `module::sub::inner` (Session 133)
-fn extract_glob_imports(content: &str) -> Vec<String> {
+pub fn extract_glob_imports(content: &str) -> Vec<String> {
     let mut globs = Vec::new();
 
     // 预处理: 将多行 use 语句合并为单行 (Session 134)
@@ -4884,6 +4884,8 @@ fn extract_glob_imports(content: &str) -> Vec<String> {
         }
         // Session 135: 移除行注释后再解析 (支持 use 语句中的 // 注释)
         let trimmed = strip_use_line_comments(trimmed);
+        // Session 136: 移除块注释后再解析 (支持 use 语句中的 /* */ 注释)
+        let trimmed = strip_use_block_comments(&trimmed);
         if !trimmed.starts_with("use ") {
             continue;
         }
@@ -4917,7 +4919,7 @@ fn extract_glob_imports(content: &str) -> Vec<String> {
 ///
 /// use 语句中不包含字符串字面量, 因此可以安全地移除 `// ...` 注释。
 /// 排除 URL 中的 `://` 协议分隔符 (如 `http://`)。
-fn strip_use_line_comments(s: &str) -> String {
+pub fn strip_use_line_comments(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i + 1 < bytes.len() {
@@ -4934,6 +4936,49 @@ fn strip_use_line_comments(s: &str) -> String {
     s.to_string()
 }
 
+/// 从 use 语句行中移除块注释 (Session 136)
+///
+/// 支持 Rust 嵌套块注释 `/* /* ... */ */`.
+/// use 语句中不包含字符串字面量, 因此可以安全地移除块注释。
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::strip_use_block_comments;
+///
+/// assert_eq!(strip_use_block_comments("use std::{/* comment */ io::*};"), "use std::{ io::*};");
+/// assert_eq!(strip_use_block_comments("use std::io::*;"), "use std::io::*;");
+/// ```
+pub fn strip_use_block_comments(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::new();
+    let mut i = 0;
+    let mut depth = 0;
+    while i < chars.len() {
+        if depth > 0 {
+            // 在块注释内部
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                depth += 1;
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                depth = 1;
+                i += 2;
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    result
+}
+
 /// 将多行 use 语句合并为单行 (Session 134)
 ///
 /// 扫描代码中的 `use` 语句, 如果以 `{` 开头但未在同一行以 `};` 结束,
@@ -4948,10 +4993,12 @@ fn join_multiline_use_statements(content: &str) -> String {
         let trimmed = line.trim();
 
         // 检测 use 语句且包含未闭合的 {
-        if trimmed.starts_with("use ") && trimmed.contains('{') {
-            // 计算当前行的 { 和 } 数量
-            let open_count = trimmed.chars().filter(|&c| c == '{').count();
-            let close_count = trimmed.chars().filter(|&c| c == '}').count();
+        // Session 136: 先移除块注释, 避免块注释中的 { } 影响计数
+        let trimmed_no_block = strip_use_block_comments(trimmed);
+        if trimmed_no_block.starts_with("use ") && trimmed_no_block.contains('{') {
+            // 计算当前行的 { 和 } 数量 (移除块注释后)
+            let open_count = trimmed_no_block.chars().filter(|&c| c == '{').count();
+            let close_count = trimmed_no_block.chars().filter(|&c| c == '}').count();
 
             if open_count > close_count {
                 // 多行 use 语句: 合并后续行
@@ -4964,8 +5011,10 @@ fn join_multiline_use_statements(content: &str) -> String {
                     let cleaned = strip_use_line_comments(lines[i]);
                     joined.push_str(&cleaned);
                     let joined_trimmed = joined.trim();
-                    let o = joined_trimmed.chars().filter(|&c| c == '{').count();
-                    let c = joined_trimmed.chars().filter(|&c| c == '}').count();
+                    // Session 136: 移除块注释后再计数
+                    let joined_cleaned = strip_use_block_comments(joined_trimmed);
+                    let o = joined_cleaned.chars().filter(|&c| c == '{').count();
+                    let c = joined_cleaned.chars().filter(|&c| c == '}').count();
                     if o <= c {
                         break;
                     }
@@ -5363,6 +5412,10 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `HttpResponse` / `HttpRequest` / `Responder` / `HttpServer` → `use actix_web::{...};` (Session 135)
 /// - `EntityTrait` / `Database` / `DbConn` / `PaginatorTrait` → `use sea_orm::{...};` (Session 135)
 /// - `QueryDsl` / `RunQueryDsl` / `ExpressionMethods` / `PgConnection` / `SqliteConnection` → `use diesel::{...};` (Session 135)
+/// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
+/// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
+/// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
+/// - `SdkConfig` / `BehaviorVersion` → `use aws_config::{...};` (Session 136)
 ///
 /// # 规则
 ///
@@ -5520,6 +5573,19 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("ExpressionMethods", "diesel"),
         ("PgConnection", "diesel"),
         ("SqliteConnection", "diesel"),
+        // mailgun (Session 136)
+        ("Mailgun", "mailgun"),
+        ("Recipient", "mailgun"),
+        // stripe (Session 136)
+        ("Charge", "stripe"),
+        ("Customer", "stripe"),
+        ("PaymentIntent", "stripe"),
+        // aws-sdk-s3 (Session 136)
+        ("PutObjectOutput", "aws_sdk_s3"),
+        ("GetObjectOutput", "aws_sdk_s3"),
+        // aws-config (Session 136)
+        ("SdkConfig", "aws_config"),
+        ("BehaviorVersion", "aws_config"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6123,6 +6189,11 @@ pub struct ImportIssue {
 /// - `.spawn()` → `use tokio::spawn;` (Session 134)
 /// - `.collect()` → `use std::iter::FromIterator;` (Session 135)
 /// - `.into_iter()` → `use std::iter::IntoIterator;` (Session 135)
+/// - `.map()` / `.filter()` → `use std::iter::Iterator;` (Session 136)
+/// - `Mailgun` / `Recipient` → `use mailgun::{...};` (Session 136)
+/// - `Charge` / `Customer` / `PaymentIntent` → `use stripe::{...};` (Session 136)
+/// - `PutObjectOutput` / `GetObjectOutput` → `use aws_sdk_s3::{...};` (Session 136)
+/// - `SdkConfig` / `BehaviorVersion` → `use aws_config::{...};` (Session 136)
 ///
 /// # 示例
 ///
@@ -6415,6 +6486,16 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("ExpressionMethods", "diesel"),
         ("PgConnection", "diesel"),
         ("SqliteConnection", "diesel"),
+        // External crates (Session 136)
+        ("Mailgun", "mailgun"),
+        ("Recipient", "mailgun"),
+        ("Charge", "stripe"),
+        ("Customer", "stripe"),
+        ("PaymentIntent", "stripe"),
+        ("PutObjectOutput", "aws_sdk_s3"),
+        ("GetObjectOutput", "aws_sdk_s3"),
+        ("SdkConfig", "aws_config"),
+        ("BehaviorVersion", "aws_config"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -6929,6 +7010,47 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                 type_name: "IntoIterator".to_string(),
                 module_path: "std::iter".to_string(),
                 usage_line: into_iter_method_line,
+            });
+        }
+    }
+
+    // 检测 .map() / .filter() → Iterator trait 方法调用 (Session 136)
+    // .map() / .filter() 方法需要 Iterator trait 在作用域中 (通常通过 prelude 自动可用)
+    // 此检测为建议性, 帮助明确导入
+    let iterator_methods: &[&str] = &["map", "filter"];
+    let mut iterator_method_found = false;
+    let mut iterator_method_line = 0;
+    'outer: for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        // 跳过注释行和导入行
+        if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+            continue;
+        }
+        for &method_name in iterator_methods {
+            let method_call = format!(".{}(", method_name);
+            if line.contains(&method_call) {
+                iterator_method_found = true;
+                iterator_method_line = i + 1;
+                break 'outer;
+            }
+        }
+    }
+
+    if iterator_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use std::iter::Iterator;")
+                || (trimmed.contains("use std::iter::{")
+                    && contains_type_usage(trimmed, "Iterator"))
+                || trimmed.starts_with("use std::iter::*;")
+                || trimmed.starts_with("use std::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "Iterator".to_string(),
+                module_path: "std::iter".to_string(),
+                usage_line: iterator_method_line,
             });
         }
     }
@@ -17101,5 +17223,489 @@ fn main() {
             validate_rust_braces(code).is_none(),
             "含 raw string 的 macro_rules! 应通过验证"
         );
+    }
+
+    // ===== Session 136: ensure_external_imports mailgun/stripe/aws-sdk 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_mailgun() {
+        let code = "fn foo(m: &Mailgun) { m.send(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use mailgun::Mailgun;"),
+            "应添加 mailgun::Mailgun 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_mailgun_recipient() {
+        let code = "fn foo() -> Recipient { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use mailgun::Recipient;"),
+            "应添加 mailgun::Recipient 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_mailgun_full_path() {
+        let code = "fn foo(m: &mailgun::Mailgun) { m.send(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use mailgun::Mailgun;"),
+            "全限定 mailgun:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_stripe_charge() {
+        let code = "fn foo() -> Charge { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use stripe::Charge;"),
+            "应添加 stripe::Charge 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_stripe_multiple() {
+        let code = "fn foo() -> (Charge, Customer, PaymentIntent) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use stripe::{") && result.contains("Charge"),
+            "应合并 stripe 导入: {}",
+            result
+        );
+        assert!(result.contains("Customer"), "应包含 Customer: {}", result);
+        assert!(
+            result.contains("PaymentIntent"),
+            "应包含 PaymentIntent: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_stripe_full_path() {
+        let code = "fn foo() -> stripe::Charge { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use stripe::"),
+            "全限定 stripe:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_aws_s3() {
+        let code = "fn foo() -> PutObjectOutput { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use aws_sdk_s3::PutObjectOutput;"),
+            "应添加 aws_sdk_s3::PutObjectOutput 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_aws_s3_multiple() {
+        let code = "fn foo() -> (PutObjectOutput, GetObjectOutput) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use aws_sdk_s3::{") && result.contains("PutObjectOutput"),
+            "应合并 aws_sdk_s3 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("GetObjectOutput"),
+            "应包含 GetObjectOutput: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_aws_config() {
+        let code = "fn foo() -> SdkConfig { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use aws_config::SdkConfig;"),
+            "应添加 aws_config::SdkConfig 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_aws_config_full_path() {
+        let code = "fn foo() -> aws_config::SdkConfig { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use aws_config::"),
+            "全限定 aws_config:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s136_idempotent() {
+        let code = "fn foo() -> (Mailgun, Charge, PutObjectOutput, SdkConfig) { unimplemented!() }\nfn bar() -> Recipient { unimplemented!() }\nfn baz() -> (Customer, PaymentIntent, GetObjectOutput, BehaviorVersion) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 136 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 136: verify_imports mailgun/stripe/aws-sdk 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_mailgun_missing() {
+        let issues = verify_imports("fn foo(m: &Mailgun) { }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Mailgun" && i.module_path == "mailgun"),
+            "应检测到 Mailgun 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_stripe_missing() {
+        let issues = verify_imports("fn foo() -> Charge { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Charge" && i.module_path == "stripe"),
+            "应检测到 Charge 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_aws_s3_missing() {
+        let issues = verify_imports("fn foo() -> PutObjectOutput { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "PutObjectOutput" && i.module_path == "aws_sdk_s3"),
+            "应检测到 PutObjectOutput 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_aws_config_missing() {
+        let issues = verify_imports("fn foo() -> SdkConfig { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "SdkConfig" && i.module_path == "aws_config"),
+            "应检测到 SdkConfig 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_mailgun_already_imported() {
+        let code = "use mailgun::Mailgun;\nfn foo(m: &Mailgun) { }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Mailgun" && i.module_path == "mailgun"),
+            "已有 mailgun::Mailgun 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_stripe_already_imported() {
+        let code = "use stripe::Charge;\nfn foo() -> Charge { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Charge" && i.module_path == "stripe"),
+            "已有 stripe::Charge 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 136: verify_imports .map()/.filter() Iterator 测试 =====
+
+    #[test]
+    fn test_verify_imports_map_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().map(|x| x * 2); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .map() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_filter_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().filter(|&x| x > 0); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .filter() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_map_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().map(|x| x * 2); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .map() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_map_glob_import() {
+        let code = "use std::iter::*;\nfn foo(v: Vec<i32>) { v.iter().map(|x| x * 2); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "glob 导入 use std::iter::*; 应覆盖 Iterator: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_map_and_filter_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().filter(|&x| x > 0).map(|x| x * 2); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 Iterator (.map 和 .filter 组合): {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 136: extract_glob_imports 块注释测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_with_block_comment() {
+        let code = "use std::{/* comment */ io::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "块注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_block_comment_multiline() {
+        let code = "use std::{\n    /* this is a block comment */\n    io::*,\n    sync::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "多行块注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "多行块注释的 use 语句应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_nested_block_comment() {
+        let code = "use std::{/* outer /* inner */ comment */ io::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "嵌套块注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_with_block_and_line_comment() {
+        let code = "use std::{\n    // line comment\n    /* block comment */ io::*,\n    sync::* // trailing\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "混合注释的 use 语句应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "混合注释的 use 语句应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_block_comment_with_braces() {
+        // 块注释中包含大括号, 不应影响计数
+        let code = "use std::{/* { } */ io::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "块注释中的大括号不应影响 glob 提取: {:?}",
+            globs
+        );
+    }
+
+    // ===== Session 136: strip_use_block_comments 测试 =====
+
+    #[test]
+    fn test_strip_use_block_comments_basic() {
+        assert_eq!(
+            strip_use_block_comments("use std::{/* comment */ io::*};"),
+            "use std::{ io::*};"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_block_comments_no_comment() {
+        assert_eq!(
+            strip_use_block_comments("use std::io::*;"),
+            "use std::io::*;"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_block_comments_nested() {
+        assert_eq!(
+            strip_use_block_comments("use std::{/* outer /* inner */ */ io::*};"),
+            "use std::{ io::*};"
+        );
+    }
+
+    #[test]
+    fn test_strip_use_block_comments_multiple() {
+        assert_eq!(
+            strip_use_block_comments("use std::{/* a */ io::*, /* b */ sync::*};"),
+            "use std::{ io::*,  sync::*};"
+        );
+    }
+
+    // ===== Session 136: validate_rust_braces proc_macro 测试 =====
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_attribute() {
+        let code = r#"
+#[proc_macro]
+pub fn my_macro(input: TokenStream) -> TokenStream {
+    let expanded = quote! {
+        let x = 42;
+    };
+    expanded
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "#[proc_macro] 属性宏应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_attribute_fn() {
+        let code = r#"
+#[proc_macro_attribute]
+pub fn my_attr_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let expanded = quote! {
+        #item
+    };
+    expanded
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "#[proc_macro_attribute] 属性宏应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_derive() {
+        let code = r#"
+#[proc_macro_derive(MyDerive, attributes(my_attr))]
+pub fn my_derive(input: TokenStream) -> TokenStream {
+    let expanded = quote! {
+        impl MyDerive for #name {
+            fn do_something(&self) {
+                println!("hello");
+            }
+        }
+    };
+    expanded
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "#[proc_macro_derive(...)] 属性宏应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_with_quote_repetition() {
+        let code = r#"
+#[proc_macro]
+pub fn make_struct(input: TokenStream) -> TokenStream {
+    let expanded = quote! {
+        struct Generated {
+            #( #field: #field_types, )*
+        }
+    };
+    expanded
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "proc_macro 函数体内 quote! 重复语法应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_with_macro_rules() {
+        let code = r#"
+#[proc_macro]
+pub fn my_macro(input: TokenStream) -> TokenStream {
+    macro_rules! helper {
+        ($x:expr) => { $x + 1 };
+    }
+    let result = helper!(42);
+    quote! { #result }
+}
+"#;
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "proc_macro 函数体内 macro_rules! 应通过验证"
+        );
+    }
+
+    #[test]
+    fn test_validate_rust_braces_proc_macro_unbalanced() {
+        let code = r#"
+#[proc_macro]
+pub fn my_macro(input: TokenStream) -> TokenStream {
+    let expanded = quote! {
+        struct Foo {
+            x: i32,
+    };
+    expanded
+}
+"#;
+        let result = validate_rust_braces(code);
+        assert!(result.is_some(), "不平衡的 proc_macro 应报告问题");
     }
 }
