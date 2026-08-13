@@ -1,0 +1,360 @@
+#![allow(clippy::useless_vec)]
+
+//! 导入检查大规模性能基准测试 (Session 133)
+//!
+//! 测试目标:
+//! 1. verify_imports_large — 大规模代码导入检查性能 (10/100/500/1000 行)
+//! 2. ensure_external_imports_large — 大规模外部 crate 导入检测性能
+//! 3. glob_import_detection — 混合 glob 导入检测性能 (简单/混合/嵌套)
+//! 4. trait_method_detection — trait 方法检测性能 (.read()/.send()/.try_read() 等)
+//! 5. edge_cases — 边界情况 (空/单行/全限定路径/已导入/Unicode)
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use forge::extract::{ensure_external_imports, ensure_std_imports, verify_imports};
+
+/// 构建需要多种 std 导入的代码 (n 个使用未导入类型的函数)
+fn build_missing_imports_code(n: usize) -> String {
+    let mut code = String::new();
+    for i in 0..n {
+        code.push_str(&format!(
+            "fn func_{}() -> HashMap<String, Arc<Mutex<Vec<i32>>>> {{ HashMap::new() }}\n",
+            i
+        ));
+    }
+    code
+}
+
+/// 构建需要多种外部 crate 导入的代码
+fn build_missing_external_code(n: usize) -> String {
+    let types = [
+        ("Serialize", "#[derive(Serialize)]\nstruct S{}"),
+        ("Regex", "fn f() -> Regex { Regex::new(\"\").unwrap() }"),
+        ("DateTime", "fn f() -> DateTime<Utc> { Utc::now() }"),
+        ("Client", "fn f() -> Client { Client::new() }"),
+        ("Router", "fn f() -> Router { Router::new() }"),
+        ("Tera", "fn f() -> Tera { Tera::new(\"x\").unwrap() }"),
+        ("Pool", "fn f() -> Pool<Sqlite> { unimplemented!() }"),
+        ("Message", "fn f() -> Message { unimplemented!() }"),
+        ("Config", "fn f() -> Config { unimplemented() }"),
+        ("Cmd", "fn f() -> Cmd { Cmd::new(\"GET\") }"),
+    ];
+    let mut code = String::new();
+    for i in 0..n {
+        let (_, snippet) = types[i % types.len()];
+        code.push_str(snippet);
+        code.push('\n');
+    }
+    code
+}
+
+/// 构建已有所有导入的代码 (幂等性测试)
+fn build_complete_imports_code(n: usize) -> String {
+    let imports = [
+        "use std::collections::HashMap;",
+        "use std::sync::{Arc, Mutex, RwLock};",
+        "use serde::Serialize;",
+        "use regex::Regex;",
+        "use chrono::{DateTime, Utc};",
+        "use reqwest::Client;",
+        "use axum::Router;",
+        "use tera::Tera;",
+        "use sqlx::Pool;",
+        "use lettre::Message;",
+        "use config::Config;",
+        "use redis::Cmd;",
+    ];
+    let mut code = String::new();
+    for imp in &imports {
+        code.push_str(imp);
+        code.push('\n');
+    }
+    for i in 0..n {
+        code.push_str(&format!("fn func_{}() -> i32 {{ {} }}\n", i, i));
+    }
+    code
+}
+
+/// 构建大量 glob 导入的代码
+fn build_glob_heavy_code(n: usize) -> String {
+    let mut code = String::new();
+    code.push_str("use std::collections::*;\n");
+    code.push_str("use std::sync::{*, atomic::*};\n");
+    code.push_str("use std::{io::*, fmt::*};\n");
+    code.push_str("use serde::{Serialize, *};\n");
+    for i in 0..n {
+        code.push_str(&format!(
+            "fn func_{}() -> HashMap<String, AtomicBool> {{ HashMap::new() }}\n",
+            i
+        ));
+    }
+    code
+}
+
+/// 构建 trait 方法调用密集的代码
+fn build_trait_method_heavy_code(n: usize) -> String {
+    let methods = [
+        ".lock()",
+        ".read()",
+        ".write()",
+        ".try_read()",
+        ".try_write()",
+        ".send(42)",
+        ".recv()",
+        ".try_send(42)",
+        ".gen_range(0..10)",
+        ".par_iter()",
+    ];
+    let mut code = String::new();
+    for i in 0..n {
+        let method = methods[i % methods.len()];
+        code.push_str(&format!("fn func_{}() {{ let x = unit{}; }}\n", i, method));
+    }
+    code
+}
+
+/// 构建 sqlx 宏密集的代码
+fn build_sqlx_macro_heavy_code(n: usize) -> String {
+    let mut code = String::new();
+    for i in 0..n {
+        match i % 3 {
+            0 => code.push_str(&format!(
+                "fn func_{}() {{ let r = query!(\"SELECT {} FROM t\"); }}\n",
+                i, i
+            )),
+            1 => code.push_str(&format!(
+                "fn func_{}() {{ let r = query_as!(User, \"SELECT * FROM t WHERE id = {}\"); }}\n",
+                i, i
+            )),
+            _ => code.push_str(&format!(
+                "fn func_{}() -> Pool<Sqlite> {{ unimplemented!() }}\n",
+                i
+            )),
+        }
+    }
+    code
+}
+
+/// 1. verify_imports 大规模性能
+fn verify_imports_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("verify_imports_large");
+    let sizes = [10, 100, 500, 1000];
+
+    for &size in &sizes {
+        let code = build_missing_imports_code(size);
+        group.bench_with_input(
+            BenchmarkId::new("missing_imports", size),
+            &code,
+            |b, code| {
+                b.iter(|| {
+                    let issues = verify_imports(black_box(code));
+                    black_box(issues);
+                });
+            },
+        );
+    }
+
+    for &size in &sizes {
+        let code = build_complete_imports_code(size);
+        group.bench_with_input(
+            BenchmarkId::new("complete_imports", size),
+            &code,
+            |b, code| {
+                b.iter(|| {
+                    let issues = verify_imports(black_box(code));
+                    black_box(issues);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// 2. ensure_external_imports 大规模性能
+fn ensure_external_imports_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ensure_external_imports_large");
+    let sizes = [10, 100, 500, 1000];
+
+    for &size in &sizes {
+        let code = build_missing_external_code(size);
+        group.bench_with_input(
+            BenchmarkId::new("missing_external", size),
+            &code,
+            |b, code| {
+                b.iter(|| {
+                    let result = ensure_external_imports(black_box(code));
+                    black_box(result);
+                });
+            },
+        );
+    }
+
+    for &size in &sizes {
+        let code = build_complete_imports_code(size);
+        group.bench_with_input(BenchmarkId::new("idempotent", size), &code, |b, code| {
+            b.iter(|| {
+                let result = ensure_external_imports(black_box(code));
+                black_box(result);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// 3. glob 导入检测性能
+fn glob_import_detection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("glob_import_detection");
+    let sizes = [10, 100, 500, 1000];
+
+    for &size in &sizes {
+        let code = build_glob_heavy_code(size);
+        group.bench_with_input(BenchmarkId::new("glob_heavy", size), &code, |b, code| {
+            b.iter(|| {
+                let result = ensure_std_imports(black_box(code));
+                black_box(result);
+            });
+        });
+    }
+
+    // 混合 glob + 外部导入
+    for &size in &sizes {
+        let mut code = String::new();
+        code.push_str("use std::sync::{*, atomic::*};\n");
+        code.push_str("use serde::{Serialize, *};\n");
+        for i in 0..size {
+            code.push_str(&format!(
+                "#[derive(Serialize)]\nstruct S{} {{ x: AtomicBool }}\n",
+                i
+            ));
+        }
+        group.bench_with_input(
+            BenchmarkId::new("mixed_glob_external", size),
+            &code,
+            |b, code| {
+                b.iter(|| {
+                    let result = ensure_external_imports(black_box(code));
+                    black_box(result);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// 4. trait 方法检测性能
+fn trait_method_detection(c: &mut Criterion) {
+    let mut group = c.benchmark_group("trait_method_detection");
+    let sizes = [10, 100, 500, 1000];
+
+    for &size in &sizes {
+        let code = build_trait_method_heavy_code(size);
+        group.bench_with_input(BenchmarkId::new("trait_methods", size), &code, |b, code| {
+            b.iter(|| {
+                let issues = verify_imports(black_box(code));
+                black_box(issues);
+            });
+        });
+    }
+
+    // sqlx 宏检测
+    for &size in &sizes {
+        let code = build_sqlx_macro_heavy_code(size);
+        group.bench_with_input(BenchmarkId::new("sqlx_macros", size), &code, |b, code| {
+            b.iter(|| {
+                let issues = verify_imports(black_box(code));
+                black_box(issues);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// 5. 边界情况
+fn edge_cases(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge_cases");
+
+    // 空代码
+    group.bench_function("empty", |b| {
+        b.iter(|| {
+            let issues = verify_imports(black_box(""));
+            black_box(issues);
+        });
+    });
+
+    // 单行代码
+    group.bench_function("single_line", |b| {
+        b.iter(|| {
+            let issues = verify_imports(black_box("fn foo() -> i32 { 42 }"));
+            black_box(issues);
+        });
+    });
+
+    // 全限定路径 (不需要导入)
+    group.bench_function("full_paths", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> std::collections::HashMap<i32, i32> { std::collections::HashMap::new() }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // 已全部导入
+    group.bench_function("all_imported", |b| {
+        b.iter(|| {
+            let code = "use std::collections::HashMap;\nuse std::sync::{Arc, Mutex, RwLock};\nuse serde::Serialize;\nfn foo() -> HashMap<String, Arc<Mutex<i32>>> { HashMap::new() }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Unicode 标识符
+    group.bench_function("unicode", |b| {
+        b.iter(|| {
+            let code = "fn 你好() -> HashMap<String, i32> { HashMap::new() }\nfn func() -> RwLock<i32> { RwLock::new(0) }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // 超大代码 (5000 行)
+    group.bench_function("very_large_5000", |b| {
+        b.iter(|| {
+            let code = build_missing_imports_code(5000);
+            let issues = verify_imports(black_box(&code));
+            black_box(issues);
+        });
+    });
+
+    // 大量外部 crate 类型 (ensure_external_imports)
+    group.bench_function("many_external_types", |b| {
+        b.iter(|| {
+            let code = build_missing_external_code(500);
+            let result = ensure_external_imports(black_box(&code));
+            black_box(result);
+        });
+    });
+
+    // 嵌套 glob 导入
+    group.bench_function("nested_glob", |b| {
+        b.iter(|| {
+            let code = "use std::{sync::{*, atomic::*}, io::*, fmt::{Display, Debug}};\nfn foo() -> AtomicBool { AtomicBool::new(true) }\nfn bar() -> BufReader<File> { unimplemented!() }";
+            let result = ensure_std_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    verify_imports_large,
+    ensure_external_imports_large,
+    glob_import_detection,
+    trait_method_detection,
+    edge_cases,
+);
+criterion_main!(benches);

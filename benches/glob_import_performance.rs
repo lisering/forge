@@ -1,230 +1,257 @@
 #![allow(clippy::useless_vec)]
 
-//! Glob 导入排除性能基准测试 (Session 130)
+//! Glob 导入检测大规模性能基准测试 (Session 134)
 //!
 //! 测试目标:
-//! 1. glob 导入排除 — ensure_std_imports 在有 glob 导入时的性能
-//! 2. glob 导入排除 — ensure_external_imports 在有 glob 导入时的性能
-//! 3. glob 导入检测 — verify_imports 在有 glob 导入时的性能
-//! 4. 无 glob 导入对比 — 基线性能对比
-//! 5. 边界情况 — 空代码/纯 glob/混合 glob
+//! 1. glob_exclusion — std glob 导入覆盖检测 (简单/混合/嵌套 × 10-1000行)
+//! 2. glob_detection — 多行 use 语句 glob 检测 (单行/多行/嵌套多行 × 规模)
+//! 3. nested_glob — 嵌套 glob 路径检测 (2层/3层/4层嵌套 × 规模)
+//! 4. multiline_glob — 多行 use 语句合并性能 (3行/10行/50行 use 块)
+//! 5. edge_cases — 边界情况 (空/单行/纯glob/混合/Unicode/超大)
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use forge::extract::{ensure_external_imports, ensure_std_imports, verify_imports};
+use forge::extract::{ensure_external_imports, ensure_std_imports};
 
-/// 构建带有 glob 导入的代码 (std 类型)
-fn build_std_glob_code(n: usize) -> String {
-    let mut code = String::from("use std::collections::*;\nuse std::sync::*;\n");
-    code.push_str("fn foo() {\n");
+/// 构建带简单 glob 导入的代码 (use module::*;)
+fn build_simple_glob_code(n: usize) -> String {
+    let mut code = String::from("use std::collections::*;\n");
     for i in 0..n {
         code.push_str(&format!(
-            "    let v{}: HashMap<i32, Arc<{}>> = HashMap::new();\n",
-            i, i
+            "fn func_{}() -> HashMap<String, HashSet<i32>> {{ HashMap::new() }}\n",
+            i
         ));
     }
-    code.push_str("}\n");
     code
 }
 
-/// 构建不带 glob 导入的代码 (std 类型) — 基线
-fn build_std_no_glob_code(n: usize) -> String {
-    let mut code = String::from("fn foo() {\n");
+/// 构建带混合 glob 导入的代码 (use module::{Type, sub::*};)
+fn build_mixed_glob_code(n: usize) -> String {
+    let mut code = String::from("use std::collections::{HashMap, hash_map::*};\n");
     for i in 0..n {
         code.push_str(&format!(
-            "    let v{}: HashMap<i32, Arc<{}>> = HashMap::new();\n",
-            i, i
+            "fn func_{}() -> (HashMap<String, i32>, Entry<i32>) {{ HashMap::new() }}\n",
+            i
         ));
     }
-    code.push_str("}\n");
     code
 }
 
-/// 构建带有 glob 导入的代码 (外部 crate)
-fn build_external_glob_code(n: usize) -> String {
-    let mut code = String::from("use serde::*;\nuse regex::*;\n");
-    code.push_str("fn foo() {\n");
-    for i in 0..n {
-        code.push_str(&format!("    let s{}: Serialize = serialize_{}();\n", i, i));
-    }
-    code.push_str("}\n");
-    code
-}
-
-/// 构建不带 glob 导入的代码 (外部 crate) — 基线
-fn build_external_no_glob_code(n: usize) -> String {
-    let mut code = String::from("fn foo() {\n");
-    for i in 0..n {
-        code.push_str(&format!("    let s{}: Serialize = serialize_{}();\n", i, i));
-    }
-    code.push_str("}\n");
-    code
-}
-
-/// 构建多层 glob 导入代码
+/// 构建带嵌套 glob 导入的代码 (use std::{sync::{*, atomic::*}, io::*};)
 fn build_nested_glob_code(n: usize) -> String {
-    let mut code = String::from("use std::*;\nuse std::sync::*;\nuse std::collections::*;\n");
-    code.push_str("fn foo() {\n");
+    let mut code = String::from("use std::{sync::{*, atomic::*}, io::*};\n");
     for i in 0..n {
         code.push_str(&format!(
-            "    let v{}: HashMap<String, Arc<Mutex<{}>>> = HashMap::new();\n",
-            i, i
+            "fn func_{}() -> (Arc<Mutex<i32>>, AtomicBool, BufReader) {{ unimplemented!() }}\n",
+            i
         ));
     }
-    code.push_str("}\n");
     code
 }
 
-/// glob 导入排除基准测试
-fn glob_exclusion_benchmark(c: &mut Criterion) {
+/// 构建多行 use 语句的代码
+fn build_multiline_glob_code(lines: usize) -> String {
+    let mut code = String::from("use std::{\n");
+    for i in 0..lines {
+        code.push_str(&format!("    module_{}::*,\n", i));
+    }
+    code.push_str("};\nfn foo() {}\n");
+    code
+}
+
+/// 构建多行嵌套 use 语句的代码
+fn build_multiline_nested_glob_code(depth: usize) -> String {
+    let mut code = String::from("use std::{\n");
+    for d in 0..depth {
+        code.push_str(&format!("    level_{}::{{\n", d));
+        code.push_str("        *,\n");
+        code.push_str("        sub::*\n");
+        code.push_str("    },\n");
+    }
+    code.push_str("};\nfn foo() {}\n");
+    code
+}
+
+/// 构建带外部 crate glob 导入的代码
+fn build_external_glob_code(n: usize) -> String {
+    let mut code = String::from("use serde::*;\n");
+    for i in 0..n {
+        code.push_str(&format!(
+            "#[derive(Serialize, Deserialize)]\nstruct S{} {{ x: i32 }}\n",
+            i
+        ));
+    }
+    code
+}
+
+/// 构建超大 Unicode 代码
+fn build_unicode_code(n: usize) -> String {
+    let mut code = String::from("use std::collections::*;\n");
+    for i in 0..n {
+        code.push_str(&format!(
+            "// 函数_{}: 处理中文数据 🔥\nfn func_{}() -> HashMap<String, Vec<中文类型>> {{ HashMap::new() }}\n",
+            i, i
+        ));
+    }
+    code
+}
+
+/// 1. glob_exclusion — std glob 导入覆盖检测性能
+fn glob_exclusion(c: &mut Criterion) {
     let mut group = c.benchmark_group("glob_exclusion");
 
-    let sizes: Vec<usize> = vec![1, 10, 50, 100];
-
-    // ensure_std_imports with glob
-    for &size in &sizes {
-        let code = build_std_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("ensure_std_imports_with_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(ensure_std_imports(code))),
-        );
+    for (name, code) in [
+        ("simple", build_simple_glob_code(100)),
+        ("mixed", build_mixed_glob_code(100)),
+        ("nested", build_nested_glob_code(100)),
+    ] {
+        group.bench_with_input(BenchmarkId::new("ensure_std", name), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
     }
 
-    // ensure_std_imports without glob (baseline)
+    let sizes: Vec<usize> = vec![10, 100, 1000];
     for &size in &sizes {
-        let code = build_std_no_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("ensure_std_imports_no_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(ensure_std_imports(code))),
-        );
-    }
+        let code = build_simple_glob_code(size);
+        group.bench_with_input(BenchmarkId::new("simple_size", size), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
 
-    // ensure_external_imports with glob
-    for &size in &sizes {
-        let code = build_external_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("ensure_external_imports_with_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(ensure_external_imports(code))),
-        );
-    }
-
-    // ensure_external_imports without glob (baseline)
-    for &size in &sizes {
-        let code = build_external_no_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("ensure_external_imports_no_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(ensure_external_imports(code))),
-        );
+        let code = build_nested_glob_code(size);
+        group.bench_with_input(BenchmarkId::new("nested_size", size), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
     }
 
     group.finish();
 }
 
-/// glob 导入检测基准测试 (verify_imports)
-fn glob_detection_benchmark(c: &mut Criterion) {
+/// 2. glob_detection — 多行 use 语句 glob 检测性能
+fn glob_detection(c: &mut Criterion) {
     let mut group = c.benchmark_group("glob_detection");
 
-    let sizes: Vec<usize> = vec![1, 10, 50, 100];
+    // 单行 vs 多行
+    let single_line = "use std::{io::*, sync::*};\nfn foo() {}\n";
+    let multi_line = "use std::{\n    io::*,\n    sync::*\n};\nfn foo() {}\n";
+    let nested_multi =
+        "use std::{\n    sync::{\n        *,\n        atomic::*\n    },\n    io::*\n};\nfn foo() {}\n";
 
-    for &size in &sizes {
-        let code = build_std_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("verify_imports_with_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(verify_imports(code))),
-        );
+    for (name, code) in [
+        ("single_line", single_line.to_string()),
+        ("multi_line", multi_line.to_string()),
+        ("nested_multi", nested_multi.to_string()),
+    ] {
+        group.bench_with_input(BenchmarkId::new("format", name), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
     }
 
-    for &size in &sizes {
-        let code = build_std_no_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("verify_imports_no_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(verify_imports(code))),
-        );
+    // 规模测试
+    for &n in &[3, 10, 50] {
+        let code = build_multiline_glob_code(n);
+        group.bench_with_input(BenchmarkId::new("multiline", n), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
     }
 
     group.finish();
 }
 
-/// 多层 glob 导入基准测试
-fn nested_glob_benchmark(c: &mut Criterion) {
+/// 3. nested_glob — 嵌套 glob 路径检测性能
+fn nested_glob(c: &mut Criterion) {
     let mut group = c.benchmark_group("nested_glob");
 
-    let sizes: Vec<usize> = vec![1, 10, 50, 100];
-
-    for &size in &sizes {
-        let code = build_nested_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("ensure_std_imports_nested_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(ensure_std_imports(code))),
-        );
+    for &depth in &[1, 2, 3, 4] {
+        let code = build_multiline_nested_glob_code(depth);
+        group.bench_with_input(BenchmarkId::new("depth", depth), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
     }
 
+    // 外部 crate glob
+    let sizes: Vec<usize> = vec![10, 100, 500];
     for &size in &sizes {
-        let code = build_nested_glob_code(size);
-        group.bench_with_input(
-            BenchmarkId::new("verify_imports_nested_glob", size),
-            &code,
-            |b, code| b.iter(|| black_box(verify_imports(code))),
-        );
+        let code = build_external_glob_code(size);
+        group.bench_with_input(BenchmarkId::new("external_size", size), &code, |b, c| {
+            b.iter(|| black_box(ensure_external_imports(c)));
+        });
     }
 
     group.finish();
 }
 
-/// 边界情况基准测试
-fn edge_cases_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("glob_edge_cases");
+/// 4. multiline_glob — 多行 use 语句合并性能
+fn multiline_glob(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multiline_glob");
 
-    // 空代码
-    group.bench_function("empty_code", |b| {
-        b.iter(|| black_box(ensure_std_imports("")))
+    // 多种多行 use 块大小
+    for &lines in &[5, 10, 20, 50] {
+        let code = build_multiline_glob_code(lines);
+        group.bench_with_input(BenchmarkId::new("lines", lines), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
+    }
+
+    // 多行 + 类型混合
+    let mut mixed_code = String::from("use std::{\n");
+    mixed_code.push_str("    io::*,\n");
+    mixed_code.push_str("    sync::*\n");
+    mixed_code.push_str("};\n");
+    for i in 0..100 {
+        mixed_code.push_str(&format!(
+            "fn func_{}() -> (Arc<Mutex<i32>>, BufReader) {{ unimplemented!() }}\n",
+            i
+        ));
+    }
+    group.bench_function("mixed_100_fns", |b| {
+        b.iter(|| black_box(ensure_std_imports(&mixed_code)));
     });
 
-    // 纯 glob 导入无类型使用
-    group.bench_function("pure_glob_no_types", |b| {
-        b.iter(|| {
-            black_box(ensure_std_imports(
-                "use std::collections::*;\nuse std::sync::*;\nfn foo() {}\n",
-            ))
-        })
+    group.finish();
+}
+
+/// 5. edge_cases — 边界情况
+fn edge_cases(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edge_cases");
+
+    let empty = "";
+    let single_line = "use std::collections::*;\nfn foo() {}";
+    let all_glob = "use std::*;\nuse serde::*;\nuse tokio::*;\nuse regex::*;\nfn foo() {}";
+    let no_glob =
+        "use std::collections::HashMap;\nfn foo() -> HashMap<i32, i32> { HashMap::new() }";
+    let unicode_100 = build_unicode_code(100);
+
+    for (name, code) in [
+        ("empty", empty.to_string()),
+        ("single_line", single_line.to_string()),
+        ("all_glob", all_glob.to_string()),
+        ("no_glob", no_glob.to_string()),
+        ("unicode_100", unicode_100),
+    ] {
+        group.bench_with_input(BenchmarkId::new("ensure_std", name), &code, |b, c| {
+            b.iter(|| black_box(ensure_std_imports(c)));
+        });
+    }
+
+    // 超大规模
+    let huge_5000 = build_simple_glob_code(5000);
+    group.bench_function("ensure_std_5000_lines", |b| {
+        b.iter(|| black_box(ensure_std_imports(&huge_5000)));
     });
 
-    // 多个 glob 导入 + 少量类型
-    group.bench_function("many_globs_few_types", |b| {
-        let code = "use std::collections::*;\nuse std::sync::*;\nuse std::io::*;\nuse std::path::*;\nuse std::process::*;\nfn foo() -> HashMap<i32, i32> { HashMap::new() }\n";
-        b.iter(|| black_box(ensure_std_imports(code)))
-    });
-
-    // glob 导入与显式导入混合
-    group.bench_function("mixed_glob_explicit", |b| {
-        let code = "use std::collections::*;\nuse std::sync::Arc;\nfn foo() -> (HashMap<i32, i32>, Arc<u8>) { (HashMap::new(), Arc::new(0)) }\n";
-        b.iter(|| black_box(ensure_std_imports(code)))
-    });
-
-    // 大量 glob 导入
-    group.bench_function("many_glob_imports", |b| {
-        let mut code = String::new();
-        for _ in 0..20 {
-            code.push_str("use std::collections::*;\n");
-        }
-        code.push_str("fn foo() -> HashMap<i32, i32> { HashMap::new() }\n");
-        b.iter(|| black_box(ensure_std_imports(&code)))
+    let huge_external_1000 = build_external_glob_code(1000);
+    group.bench_function("ensure_external_1000", |b| {
+        b.iter(|| black_box(ensure_external_imports(&huge_external_1000)));
     });
 
     group.finish();
 }
 
 criterion_group!(
-    glob_import_benchmarks,
-    glob_exclusion_benchmark,
-    glob_detection_benchmark,
-    nested_glob_benchmark,
-    edge_cases_benchmark,
+    benches,
+    glob_exclusion,
+    glob_detection,
+    nested_glob,
+    multiline_glob,
+    edge_cases
 );
-criterion_main!(glob_import_benchmarks);
+criterion_main!(benches);

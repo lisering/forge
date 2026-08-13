@@ -247,6 +247,51 @@ pub fn validate_rust_braces(content: &str) -> Option<String> {
                 State::BlockComment(1)
             }
             (State::Code, '"', _) => State::String,
+            // 字节字符串 b"..." (Session 134)
+            (State::Code, 'b', Some('"')) => {
+                i += 1; // 跳过 "
+                State::String
+            }
+            // 原始字节字符串 br"..." 或 br#"..."# (Session 134)
+            (State::Code, 'b', Some('r')) => {
+                // 检查后面是否是 r" 或 r#"
+                if i + 2 < chars.len() && chars[i + 2] == '"' {
+                    // br"..."
+                    i += 2; // 跳过 r"
+                    State::RawString(0)
+                } else if i + 2 < chars.len() && chars[i + 2] == '#' {
+                    // br#"..."#
+                    let mut hash_depth = 0;
+                    let mut j = i + 2;
+                    while j < chars.len() && chars[j] == '#' {
+                        hash_depth += 1;
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == '"' {
+                        i = j; // 跳过所有 # 和 "
+                        State::RawString(hash_depth)
+                    } else {
+                        State::Code
+                    }
+                } else {
+                    State::Code
+                }
+            }
+            // 字节字符 b'x' (Session 134)
+            (State::Code, 'b', Some('\'')) => {
+                // b'x' 或 b'\x7f' — 同字符字面量处理
+                if chars.len() > i + 3 && chars[i + 3] == '\'' {
+                    // b'x'
+                    i += 3; // 跳过 'x'
+                    State::Code
+                } else if chars.len() > i + 4 && chars[i + 2] == '\\' && chars[i + 4] == '\'' {
+                    // b'\x7f' 等转义
+                    i += 4;
+                    State::Code
+                } else {
+                    State::Code
+                }
+            }
             (State::Code, 'r', Some('"')) => {
                 // r"..." 或 r#"..."#
                 i += 1; // 跳过 "
@@ -4814,21 +4859,156 @@ fn has_covering_glob_import(glob_imports: &[String], module_path: &str) -> bool 
     })
 }
 
-/// 从代码中提取所有 glob 导入的模块路径 (Session 129)
+/// 从代码中提取所有 glob 导入的模块路径 (Session 129 + Session 133 增强)
 ///
 /// 扫描 `use X::*;` 形式的导入, 返回模块路径列表。
 /// 用于快速判断某类型是否已被 glob 导入覆盖。
+///
+/// # 支持的格式
+///
+/// - `use module::*;` → `module` (Session 129)
+/// - `use module::{*, sub::*};` → `module` + `module::sub` (Session 133)
+/// - `use module::{Type, sub::*};` → `module::sub` (Session 133)
+/// - `use module::{sub::{*, inner::*}};` → `module::sub` + `module::sub::inner` (Session 133)
 fn extract_glob_imports(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("use ")
-                .and_then(|rest| rest.strip_suffix("::*;"))
-                .map(|s| s.to_string())
-        })
-        .collect()
+    let mut globs = Vec::new();
+
+    // 预处理: 将多行 use 语句合并为单行 (Session 134)
+    // 例如: use std::{\n io::*,\n sync::*\n}; → use std::{ io::*, sync::*};
+    let joined = join_multiline_use_statements(content);
+
+    for line in joined.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("use ") {
+            continue;
+        }
+        let rest = &trimmed[4..]; // skip "use "
+        if !rest.ends_with(';') {
+            continue;
+        }
+        let rest = &rest[..rest.len() - 1]; // remove trailing ';'
+
+        // Case 1: use module::*;
+        if let Some(module) = rest.strip_suffix("::*") {
+            globs.push(module.to_string());
+            continue;
+        }
+
+        // Case 2: use module::{...} with globs inside braces
+        if let Some(brace_pos) = rest.find("::{") {
+            if let Some(close_pos) = rest.rfind('}') {
+                if close_pos > brace_pos + 2 {
+                    let module = &rest[..brace_pos];
+                    let inner = &rest[brace_pos + 3..close_pos];
+                    extract_globs_from_braces(inner, module, &mut globs);
+                }
+            }
+        }
+    }
+    globs
+}
+
+/// 将多行 use 语句合并为单行 (Session 134)
+///
+/// 扫描代码中的 `use` 语句, 如果以 `{` 开头但未在同一行以 `};` 结束,
+/// 则将后续行合并到同一行 (用空格替代换行), 直到找到 `};` 为止。
+fn join_multiline_use_statements(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // 检测 use 语句且包含未闭合的 {
+        if trimmed.starts_with("use ") && trimmed.contains('{') {
+            // 计算当前行的 { 和 } 数量
+            let open_count = trimmed.chars().filter(|&c| c == '{').count();
+            let close_count = trimmed.chars().filter(|&c| c == '}').count();
+
+            if open_count > close_count {
+                // 多行 use 语句: 合并后续行
+                let mut joined = line.to_string();
+                i += 1;
+                while i < lines.len() {
+                    joined.push(' ');
+                    joined.push_str(lines[i]);
+                    let joined_trimmed = joined.trim();
+                    let o = joined_trimmed.chars().filter(|&c| c == '{').count();
+                    let c = joined_trimmed.chars().filter(|&c| c == '}').count();
+                    if o <= c {
+                        break;
+                    }
+                    i += 1;
+                }
+                result.push(joined);
+                i += 1;
+                continue;
+            }
+        }
+
+        result.push(line.to_string());
+        i += 1;
+    }
+
+    result.join("\n")
+}
+
+/// 从花括号内容中提取 glob 导入路径 (Session 133)
+///
+/// 递归解析 `use module::{...}` 中花括号内的内容,
+/// 提取 `*` 和 `sub::*` 形式的 glob 导入。
+fn extract_globs_from_braces(inner: &str, parent: &str, globs: &mut Vec<String>) {
+    for item in split_top_level_commas(inner) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item == "*" {
+            // use parent::{*} → parent
+            globs.push(parent.to_string());
+        } else if let Some(sub) = item.strip_suffix("::*") {
+            // use parent::{sub::*} → parent::sub
+            globs.push(format!("{}::{}", parent, sub));
+        } else if let Some(nested_pos) = item.find("::{") {
+            // use parent::{sub::{...}} → recurse
+            if let Some(nested_close) = item.rfind('}') {
+                if nested_close > nested_pos + 2 {
+                    let sub = &item[..nested_pos];
+                    let nested_inner = &item[nested_pos + 3..nested_close];
+                    let full_path = format!("{}::{}", parent, sub);
+                    extract_globs_from_braces(nested_inner, &full_path, globs);
+                }
+            }
+        }
+    }
+}
+
+/// 在顶层按逗号分割字符串 (忽略嵌套花括号内的逗号) (Session 133)
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                result.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < s.len() {
+        result.push(&s[start..]);
+    }
+    result
 }
 
 /// 检测并添加缺失的 `std` 导入 (Session 124 + Session 125 扩展)
@@ -5145,6 +5325,11 @@ pub fn ensure_std_imports(content: &str) -> String {
 /// - `Connection` / `Statement` / `Row` → `use rusqlite::{...};` (Session 132)
 /// - `params!` → `use rusqlite::params;` (Session 132)
 /// - `Cmd` / `AsyncConnection` → `use redis::{...};` (Session 132)
+/// - `Pool` / `QueryBuilder` / `Executor` / `AnyPool` / `MySqlPool` / `PgPool` / `SqlitePool` → `use sqlx::{...};` (Session 133)
+/// - `query!` / `query_as!` / `query_unchecked!` → `use sqlx::{...};` (Session 133)
+/// - `TypedHeader` → `use axum_extra::...;` (Session 133)
+/// - `Message` / `Transport` / `SmtpTransport` / `AsyncTransport` → `use lettre::{...};` (Session 133)
+/// - `Config` → `use config::Config;` (Session 133)
 ///
 /// # 规则
 ///
@@ -5242,6 +5427,47 @@ pub fn ensure_external_imports(content: &str) -> String {
         // redis (Session 132)
         ("Cmd", "redis"),
         ("AsyncConnection", "redis"),
+        // sqlx (Session 133)
+        ("Pool", "sqlx"),
+        ("QueryBuilder", "sqlx"),
+        ("Executor", "sqlx"),
+        ("AnyPool", "sqlx"),
+        ("MySqlPool", "sqlx"),
+        ("PgPool", "sqlx"),
+        ("SqlitePool", "sqlx"),
+        // axum-extra (Session 133)
+        ("TypedHeader", "axum_extra"),
+        // lettre (Session 133)
+        ("Message", "lettre"),
+        ("Transport", "lettre"),
+        ("SmtpTransport", "lettre"),
+        ("AsyncTransport", "lettre"),
+        // config (Session 133)
+        ("Config", "config"),
+        // hyper (Session 134)
+        ("Body", "hyper"),
+        ("HeaderMap", "hyper"),
+        ("Uri", "hyper"),
+        ("Method", "hyper"),
+        // tower (Session 134)
+        ("Service", "tower"),
+        ("ServiceExt", "tower"),
+        ("Layer", "tower"),
+        ("BoxError", "tower"),
+        // tonic (Session 134)
+        ("Status", "tonic"),
+        ("Code", "tonic"),
+        ("Channel", "tonic::transport"),
+        // proc_macro2 (Session 134)
+        ("TokenStream", "proc_macro2"),
+        ("Span", "proc_macro2"),
+        ("Ident", "proc_macro2"),
+        ("Literal", "proc_macro2"),
+        // syn (Session 134)
+        ("DeriveInput", "syn"),
+        ("ItemFn", "syn"),
+        ("ItemStruct", "syn"),
+        ("ItemEnum", "syn"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -5580,6 +5806,106 @@ pub fn ensure_external_imports(content: &str) -> String {
         }
     }
 
+    // 检测 sqlx query! / query_as! 宏使用 (Session 133)
+    // query!("SELECT * FROM users") → use sqlx::query;
+    // query_as!(User, "SELECT * FROM users") → use sqlx::query_as;
+    let sqlx_macros: &[&str] = &["query", "query_as", "query_unchecked"];
+    let mut sqlx_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in sqlx_macros {
+        let macro_bang = format!("{}!(", macro_name);
+        let full_path = format!("sqlx::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use sqlx::{};", macro_name))
+                    || (trimmed.contains("use sqlx::{") && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use sqlx::*;")
+            }) || has_covering_glob_import(&glob_imports, "sqlx");
+
+            if !already_imported {
+                sqlx_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !sqlx_macro_needed.is_empty() {
+        sqlx_macro_needed.sort();
+        sqlx_macro_needed.dedup();
+        needed.entry("sqlx").or_default().extend(sqlx_macro_needed);
+    }
+
+    // 检测 quote! / format_ident! 宏使用 (Session 134)
+    // quote! { ... } → use quote::quote;
+    // format_ident!("name") → use quote::format_ident;
+    let quote_macros: &[&str] = &["quote", "format_ident"];
+    let mut quote_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in quote_macros {
+        let macro_bang = format!("{}!", macro_name);
+        let full_path = format!("quote::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use quote::{};", macro_name))
+                    || (trimmed.contains("use quote::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use quote::*;")
+            }) || has_covering_glob_import(&glob_imports, "quote");
+
+            if !already_imported {
+                quote_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !quote_macro_needed.is_empty() {
+        quote_macro_needed.sort();
+        quote_macro_needed.dedup();
+        needed
+            .entry("quote")
+            .or_default()
+            .extend(quote_macro_needed);
+    }
+
+    // 检测 syn parse_quote! / parse_str! 宏使用 (Session 134)
+    // parse_quote!(ItemFn) → use syn::parse_quote;
+    // parse_str!("code") → use syn::parse_str;
+    let syn_macros: &[&str] = &["parse_quote", "parse_str"];
+    let mut syn_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in syn_macros {
+        let macro_bang = format!("{}!(", macro_name);
+        let full_path = format!("syn::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use syn::{};", macro_name))
+                    || (trimmed.contains("use syn::{") && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use syn::*;")
+            }) || has_covering_glob_import(&glob_imports, "syn");
+
+            if !already_imported {
+                syn_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !syn_macro_needed.is_empty() {
+        syn_macro_needed.sort();
+        syn_macro_needed.dedup();
+        needed.entry("syn").or_default().extend(syn_macro_needed);
+    }
+
     if needed.is_empty() {
         return content.to_string();
     }
@@ -5739,6 +6065,10 @@ pub struct ImportIssue {
 /// - `.read()` / `.write()` → `use std::sync::RwLock;` (Session 132)
 /// - `.send()` → `use std::sync::mpsc::Sender;` (Session 132)
 /// - `.recv()` → `use std::sync::mpsc::Receiver;` (Session 132)
+/// - `.try_read()` / `.try_write()` → `use std::sync::RwLock;` (Session 133)
+/// - `.try_send()` → `use std::sync::mpsc::Sender;` (Session 133)
+/// - `.await?` → `use anyhow::Result;` (Session 134)
+/// - `.spawn()` → `use tokio::spawn;` (Session 134)
 ///
 /// # 示例
 ///
@@ -5981,6 +6311,40 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("Row", "rusqlite"),
         ("Cmd", "redis"),
         ("AsyncConnection", "redis"),
+        // External crates (Session 133)
+        ("Pool", "sqlx"),
+        ("QueryBuilder", "sqlx"),
+        ("Executor", "sqlx"),
+        ("AnyPool", "sqlx"),
+        ("MySqlPool", "sqlx"),
+        ("PgPool", "sqlx"),
+        ("SqlitePool", "sqlx"),
+        ("TypedHeader", "axum_extra"),
+        ("Message", "lettre"),
+        ("Transport", "lettre"),
+        ("SmtpTransport", "lettre"),
+        ("AsyncTransport", "lettre"),
+        ("Config", "config"),
+        // External crates (Session 134)
+        ("Body", "hyper"),
+        ("HeaderMap", "hyper"),
+        ("Uri", "hyper"),
+        ("Method", "hyper"),
+        ("Service", "tower"),
+        ("ServiceExt", "tower"),
+        ("Layer", "tower"),
+        ("BoxError", "tower"),
+        ("Status", "tonic"),
+        ("Code", "tonic"),
+        ("Channel", "tonic::transport"),
+        ("TokenStream", "proc_macro2"),
+        ("Span", "proc_macro2"),
+        ("Ident", "proc_macro2"),
+        ("Literal", "proc_macro2"),
+        ("DeriveInput", "syn"),
+        ("ItemFn", "syn"),
+        ("ItemStruct", "syn"),
+        ("ItemEnum", "syn"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -6011,6 +6375,47 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                     }
                 }
             }
+        }
+    }
+
+    // 检测 sqlx query! / query_as! / query_unchecked! 宏使用 (Session 133)
+    let sqlx_verify_macros: &[&str] = &["query", "query_as", "query_unchecked"];
+    let mut sqlx_verify_macro_found = false;
+    let mut sqlx_verify_macro_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &macro_name in sqlx_verify_macros {
+            let macro_bang = format!("{}!(", macro_name);
+            let full_path = format!("sqlx::{}!", macro_name);
+            if line.contains(&macro_bang) && !line.contains(&full_path) {
+                sqlx_verify_macro_found = true;
+                sqlx_verify_macro_line = i + 1;
+                break;
+            }
+        }
+        if sqlx_verify_macro_found {
+            break;
+        }
+    }
+
+    if sqlx_verify_macro_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use sqlx::query;")
+                || trimmed.starts_with("use sqlx::query_as;")
+                || trimmed.starts_with("use sqlx::query_unchecked;")
+                || (trimmed.contains("use sqlx::{")
+                    && (contains_type_usage(trimmed, "query")
+                        || contains_type_usage(trimmed, "query_as")
+                        || contains_type_usage(trimmed, "query_unchecked")))
+                || trimmed.starts_with("use sqlx::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "query".to_string(),
+                module_path: "sqlx".to_string(),
+                usage_line: sqlx_verify_macro_line,
+            });
         }
     }
 
@@ -6160,9 +6565,10 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 std::sync::RwLock 的 .read() / .write() 方法调用 (Session 132)
-    // .read() / .write() 是 RwLock 的核心方法, 如果调用但未导入 RwLock, 可能缺少导入
-    let rwlock_methods: &[&str] = &["read", "write"];
+    // 检测 std::sync::RwLock 的 .read() / .write() / .try_read() / .try_write() 方法调用 (Session 132 + 133)
+    // .read() / .write() 是 RwLock 的核心方法, .try_read() / .try_write() 是非阻塞版本
+    // 如果调用但未导入 RwLock, 可能缺少导入
+    let rwlock_methods: &[&str] = &["read", "write", "try_read", "try_write"];
     let mut rwlock_method_found = false;
     let mut rwlock_method_line = 0;
     for (i, line) in lines.iter().enumerate() {
@@ -6197,9 +6603,9 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         }
     }
 
-    // 检测 std::sync::mpsc 的 .send() / .recv() 方法调用 (Session 132)
-    // .send() 是 Sender 的方法, .recv() 是 Receiver 的方法
-    let mpsc_methods: &[&str] = &["send", "recv"];
+    // 检测 std::sync::mpsc 的 .send() / .recv() / .try_send() 方法调用 (Session 132 + 133)
+    // .send() 是 Sender 的方法, .recv() 是 Receiver 的方法, .try_send() 是 Sender 的非阻塞方法
+    let mpsc_methods: &[&str] = &["send", "recv", "try_send"];
     let mut mpsc_method_found = false;
     let mut mpsc_method_line = 0;
     for (i, line) in lines.iter().enumerate() {
@@ -6229,7 +6635,7 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
 
         if !already_imported {
             // 检测具体是 Sender 还是 Receiver
-            let has_send = content.contains(".send(");
+            let has_send = content.contains(".send(") || content.contains(".try_send(");
             let has_recv = content.contains(".recv(");
             if has_send {
                 issues.push(ImportIssue {
@@ -6245,6 +6651,143 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                     usage_line: mpsc_method_line,
                 });
             }
+        }
+    }
+
+    // 检测 .await? 使用 → 需要 anyhow::Result (Session 134)
+    // .await? 表示异步函数中使用 ? 操作符, 函数必须返回 Result
+    let mut await_question_found = false;
+    let mut await_question_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains(".await?") {
+            await_question_found = true;
+            await_question_line = i + 1;
+            break;
+        }
+    }
+
+    if await_question_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use anyhow::Result;")
+                || trimmed.starts_with("use anyhow::{")
+                || trimmed.starts_with("use anyhow::*;")
+                || trimmed.starts_with("use std::result::Result;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "Result".to_string(),
+                module_path: "anyhow".to_string(),
+                usage_line: await_question_line,
+            });
+        }
+    }
+
+    // 检测 tokio::spawn 的 .spawn() 方法调用 (Session 134)
+    // .spawn() 是 tokio::task::JoinHandle 的关联函数, 裸调用需要导入
+    let mut spawn_method_found = false;
+    let mut spawn_method_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains(".spawn()") && !line.contains("tokio::spawn") {
+            spawn_method_found = true;
+            spawn_method_line = i + 1;
+            break;
+        }
+    }
+
+    if spawn_method_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use tokio::spawn;")
+                || (trimmed.contains("use tokio::{") && contains_type_usage(trimmed, "spawn"))
+                || trimmed.starts_with("use tokio::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "spawn".to_string(),
+                module_path: "tokio".to_string(),
+                usage_line: spawn_method_line,
+            });
+        }
+    }
+
+    // 检测 quote! / format_ident! 宏使用 (Session 134)
+    let quote_verify_macros: &[&str] = &["quote", "format_ident"];
+    let mut quote_verify_macro_found = false;
+    let mut quote_verify_macro_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &macro_name in quote_verify_macros {
+            let macro_bang = format!("{}!", macro_name);
+            let full_path = format!("quote::{}!", macro_name);
+            if line.contains(&macro_bang) && !line.contains(&full_path) {
+                quote_verify_macro_found = true;
+                quote_verify_macro_line = i + 1;
+                break;
+            }
+        }
+        if quote_verify_macro_found {
+            break;
+        }
+    }
+
+    if quote_verify_macro_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use quote::quote;")
+                || trimmed.starts_with("use quote::format_ident;")
+                || (trimmed.contains("use quote::{")
+                    && (contains_type_usage(trimmed, "quote")
+                        || contains_type_usage(trimmed, "format_ident")))
+                || trimmed.starts_with("use quote::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "quote".to_string(),
+                module_path: "quote".to_string(),
+                usage_line: quote_verify_macro_line,
+            });
+        }
+    }
+
+    // 检测 syn parse_quote! / parse_str! 宏使用 (Session 134)
+    let syn_verify_macros: &[&str] = &["parse_quote", "parse_str"];
+    let mut syn_verify_macro_found = false;
+    let mut syn_verify_macro_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &macro_name in syn_verify_macros {
+            let macro_bang = format!("{}!(", macro_name);
+            let full_path = format!("syn::{}!", macro_name);
+            if line.contains(&macro_bang) && !line.contains(&full_path) {
+                syn_verify_macro_found = true;
+                syn_verify_macro_line = i + 1;
+                break;
+            }
+        }
+        if syn_verify_macro_found {
+            break;
+        }
+    }
+
+    if syn_verify_macro_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use syn::parse_quote;")
+                || trimmed.starts_with("use syn::parse_str;")
+                || (trimmed.contains("use syn::{")
+                    && (contains_type_usage(trimmed, "parse_quote")
+                        || contains_type_usage(trimmed, "parse_str")))
+                || trimmed.starts_with("use syn::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "parse_quote".to_string(),
+                module_path: "syn".to_string(),
+                usage_line: syn_verify_macro_line,
+            });
         }
     }
 
@@ -14821,6 +15364,942 @@ fn foo(
                 .any(|i| i.type_name == "AsyncConnection" && i.module_path == "redis"),
             "应检测到 redis::AsyncConnection 缺失导入: {:?}",
             issues
+        );
+    }
+
+    // ===== Session 133: verify_imports .try_read()/.try_write() → RwLock 测试 =====
+
+    #[test]
+    fn test_verify_imports_try_read_method_rwlock() {
+        let issues = verify_imports("fn foo(r: RwLock<i32>) { let g = r.try_read(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "应通过 .try_read() 方法检测到 RwLock 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_write_method_rwlock() {
+        let issues = verify_imports("fn foo(w: RwLock<i32>) { let g = w.try_write(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "应通过 .try_write() 方法检测到 RwLock 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_read_already_imported() {
+        let code = "use std::sync::RwLock;\nfn foo(r: RwLock<i32>) { let g = r.try_read(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "已有 RwLock 导入不应通过 .try_read() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_write_glob_import() {
+        let code = "use std::sync::*;\nfn foo(w: RwLock<i32>) { let g = w.try_write(); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "glob 导入 use std::sync::*; 应覆盖 RwLock: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 133: verify_imports .try_send() → mpsc::Sender 测试 =====
+
+    #[test]
+    fn test_verify_imports_try_send_method_mpsc() {
+        let issues = verify_imports("fn foo(s: Sender<i32>) { s.try_send(42); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "应通过 .try_send() 方法检测到 mpsc::Sender 可能缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_send_already_imported() {
+        let code = "use std::sync::mpsc::Sender;\nfn foo(s: Sender<i32>) { s.try_send(42); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "已有 Sender 导入不应通过 .try_send() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_send_glob_import() {
+        let code = "use std::sync::mpsc::*;\nfn foo(s: Sender<i32>) { s.try_send(42); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "glob 导入 use std::sync::mpsc::*; 应覆盖 Sender: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_read_and_try_send_combined() {
+        let code =
+            "fn foo(r: RwLock<i32>, s: Sender<i32>) { let _ = r.try_read(); s.try_send(1); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "RwLock" && i.module_path == "std::sync"),
+            "应检测到 RwLock 缺失导入: {:?}",
+            issues
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Sender" && i.module_path == "std::sync::mpsc"),
+            "应检测到 Sender 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 133: ensure_external_imports sqlx 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_pool() {
+        let code = "fn foo() -> Pool<Sqlite> { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sqlx::Pool;"),
+            "应添加 sqlx::Pool 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_query_builder() {
+        let code = "fn foo() -> QueryBuilder<Sqlite> { QueryBuilder::new(\"\") }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sqlx::QueryBuilder;"),
+            "应添加 sqlx::QueryBuilder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_multiple() {
+        let code = "fn foo() -> (Pool<Sqlite>, Executor) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use sqlx::{") && result.contains("Pool"),
+            "应合并 sqlx 导入: {}",
+            result
+        );
+        assert!(result.contains("Executor"), "应包含 Executor: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_full_path() {
+        let code = "fn foo() -> sqlx::Pool<Sqlite> { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use sqlx::Pool;"),
+            "全限定 sqlx:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_query_macro() {
+        let code = "fn foo() { let r = query!(\"SELECT 1\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("sqlx::") && result.contains("query"),
+            "应通过 query! 宏检测添加 sqlx::query 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_query_as_macro() {
+        let code = "fn foo() { let r = query_as!(User, \"SELECT * FROM users\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("sqlx::") && result.contains("query_as"),
+            "应通过 query_as! 宏检测添加 sqlx::query_as 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_sqlx_full_path_macro() {
+        let code = "fn foo() { let r = sqlx::query!(\"SELECT 1\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use sqlx::query;"),
+            "全限定 sqlx::query! 不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 133: ensure_external_imports axum-extra 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_axum_extra_typed_header() {
+        let code = "fn foo(h: TypedHeader<XAuthToken>) -> () {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use axum_extra::TypedHeader;"),
+            "应添加 axum_extra::TypedHeader 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_axum_extra_full_path() {
+        let code = "fn foo(h: axum_extra::TypedHeader<X>) {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use axum_extra::TypedHeader;"),
+            "全限定 axum_extra:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 133: ensure_external_imports lettre 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_lettre_message() {
+        let code = "fn foo() -> Message { Message::builder().build() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use lettre::Message;"),
+            "应添加 lettre::Message 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_lettre_smtp_transport() {
+        let code = "fn foo() -> SmtpTransport { SmtpTransport::relay(\"localhost\").unwrap() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use lettre::SmtpTransport;"),
+            "应添加 lettre::SmtpTransport 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_lettre_multiple() {
+        let code = "fn foo() -> (Message, SmtpTransport) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use lettre::{") && result.contains("Message"),
+            "应合并 lettre 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("SmtpTransport"),
+            "应包含 SmtpTransport: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_lettre_full_path() {
+        let code = "fn foo() -> lettre::Message { lettre::Message::builder().build() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use lettre::Message;"),
+            "全限定 lettre:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 133: ensure_external_imports config 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_config() {
+        let code = "fn foo() -> Config { Config::builder().build() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use config::Config;"),
+            "应添加 config::Config 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_config_full_path() {
+        let code = "fn foo() -> config::Config { config::Config::builder().build() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use config::Config;"),
+            "全限定 config:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s133_idempotent() {
+        let code = "fn foo() -> (Pool<Sqlite>, TypedHeader<X>) { unimplemented!() }\nfn bar() -> Message { unimplemented!() }\nfn baz() -> Config { unimplemented() }\nlet r = query!(\"SELECT 1\");";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 133 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 133: verify_imports 新增外部 crate 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_sqlx_pool_missing() {
+        let issues = verify_imports("fn foo() -> Pool<Sqlite> { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Pool" && i.module_path == "sqlx"),
+            "应检测到 Pool 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_lettre_message_missing() {
+        let issues = verify_imports("fn foo() -> Message { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Message" && i.module_path == "lettre"),
+            "应检测到 lettre::Message 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_config_missing() {
+        let issues = verify_imports("fn foo() -> Config { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Config" && i.module_path == "config"),
+            "应检测到 config::Config 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_axum_extra_typed_header_missing() {
+        let issues = verify_imports("fn foo(h: TypedHeader<X>) {}");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "TypedHeader" && i.module_path == "axum_extra"),
+            "应检测到 axum_extra::TypedHeader 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sqlx_query_macro_missing() {
+        let issues = verify_imports("fn foo() { let r = query!(\"SELECT 1\"); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "query" && i.module_path == "sqlx"),
+            "应检测到 sqlx::query! 宏缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_sqlx_query_macro_already_imported() {
+        let code = "use sqlx::query;\nfn foo() { let r = query!(\"SELECT 1\"); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "query" && i.module_path == "sqlx"),
+            "已有 sqlx::query 导入不应重复报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 133: 增强 glob 导入检测测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_mixed_star_and_sub() {
+        let code = "use std::sync::{*, atomic::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "应包含 std::sync (from *): {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync::atomic".to_string()),
+            "应包含 std::sync::atomic (from atomic::*): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_multiple_globs_in_braces() {
+        let code = "use std::{io::*, sync::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_type_and_glob_mixed() {
+        let code = "use std::collections::{HashMap, hash_map::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::collections::hash_map".to_string()),
+            "应包含 std::collections::hash_map: {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"std::collections".to_string()),
+            "不应包含 std::collections (HashMap 不是 glob): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_nested_braces() {
+        let code = "use std::{sync::{*, atomic::*}, io::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "应包含 std::sync: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync::atomic".to_string()),
+            "应包含 std::sync::atomic: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "应包含 std::io: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_self_and_glob() {
+        let code = "use crate::{self, sub::*};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"crate::sub".to_string()),
+            "应包含 crate::sub: {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"crate".to_string()),
+            "不应包含 crate (self 不是 glob): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_simple_still_works() {
+        let code = "use std::collections::*;\nuse serde::Serialize;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::collections".to_string()),
+            "简单 glob 仍应正常工作: {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"serde".to_string()),
+            "非 glob 导入不应包含: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_empty_braces() {
+        let code = "use std::collections::{HashMap, HashSet};";
+        let globs = extract_glob_imports(code);
+        assert!(globs.is_empty(), "无 glob 的花括号导入应为空: {:?}", globs);
+    }
+
+    #[test]
+    fn test_split_top_level_commas_basic() {
+        let parts = split_top_level_commas("a, b, c");
+        assert_eq!(parts.len(), 3, "应分割为3部分: {:?}", parts);
+        assert_eq!(parts[0], "a");
+        assert_eq!(parts[1], " b");
+        assert_eq!(parts[2], " c");
+    }
+
+    #[test]
+    fn test_split_top_level_commas_nested() {
+        let parts = split_top_level_commas("a, {b, c}, d");
+        assert_eq!(parts.len(), 3, "嵌套花括号内逗号不应分割: {:?}", parts);
+        assert_eq!(parts[0], "a");
+        assert_eq!(parts[1], " {b, c}");
+        assert_eq!(parts[2], " d");
+    }
+
+    #[test]
+    fn test_split_top_level_commas_empty() {
+        let parts = split_top_level_commas("");
+        assert!(parts.is_empty(), "空字符串应返回空: {:?}", parts);
+    }
+
+    #[test]
+    fn test_ensure_std_imports_mixed_glob_exclusion() {
+        let code =
+            "use std::sync::{*, atomic::*};\nfn foo() -> AtomicBool { AtomicBool::new(true) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::sync::atomic::AtomicBool;"),
+            "use std::sync::{{*, atomic::*}}; 应覆盖 AtomicBool: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_mixed_glob_exclusion() {
+        let code = "use serde::{Serialize, *};\n#[derive(Deserialize)]\nstruct Foo {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use serde::Deserialize;"),
+            "use serde::{{Serialize, *}}; 应覆盖 Deserialize: {}",
+            result
+        );
+    }
+
+    // ===== Session 134: ensure_external_imports hyper/tower/tonic 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_hyper_body() {
+        let code = "fn foo() -> Body { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use hyper::Body;"),
+            "应添加 hyper::Body 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_hyper_multiple() {
+        let code = "fn foo() -> (Body, HeaderMap) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use hyper::{") && result.contains("Body"),
+            "应合并 hyper 导入: {}",
+            result
+        );
+        assert!(result.contains("HeaderMap"), "应包含 HeaderMap: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_hyper_full_path() {
+        let code = "fn foo() -> hyper::Body { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use hyper::Body;"),
+            "全限定 hyper:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tower_service() {
+        let code = "fn foo() -> Service { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tower::Service;"),
+            "应添加 tower::Service 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tower_multiple() {
+        let code = "fn foo() -> (Service, Layer) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tower::{") && result.contains("Service"),
+            "应合并 tower 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tonic_status() {
+        let code = "fn foo() -> Status { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tonic::Status;"),
+            "应添加 tonic::Status 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tonic_channel() {
+        let code = "fn foo() -> Channel { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tonic::transport::Channel;"),
+            "应添加 tonic::transport::Channel 导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 134: ensure_external_imports proc_macro2/syn/quote 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_proc_macro2_token_stream() {
+        let code = "fn foo() -> TokenStream { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use proc_macro2::TokenStream;"),
+            "应添加 proc_macro2::TokenStream 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_proc_macro2_multiple() {
+        let code = "fn foo() -> (TokenStream, Span, Ident) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use proc_macro2::{") && result.contains("TokenStream"),
+            "应合并 proc_macro2 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_syn_derive_input() {
+        let code = "fn foo() -> DeriveInput { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use syn::DeriveInput;"),
+            "应添加 syn::DeriveInput 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_syn_multiple() {
+        let code = "fn foo() -> (ItemFn, ItemStruct, ItemEnum) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use syn::{") && result.contains("ItemFn"),
+            "应合并 syn 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_quote_macro() {
+        let code = "fn foo() { let ts = quote! { x }; }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use quote::quote;"),
+            "应添加 quote::quote 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_format_ident_macro() {
+        let code = "fn foo() { let id = format_ident!(\"x\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use quote::format_ident;"),
+            "应添加 quote::format_ident 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_syn_parse_quote_macro() {
+        let code = "fn foo() { let item = parse_quote!(fn main() {}); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use syn::parse_quote;"),
+            "应添加 syn::parse_quote 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s134_idempotent() {
+        let code = "fn foo() -> (Body, Service, Status) { unimplemented!() }\nfn bar() -> TokenStream { quote! { x } }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 134 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 134: verify_imports 新增外部 crate 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_hyper_body_missing() {
+        let issues = verify_imports("fn foo() -> Body { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Body" && i.module_path == "hyper"),
+            "应检测到 hyper::Body 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tower_service_missing() {
+        let issues = verify_imports("fn foo() -> Service { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Service" && i.module_path == "tower"),
+            "应检测到 tower::Service 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tonic_status_missing() {
+        let issues = verify_imports("fn foo() -> Status { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Status" && i.module_path == "tonic"),
+            "应检测到 tonic::Status 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_proc_macro2_token_stream_missing() {
+        let issues = verify_imports("fn foo() -> TokenStream { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "TokenStream" && i.module_path == "proc_macro2"),
+            "应检测到 proc_macro2::TokenStream 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_syn_derive_input_missing() {
+        let issues = verify_imports("fn foo() -> DeriveInput { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "DeriveInput" && i.module_path == "syn"),
+            "应检测到 syn::DeriveInput 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 134: verify_imports .await? / .spawn() 测试 =====
+
+    #[test]
+    fn test_verify_imports_await_question_mark() {
+        let issues = verify_imports("async fn foo() { bar().await?; }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Result" && i.module_path == "anyhow"),
+            "应检测到 .await? 需要 anyhow::Result: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_await_question_already_imported() {
+        let code = "use anyhow::Result;\nasync fn foo() -> Result<()> { bar().await?; Ok(()) }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Result" && i.module_path == "anyhow"),
+            "已有 anyhow::Result 导入不应报告 .await?: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_spawn_method() {
+        // tokio::spawn with full path — no issue
+        let _issues1 = verify_imports("async fn foo() { tokio::spawn(async {}).await; }");
+        // Test bare .spawn()
+        let code2 = "async fn foo() { task.spawn().await; }";
+        let issues2 = verify_imports(code2);
+        assert!(
+            issues2
+                .iter()
+                .any(|i| i.type_name == "spawn" && i.module_path == "tokio"),
+            "应检测到 .spawn() 需要 tokio::spawn: {:?}",
+            issues2
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_spawn_already_imported() {
+        let code = "use tokio::spawn;\nfn foo() { spawn(async {}); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "spawn" && i.module_path == "tokio"),
+            "已有 tokio::spawn 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_quote_macro_missing() {
+        let issues = verify_imports("fn foo() { let ts = quote! { x }; }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "quote" && i.module_path == "quote"),
+            "应检测到 quote! 宏缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_parse_quote_macro_missing() {
+        let issues = verify_imports("fn foo() { let item = parse_quote!(fn main() {}); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "parse_quote" && i.module_path == "syn"),
+            "应检测到 syn parse_quote! 宏缺失导入: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 134: 多行 use 语句 glob 导入检测测试 =====
+
+    #[test]
+    fn test_extract_glob_imports_multiline_basic() {
+        let code = "use std::{\n    io::*,\n    sync::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "多行 use 应包含 std::io: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "多行 use 应包含 std::sync: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_multiline_with_types() {
+        let code = "use std::{\n    collections::HashMap,\n    io::*\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::io".to_string()),
+            "多行 use 应包含 std::io (跳过非 glob 项): {:?}",
+            globs
+        );
+        assert!(
+            !globs.contains(&"std::collections".to_string()),
+            "不应包含 std::collections (HashMap 不是 glob): {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_multiline_nested() {
+        let code = "use std::{\n    sync::{\n        *,\n        atomic::*\n    }\n};";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::sync".to_string()),
+            "多行嵌套 use 应包含 std::sync: {:?}",
+            globs
+        );
+        assert!(
+            globs.contains(&"std::sync::atomic".to_string()),
+            "多行嵌套 use 应包含 std::sync::atomic: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_extract_glob_imports_multiline_single_line_still_works() {
+        let code = "use std::collections::*;\nuse serde::Serialize;";
+        let globs = extract_glob_imports(code);
+        assert!(
+            globs.contains(&"std::collections".to_string()),
+            "单行 use 仍应正常工作: {:?}",
+            globs
+        );
+    }
+
+    #[test]
+    fn test_ensure_std_imports_multiline_glob_exclusion() {
+        let code = "use std::{\n    io::*,\n    sync::*\n};\nfn foo() -> Arc<Mutex<i32>> { Arc::new(Mutex::new(0)) }";
+        let result = ensure_std_imports(code);
+        assert!(
+            !result.contains("use std::sync::Arc;"),
+            "多行 glob 导入 use std::{{io::*, sync::*}}; 应覆盖 Arc: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_multiline_glob_exclusion() {
+        let code = "use serde::{\n    Serialize,\n    *\n};\n#[derive(Deserialize)]\nstruct Foo {}";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use serde::Deserialize;"),
+            "多行 glob 导入应覆盖 Deserialize: {}",
+            result
+        );
+    }
+
+    // ===== Session 134: validate_rust_braces 字节字符串测试 =====
+    // Note: basic byte string/char/raw byte string tests already exist from Session 114
+
+    #[test]
+    fn test_validate_rust_braces_byte_string_with_braces() {
+        let code = "fn foo() {\n    let s = b\"{not a brace}\";\n}";
+        assert!(
+            validate_rust_braces(code).is_none(),
+            "字节字符串中的 {{ }} 不应被计数"
         );
     }
 }

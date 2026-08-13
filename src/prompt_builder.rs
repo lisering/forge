@@ -158,6 +158,18 @@ impl SystemPrompt {
         prompt.push_str(
   "❌ 禁止: 调用 .read()/.write() 但未导入 use std::sync::RwLock; / 调用 .send() 但未导入 use std::sync::mpsc::Sender; / 调用 .recv() 但未导入 use std::sync::mpsc::Receiver; (Session 132 trait 方法检测)\n\n",
   );
+        prompt.push_str(
+"❌ 禁止: 使用 Pool/QueryBuilder/Executor/AnyPool/MySqlPool/PgPool/SqlitePool/query!/query_as! (sqlx) / TypedHeader (axum-extra) / Message/Transport/SmtpTransport/AsyncTransport (lettre) / Config (config) 等外部 crate 类型或宏但未导入 use sqlx::... / use axum_extra::... / use lettre::... / use config::... (Session 133)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .try_read()/.try_write() 但未导入 use std::sync::RwLock; / 调用 .try_send() 但未导入 use std::sync::mpsc::Sender; (Session 133 trait 方法检测)\n",
+  );
+        prompt.push_str(
+"❌ 禁止: 使用 Body/HeaderMap/Uri/Method (hyper) / Service/ServiceExt/Layer/BoxError (tower) / Status/Code/Channel (tonic) / TokenStream/Span/Ident/Literal (proc_macro2) / DeriveInput/ItemFn/ItemStruct/ItemEnum (syn) / quote!/format_ident!/parse_quote!/parse_str! (quote/syn 宏) 等外部 crate 类型或宏但未导入 use hyper::... / use tower::... / use tonic::... / use proc_macro2::... / use syn::... / use quote::... (Session 134)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 使用 .await? 但函数未返回 Result / 调用 .spawn() 但未导入 use tokio::spawn; (Session 134 trait 方法检测)\n\n",
+  );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -898,6 +910,94 @@ mod tests {
         assert!(
             prompt.contains("mpsc::Receiver"),
             "系统 prompt 应包含 mpsc::Receiver 导入约束 (Session 132)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s133_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("sqlx"),
+            "系统 prompt 应包含 sqlx 导入约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains("axum_extra"),
+            "系统 prompt 应包含 axum_extra 导入约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains("lettre"),
+            "系统 prompt 应包含 lettre 导入约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains("config"),
+            "系统 prompt 应包含 config 导入约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains("TypedHeader"),
+            "系统 prompt 应包含 TypedHeader 导入约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains("query!"),
+            "系统 prompt 应包含 query! 宏导入约束 (Session 133)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s133_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".try_read()"),
+            "系统 prompt 应包含 .try_read() trait 方法检测约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains(".try_write()"),
+            "系统 prompt 应包含 .try_write() trait 方法检测约束 (Session 133)"
+        );
+        assert!(
+            prompt.contains(".try_send()"),
+            "系统 prompt 应包含 .try_send() trait 方法检测约束 (Session 133)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s134_new_crate_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("hyper"),
+            "系统 prompt 应包含 hyper 导入约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains("tower"),
+            "系统 prompt 应包含 tower 导入约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains("tonic"),
+            "系统 prompt 应包含 tonic 导入约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains("proc_macro2"),
+            "系统 prompt 应包含 proc_macro2 导入约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains("syn"),
+            "系统 prompt 应包含 syn 导入约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains("quote"),
+            "系统 prompt 应包含 quote 导入约束 (Session 134)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s134_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".await?"),
+            "系统 prompt 应包含 .await? trait 方法检测约束 (Session 134)"
+        );
+        assert!(
+            prompt.contains(".spawn()"),
+            "系统 prompt 应包含 .spawn() trait 方法检测约束 (Session 134)"
         );
     }
 }
