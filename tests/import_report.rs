@@ -1749,3 +1749,146 @@ fn test_import_report_json_markdown_consistency_s147() {
         );
     }
 }
+
+// ===== Session 148: num_cpus/walkdir/tempfile/indicatif JSON 报告 =====
+
+#[test]
+fn test_import_report_json_s148_walkdir() {
+    let code = "fn foo() -> WalkDir { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("WalkDir"), "JSON 应包含 WalkDir: {}", json);
+    assert!(
+        json.contains("walkdir"),
+        "JSON 应包含 walkdir 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_json_s148_tempfile() {
+    let code = "fn foo() -> TempDir { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("TempDir"), "JSON 应包含 TempDir: {}", json);
+    assert!(
+        json.contains("tempfile"),
+        "JSON 应包含 tempfile 模块: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_s148_indicatif() {
+    let code = "fn foo() -> ProgressBar { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("ProgressBar"),
+        "Markdown 应包含 ProgressBar: {}",
+        md
+    );
+    assert!(
+        md.contains("indicatif"),
+        "Markdown 应包含 indicatif 模块: {}",
+        md
+    );
+}
+
+// ===== Session 148: ensure_external_imports 验证 =====
+
+#[test]
+fn test_import_report_ensure_s148_walkdir() {
+    let code = "fn foo() -> WalkDir { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s148_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.module_path == "walkdir")
+        .collect();
+    assert!(
+        s148_issues.is_empty(),
+        "ensure_external_imports 后不应有 walkdir 导入问题: {:?}",
+        s148_issues
+    );
+}
+
+// ===== Session 148: .iter_mut()/.split()/.lines() trait 方法报告 =====
+
+#[test]
+fn test_import_report_s148_iterator_methods() {
+    let code = "fn foo(s: &str) { s.split(','); s.lines(); s.chars(); s.bytes(); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (split/lines/chars/bytes): {}",
+        json
+    );
+    assert!(
+        json.contains("std::iter"),
+        "JSON 应包含 std::iter 模块: {}",
+        json
+    );
+}
+
+// ===== Session 148: 多类型混合报告 (S147 + S148) =====
+
+#[test]
+fn test_import_report_mixed_s147_s148_types() {
+    let code = "fn foo(a: &mut App) { unimplemented!() }\nfn bar() -> WalkDir { unimplemented!() }\nfn baz() -> ProgressBar { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "App",
+        "WalkDir",
+        "ProgressBar",
+        "eframe",
+        "walkdir",
+        "indicatif",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
+
+// ===== Session 148: JSON / Markdown 双格式一致性 =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s148() {
+    let code = "fn foo() -> (WalkDir, TempDir, ProgressBar) { unimplemented!() }\nfn bar() -> Lazy<i32> { unimplemented!() }\nfn baz(s: &str) { s.split(','); s.lines(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "WalkDir",
+        "TempDir",
+        "ProgressBar",
+        "Lazy",
+        "Iterator",
+        "walkdir",
+        "tempfile",
+        "indicatif",
+        "once_cell",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

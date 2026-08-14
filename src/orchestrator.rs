@@ -233,6 +233,19 @@ impl ContextBuilder {
     }
 }
 
+/// 块定义签名 (Session 148)
+///
+/// 表示 Rust 代码中的一个块定义起始行 (fn/struct/enum/impl/trait)。
+/// 用于 recover_from_truncation 中的函数签名级别匹配。
+#[derive(Debug, Clone)]
+struct BlockSignature {
+    /// 签名行内容 (原始行)
+    line: String,
+    /// 行号 (0-based, 供未来扩展使用)
+    #[allow(dead_code)]
+    line_idx: usize,
+}
+
 /// 版本管理器 (SRP: 从 Orchestrator 拆出)
 ///
 /// 封装 Workspace 的快照保存/回滚操作。
@@ -309,13 +322,17 @@ impl VersionManager {
         None
     }
 
-    /// 合并截断的有效前缀与 known_good 后缀 (Session 147)
+    /// 合并截断的有效前缀与 known_good 后缀 (Session 147 + 148)
     ///
     /// 尝试找到一个合理的合并点:
-    /// 1. 在截断前缀中找到最后一个非空非注释行
-    /// 2. 在 known_good 中搜索该行作为合并锚点
-    /// 3. 如果找到匹配, 截取 known_good 从该行之后的内容作为后缀
-    /// 4. 如果找不到合适边界, 回退到全量 known_good 替换
+    /// 1. **Session 148 增强**: 首先尝试函数签名级别匹配
+    ///    - 提取截断前缀中的所有块定义签名 (fn/struct/enum/impl/trait)
+    ///    - 在 known_good 中查找最后一个匹配的块定义签名
+    ///    - 从 known_good 中该块定义之后的位置截取后缀
+    /// 2. **Session 147 原有逻辑**: 如果函数签名匹配失败, 使用行级匹配
+    ///    - 在截断前缀中找到最后一个完整语句行作为合并锚点
+    ///    - 在 known_good 中搜索该行
+    /// 3. 如果都找不到合适边界, 回退到全量 known_good 替换
     fn merge_partial_content(truncated_prefix: &str, kg_content: &str) -> String {
         let prefix_lines: Vec<&str> = truncated_prefix.lines().collect();
         let kg_lines: Vec<&str> = kg_content.lines().collect();
@@ -324,6 +341,34 @@ impl VersionManager {
             return kg_content.to_string();
         }
 
+        // === Session 148: 函数签名级别匹配 ===
+        // 提取截断前缀中的所有块定义签名
+        let prefix_signatures = Self::find_block_signatures(truncated_prefix);
+
+        if !prefix_signatures.is_empty() {
+            // 从最后一个签名开始向前尝试匹配
+            for sig in prefix_signatures.iter().rev() {
+                // 在 known_good 中搜索该签名
+                for (kg_idx, kg_line) in kg_lines.iter().enumerate() {
+                    if kg_line.trim() == sig.line.trim() {
+                        // 找到匹配的块定义签名
+                        // 从 known_good 中该签名所在块的下一行开始截取
+                        // 即从签名行之后开始 (签名行本身在截断前缀中已有)
+                        if kg_idx + 1 < kg_lines.len() {
+                            let kg_suffix: Vec<&str> = kg_lines[(kg_idx + 1)..].to_vec();
+                            let merged = format!(
+                                "{}\n{}",
+                                truncated_prefix.trim_end(),
+                                kg_suffix.join("\n")
+                            );
+                            return merged;
+                        }
+                    }
+                }
+            }
+        }
+
+        // === Session 147 原有逻辑: 行级匹配 ===
         // 找到截断前缀最后一个有意义的代码行作为合并锚点
         // 只使用看起来像完整语句的行 (以 ; } 或 { 结尾) 或函数签名行
         let mut last_anchor_line_idx = None;
@@ -368,6 +413,63 @@ impl VersionManager {
 
         // 回退: 全量 known_good 替换
         kg_content.to_string()
+    }
+
+    /// 从代码中提取块定义签名 (Session 148)
+    ///
+    /// 识别 Rust 代码中的块定义起始行:
+    /// - `fn` / `pub fn` — 函数定义
+    /// - `struct` / `pub struct` — 结构体定义
+    /// - `enum` / `pub enum` — 枚举定义
+    /// - `impl` — impl 块
+    /// - `trait` / `pub trait` — trait 定义
+    ///
+    /// 只提取完整的签名行 (以 `{` 结尾或签名本身所在行),
+    /// 不提取多行签名的中间部分。
+    ///
+    /// # 参数
+    /// - `content`: 代码内容
+    ///
+    /// # 返回
+    /// 返回签名行列表 (行号, 行内容)
+    fn find_block_signatures(content: &str) -> Vec<BlockSignature> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut signatures = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            // 跳过注释行
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+
+            // 检测块定义签名
+            let is_block_sig = trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("pub(crate) fn ")
+                || trimmed.starts_with("async fn ")
+                || trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("pub struct ")
+                || trimmed.starts_with("pub(crate) struct ")
+                || trimmed.starts_with("enum ")
+                || trimmed.starts_with("pub enum ")
+                || trimmed.starts_with("pub(crate) enum ")
+                || trimmed.starts_with("impl ")
+                || trimmed.starts_with("trait ")
+                || trimmed.starts_with("pub trait ")
+                || trimmed.starts_with("pub(crate) trait ");
+
+            if is_block_sig {
+                signatures.push(BlockSignature {
+                    line: line.to_string(),
+                    line_idx: i,
+                });
+            }
+        }
+
+        signatures
     }
 
     /// 从截断文件中恢复 — 部分恢复或全量恢复 (Session 146 + 147)
@@ -6210,6 +6312,167 @@ mod tests {
         let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
         assert_eq!(count, 0, "非 .rs 文件不应恢复");
         assert_eq!(recovered[0].content, "[package]\nname = \"test\"");
+    }
+
+    // ===== Session 148: find_block_signatures 测试 =====
+
+    #[test]
+    fn test_find_block_signatures_fn() {
+        let code = "fn foo() {}\nfn bar() -> i32 { 42 }";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 2, "应检测到 2 个 fn 签名");
+        assert!(sigs[0].line.contains("fn foo()"));
+        assert!(sigs[1].line.contains("fn bar()"));
+    }
+
+    #[test]
+    fn test_find_block_signatures_pub_fn() {
+        let code = "pub fn foo() {}\npub(crate) fn bar() {}";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 2, "应检测到 2 个 pub fn 签名");
+        assert!(sigs[0].line.contains("pub fn foo()"));
+        assert!(sigs[1].line.contains("pub(crate) fn bar()"));
+    }
+
+    #[test]
+    fn test_find_block_signatures_struct_enum_impl() {
+        let code = "pub struct Foo { x: i32 }\nenum Bar { A, B }\nimpl Foo { fn new() -> Self { Self { x: 0 } } }";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 3, "应检测到 struct/enum/impl 签名");
+        assert!(sigs.iter().any(|s| s.line.contains("struct")));
+        assert!(sigs.iter().any(|s| s.line.contains("enum")));
+        assert!(sigs.iter().any(|s| s.line.contains("impl")));
+    }
+
+    #[test]
+    fn test_find_block_signatures_trait() {
+        let code = "pub trait MyTrait { fn foo(&self); }";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 1, "应检测到 1 个 trait 签名");
+        assert!(sigs[0].line.contains("trait"));
+    }
+
+    #[test]
+    fn test_find_block_signatures_async_fn() {
+        let code = "async fn foo() {}\npub async fn bar() {}";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 2, "应检测到 2 个 async fn 签名");
+        assert!(sigs[0].line.contains("async fn foo"));
+        assert!(sigs[1].line.contains("pub async fn bar"));
+    }
+
+    #[test]
+    fn test_find_block_signatures_skips_comments() {
+        let code = "// fn commented_out() {}\n/// fn doc_comment() {}\nfn real_fn() {}";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert_eq!(sigs.len(), 1, "应只检测到 1 个真实 fn (跳过注释)");
+        assert!(sigs[0].line.contains("fn real_fn"));
+    }
+
+    #[test]
+    fn test_find_block_signatures_empty() {
+        let sigs = VersionManager::find_block_signatures("");
+        assert!(sigs.is_empty(), "空代码不应有签名");
+    }
+
+    #[test]
+    fn test_find_block_signatures_no_blocks() {
+        let code = "let x = 42;\nprintln!(\"hello\");";
+        let sigs = VersionManager::find_block_signatures(code);
+        assert!(sigs.is_empty(), "无块定义的代码不应有签名");
+    }
+
+    // ===== Session 148: merge_partial_content 函数签名级别匹配测试 =====
+
+    #[test]
+    fn test_merge_partial_content_block_signature_match() {
+        // 截断前缀包含 2 个完整函数 + 1 个截断函数签名
+        let prefix = "fn first() -> i32 { 42 }\n\nfn second() -> i32 {\n    let x = 42;\n";
+        let kg = "fn first() -> i32 { 42 }\n\nfn second() -> i32 {\n    let x = 42;\n    x + 1\n}\n\nfn third() -> i32 { 100 }\n";
+
+        let merged = VersionManager::merge_partial_content(prefix, kg);
+
+        // 合并应保留截断前缀的 first + second 函数
+        assert!(merged.contains("fn first()"), "合并结果应包含 first()");
+        assert!(merged.contains("fn second()"), "合并结果应包含 second()");
+
+        // 合并应包含 known_good 中 second 之后的代码
+        assert!(
+            merged.contains("fn third()"),
+            "合并结果应包含 third() (从 known_good)"
+        );
+        assert!(
+            merged.contains("x + 1"),
+            "合并结果应包含 known_good 中 second 的函数体"
+        );
+    }
+
+    #[test]
+    fn test_merge_partial_content_block_signature_struct() {
+        // 截断前缀包含完整 struct + 截断 impl
+        let prefix =
+            "pub struct Foo { x: i32 }\n\nimpl Foo {\n    fn new() -> Self { Self { x: 0 } }\n";
+        let kg = "pub struct Foo { x: i32 }\n\nimpl Foo {\n    fn new() -> Self { Self { x: 0 } }\n    fn get(&self) -> i32 { self.x }\n}\n";
+
+        let merged = VersionManager::merge_partial_content(prefix, kg);
+
+        assert!(
+            merged.contains("pub struct Foo"),
+            "合并结果应包含 struct Foo"
+        );
+        assert!(merged.contains("impl Foo"), "合并结果应包含 impl Foo");
+        assert!(
+            merged.contains("fn get"),
+            "合并结果应包含 known_good 中的 fn get"
+        );
+    }
+
+    #[test]
+    fn test_merge_partial_content_block_signature_modified_prefix() {
+        // AI 修改了函数体, 但输出被截断
+        let prefix = "fn foo() -> i32 {\n    let modified = true;\n    42\n";
+        let kg =
+            "fn foo() -> i32 {\n    let original = false;\n    99\n}\n\nfn bar() -> i32 { 0 }\n";
+
+        let merged = VersionManager::merge_partial_content(prefix, kg);
+
+        // 合并应保留截断前缀的修改
+        assert!(merged.contains("fn foo()"), "合并结果应包含 fn foo()");
+        assert!(merged.contains("modified"), "合并结果应保留 AI 修改的代码");
+        // 合并应包含 known_good 中 foo 之后的代码
+        assert!(
+            merged.contains("fn bar()"),
+            "合并结果应包含 known_good 中的 fn bar()"
+        );
+    }
+
+    #[test]
+    fn test_merge_partial_content_block_signature_multiple_functions() {
+        // 多个函数, 最后一个截断
+        let prefix = "fn a() {}\nfn b() {}\nfn c() -> i32 {\n    let x = 1;\n";
+        let kg = "fn a() {}\nfn b() {}\nfn c() -> i32 {\n    let x = 1;\n    x + 1\n}\nfn d() {}\n";
+
+        let merged = VersionManager::merge_partial_content(prefix, kg);
+
+        assert!(merged.contains("fn a()"), "合并结果应包含 fn a()");
+        assert!(merged.contains("fn b()"), "合并结果应包含 fn b()");
+        assert!(merged.contains("fn c()"), "合并结果应包含 fn c()");
+        assert!(
+            merged.contains("fn d()"),
+            "合并结果应包含 known_good 中的 fn d()"
+        );
+    }
+
+    #[test]
+    fn test_merge_partial_content_block_no_match_falls_back_to_line() {
+        // 截断前缀的函数在 known_good 中不存在 (AI 新增了函数)
+        let prefix = "fn new_function() -> i32 { 42 }\n\nlet x = 99;\n";
+        let kg = "fn old_function() -> i32 { 0 }\n";
+
+        // 块签名匹配失败, 行级匹配也应该失败, 回退到全量 known_good
+        let merged = VersionManager::merge_partial_content(prefix, kg);
+        // 全量 known_good 替换
+        assert_eq!(merged, kg, "无匹配时应回退到全量 known_good");
     }
 
     // ===== 截断 JSON 恢复测试 =====

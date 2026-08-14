@@ -234,7 +234,13 @@ impl SystemPrompt {
 "❌ 禁止: 使用 App/Frame (eframe) / Context/Ui (egui) / Application/Command (iced) / AppDelegate/Widget (druid) / ComponentHandle/Model (slint) 等外部 crate 类型但未导入 use eframe::... / use egui::... / use iced::... / use druid::... / use slint::... (Session 147)\n",
         );
         prompt.push_str(
-"❌ 禁止: 调用 .first()/.last()/.nth()/.next_back()/.rposition()/.rfold()/.rfind() 但未导入 use std::iter::Iterator; (Session 147 trait 方法检测)\n",
+  "❌ 禁止: 调用 .first()/.last()/.nth()/.next_back()/.rposition()/.rfold()/.rfind() 但未导入 use std::iter::Iterator; (Session 147 trait 方法检测)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 num_cpus (num_cpus) / Lazy (once_cell) / GzEncoder/GzDecoder (flate2) / Archive/Entry (tar) / WalkDir (walkdir) / TempDir/NamedTempFile (tempfile) / ProgressBar/MultiProgress (indicatif) / Input/Select (dialoguer) / Term/Style (console) 等外部 crate 类型但未导入 use num_cpus::... / use once_cell::... / use flate2::... / use tar::... / use walkdir::... / use tempfile::... / use indicatif::... / use dialoguer::... / use console::... (Session 148)\n",
+        );
+        prompt.push_str(
+  "❌ 禁止: 调用 .iter_mut()/.split()/.splitn()/.rsplit()/.rsplitn()/.lines()/.chars()/.bytes() 但未导入 use std::iter::Iterator; (Session 148 trait 方法检测)\n",
         );
         prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
@@ -1619,6 +1625,54 @@ mod tests {
         assert!(
             prompt.contains(".rfind()"),
             "系统 prompt 应包含 .rfind() trait 方法检测约束 (Session 147)"
+        );
+    }
+
+    // ===== Session 148: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s148_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("num_cpus"),
+            "系统 prompt 应包含 num_cpus 导入约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains("once_cell"),
+            "系统 prompt 应包含 once_cell 导入约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains("flate2"),
+            "系统 prompt 应包含 flate2 导入约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains("walkdir"),
+            "系统 prompt 应包含 walkdir 导入约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains("tempfile"),
+            "系统 prompt 应包含 tempfile 导入约束 (Session 148)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s148_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".iter_mut()"),
+            "系统 prompt 应包含 .iter_mut() trait 方法检测约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains(".split()"),
+            "系统 prompt 应包含 .split() trait 方法检测约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains(".lines()"),
+            "系统 prompt 应包含 .lines() trait 方法检测约束 (Session 148)"
+        );
+        assert!(
+            prompt.contains(".chars()"),
+            "系统 prompt 应包含 .chars() trait 方法检测约束 (Session 148)"
         );
     }
 

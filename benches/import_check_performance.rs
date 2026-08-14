@@ -678,6 +678,27 @@ fn edge_cases(c: &mut Criterion) {
         });
     });
 
+    // Session 148: num_cpus/once_cell/flate2/walkdir/tempfile/indicatif 类型检测
+    group.bench_function("s148_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> (WalkDir, TempDir, ProgressBar) { unimplemented!() }\n\
+                 fn bar() -> Lazy<i32> { unimplemented!() }\n\
+                 fn baz() -> usize { num_cpus() }\n\
+                 fn qux() -> GzEncoder { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 148: .iter_mut()/.split()/.lines()/.chars()/.bytes() trait 方法检测
+    group.bench_function("s148_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(s: &str) { s.split(','); s.lines(); s.chars(); s.bytes(); }\nfn bar(v: &mut Vec<i32>) { v.iter_mut(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
     // 嵌套 glob 导入
     group.bench_function("nested_glob", |b| {
         b.iter(|| {

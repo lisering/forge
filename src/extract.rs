@@ -5963,6 +5963,30 @@ pub fn ensure_external_imports(content: &str) -> String {
         // slint (Session 147)
         ("ComponentHandle", "slint"),
         ("Model", "slint"),
+        // num_cpus (Session 148) — num_cpus::num_cpus() function
+        ("num_cpus", "num_cpus"),
+        // once_cell (Session 148) — once_cell::sync::Lazy
+        ("Lazy", "once_cell::sync"),
+        // flate2 (Session 148) — flate2::write::GzEncoder / flate2::read::GzDecoder
+        ("GzEncoder", "flate2::write"),
+        ("GzDecoder", "flate2::read"),
+        // tar (Session 148) — tar::Archive / tar::Entry
+        ("Archive", "tar"),
+        ("Entry", "tar"),
+        // walkdir (Session 148) — walkdir::WalkDir
+        ("WalkDir", "walkdir"),
+        // tempfile (Session 148) — tempfile::TempDir / tempfile::NamedTempFile
+        ("TempDir", "tempfile"),
+        ("NamedTempFile", "tempfile"),
+        // indicatif (Session 148) — indicatif::ProgressBar / indicatif::MultiProgress
+        ("ProgressBar", "indicatif"),
+        ("MultiProgress", "indicatif"),
+        // dialoguer (Session 148) — dialoguer::Input / dialoguer::Select
+        ("Input", "dialoguer"),
+        ("Select", "dialoguer"),
+        // console (Session 148) — console::Term / console::Style
+        ("Term", "console"),
+        ("Style", "console"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6469,6 +6493,18 @@ pub fn ensure_external_imports(content: &str) -> String {
         "rposition",
         "rfold",
         "rfind",
+        // Session 148: .iter_mut() / .into_iter() / .rev() (already above) / .step_by() (already above)
+        // .iter_mut() → Iterator (mutable iteration)
+        "iter_mut",
+        // .split() / .splitn() / .rsplit() / .rsplitn() → Iterator (str/slice methods)
+        "split",
+        "splitn",
+        "rsplit",
+        "rsplitn",
+        // .lines() / .chars() / .bytes() / .enumerate() (already above) → Iterator
+        "lines",
+        "chars",
+        "bytes",
     ];
     let mut s142_iterator_method_found = false;
     for &method_name in s142_iterator_methods {
@@ -7069,6 +7105,30 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         // slint (Session 147)
         ("ComponentHandle", "slint"),
         ("Model", "slint"),
+        // num_cpus (Session 148)
+        ("num_cpus", "num_cpus"),
+        // once_cell (Session 148)
+        ("Lazy", "once_cell::sync"),
+        // flate2 (Session 148)
+        ("GzEncoder", "flate2::write"),
+        ("GzDecoder", "flate2::read"),
+        // tar (Session 148)
+        ("Archive", "tar"),
+        ("Entry", "tar"),
+        // walkdir (Session 148)
+        ("WalkDir", "walkdir"),
+        // tempfile (Session 148)
+        ("TempDir", "tempfile"),
+        ("NamedTempFile", "tempfile"),
+        // indicatif (Session 148)
+        ("ProgressBar", "indicatif"),
+        ("MultiProgress", "indicatif"),
+        // dialoguer (Session 148)
+        ("Input", "dialoguer"),
+        ("Select", "dialoguer"),
+        // console (Session 148)
+        ("Term", "console"),
+        ("Style", "console"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7646,6 +7706,15 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "rposition",
         "rfold",
         "rfind",
+        // Session 148: .iter_mut() / .split() / .splitn() / .rsplit() / .rsplitn() / .lines() / .chars() / .bytes()
+        "iter_mut",
+        "split",
+        "splitn",
+        "rsplit",
+        "rsplitn",
+        "lines",
+        "chars",
+        "bytes",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -23001,6 +23070,246 @@ fn main() {
         assert!(
             result.contains("use slint::ComponentHandle;"),
             "应包含 slint::ComponentHandle: {}",
+            result
+        );
+    }
+
+    // ===== Session 148: ensure_external_imports 新 crate 类型测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_num_cpus() {
+        let code = "fn foo() -> usize { num_cpus() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use num_cpus::num_cpus;"),
+            "应添加 num_cpus::num_cpus 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_once_cell_lazy() {
+        let code = "fn foo() -> Lazy<i32> { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use once_cell::sync::Lazy;"),
+            "应添加 once_cell::sync::Lazy 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_flate2_gz_encoder() {
+        let code = "fn foo() -> GzEncoder { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use flate2::write::GzEncoder;"),
+            "应添加 flate2::write::GzEncoder 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_walkdir() {
+        let code = "fn foo() -> WalkDir { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use walkdir::WalkDir;"),
+            "应添加 walkdir::WalkDir 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tempfile() {
+        let code = "fn foo() -> TempDir { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tempfile::TempDir;"),
+            "应添加 tempfile::TempDir 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_indicatif() {
+        let code = "fn foo() -> ProgressBar { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use indicatif::ProgressBar;"),
+            "应添加 indicatif::ProgressBar 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s148_full_path_no_import() {
+        let code = "fn foo() -> walkdir::WalkDir { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use walkdir::WalkDir;"),
+            "全限定 walkdir:: 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s148_idempotent() {
+        let code = "fn foo() -> (WalkDir, TempDir, ProgressBar) { unimplemented!() }\nfn bar() -> Lazy<i32> { unimplemented!() }\nfn baz() -> usize { num_cpus() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 148 新增外部 crate 检测应幂等");
+    }
+
+    // ===== Session 148: ensure_external_imports 新 trait 方法测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_iter_mut_method() {
+        let code = "fn foo(v: &mut Vec<i32>) { v.iter_mut(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .iter_mut() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_split_method() {
+        let code = "fn foo(s: &str) { s.split(','); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .split() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_lines_chars_bytes_methods() {
+        let code = "fn foo(s: &str) { s.lines(); s.chars(); s.bytes(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .lines()/.chars()/.bytes() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 148: verify_imports 新 crate 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_num_cpus_missing() {
+        let issues = verify_imports("fn foo() -> usize { num_cpus() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "num_cpus" && i.module_path == "num_cpus"),
+            "应检测到 num_cpus 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_once_cell_lazy_missing() {
+        let issues = verify_imports("fn foo() -> Lazy<i32> { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Lazy" && i.module_path == "once_cell::sync"),
+            "应检测到 Lazy 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_walkdir_missing() {
+        let issues = verify_imports("fn foo() -> WalkDir { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "WalkDir" && i.module_path == "walkdir"),
+            "应检测到 WalkDir 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tempdir_missing() {
+        let issues = verify_imports("fn foo() -> TempDir { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "TempDir" && i.module_path == "tempfile"),
+            "应检测到 TempDir 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s148_iterator_methods_combined() {
+        let code = "fn foo(s: &str) { s.split(','); s.lines(); s.chars(); s.bytes(); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 148 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 148: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s148_issues() {
+        let code = "fn foo() -> (WalkDir, TempDir, ProgressBar) { unimplemented!() }\nfn bar() -> Lazy<i32> { unimplemented!() }\nfn baz() -> usize { num_cpus() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s148_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "num_cpus"
+                    || i.module_path == "once_cell::sync"
+                    || i.module_path == "flate2::write"
+                    || i.module_path == "flate2::read"
+                    || i.module_path == "tar"
+                    || i.module_path == "walkdir"
+                    || i.module_path == "tempfile"
+                    || i.module_path == "indicatif"
+                    || i.module_path == "dialoguer"
+                    || i.module_path == "console"
+            })
+            .collect();
+        assert!(
+            s148_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 148 外部 crate 导入问题: {:?}",
+            s148_issues
+        );
+    }
+
+    // ===== Session 148: 混合 S147+S148 类型验证 =====
+
+    #[test]
+    fn test_mixed_s147_s148_types() {
+        let code = "fn foo(a: &mut App) { unimplemented!() }\nfn bar() -> WalkDir { unimplemented!() }\nfn baz() -> ProgressBar { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use eframe::App;"),
+            "应包含 eframe::App: {}",
+            result
+        );
+        assert!(
+            result.contains("use walkdir::WalkDir;"),
+            "应包含 walkdir::WalkDir: {}",
+            result
+        );
+        assert!(
+            result.contains("use indicatif::ProgressBar;"),
+            "应包含 indicatif::ProgressBar: {}",
             result
         );
     }
