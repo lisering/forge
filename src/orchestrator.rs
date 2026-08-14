@@ -255,6 +255,118 @@ impl VersionManager {
     pub fn rollback_to_known_good(workspace: &Workspace) -> Result<Option<u32>> {
         workspace.rollback_to_known_good()
     }
+
+    /// 从截断文件中恢复 — 尝试用 known_good 版本替换截断的 AI 输出 (Session 146)
+    ///
+    /// 当 `detect_truncated_files` 在最终轮次仍检测到截断文件时, 此方法:
+    /// 1. 获取 known_good 快照 ID
+    /// 2. 对每个截断文件, 尝试从 known_good 快照目录读取对应文件
+    /// 3. 如果 known_good 版本通过括号配对检查, 用 known_good 版本替换截断的 AI 输出
+    /// 4. 返回恢复后的文件列表和恢复的文件数
+    ///
+    /// 如果没有 known_good 快照, 或快照中不包含对应文件, 保持 AI 输出不变。
+    ///
+    /// # 参数
+    ///
+    /// - `workspace`: 工作区引用
+    /// - `files`: AI 提取的文件列表 (可能包含截断文件)
+    ///
+    /// # 返回
+    ///
+    /// 返回 `(恢复后的文件列表, 恢复的文件数)`
+    pub fn recover_from_truncation(
+        workspace: &Workspace,
+        files: Vec<crate::extract::ExtractedFile>,
+    ) -> Result<(Vec<crate::extract::ExtractedFile>, usize)> {
+        use crate::extract::validate_rust_braces;
+
+        let kg_id = match workspace.get_known_good_id() {
+            Some(id) => id,
+            None => {
+                debug!("    无 known_good 快照, 无法恢复截断文件");
+                return Ok((files, 0));
+            }
+        };
+
+        // 获取 known_good 快照目录
+        let snapshots = workspace.list_snapshots();
+        let snap = match snapshots.iter().find(|s| s.id == kg_id) {
+            Some(s) => s,
+            None => {
+                debug!("    known_good 快照 #{} 不存在, 无法恢复", kg_id);
+                return Ok((files, 0));
+            }
+        };
+
+        let snap_dir = &snap.path;
+        let mut recovered_count = 0usize;
+        let mut result_files = Vec::with_capacity(files.len());
+
+        for file in files {
+            // 只处理 .rs 文件
+            if !file.path.ends_with(".rs") {
+                result_files.push(file);
+                continue;
+            }
+
+            // 检查当前文件是否截断 (括号不配对)
+            // validate_rust_braces 返回 Some(issue) 表示有问题 (截断), None 表示正常
+            let is_truncated = validate_rust_braces(&file.content).is_some();
+            if !is_truncated {
+                result_files.push(file);
+                continue;
+            }
+
+            // 尝试从 known_good 快照中读取对应文件
+            let snap_file_path = snap_dir.join(&file.path);
+            if snap_file_path.exists() && snap_file_path.is_file() {
+                match std::fs::read_to_string(&snap_file_path) {
+                    Ok(kg_content) => {
+                        // 验证 known_good 版本的括号配对
+                        // validate_rust_braces 返回 None 表示格式正常
+                        if validate_rust_braces(&kg_content).is_none() {
+                            println!(
+                                "    🔄 文件 {} 从 known_good 快照 #{} 恢复 ({} 字符 → {} 字符)",
+                                file.path,
+                                kg_id,
+                                file.content.len(),
+                                kg_content.len()
+                            );
+                            result_files.push(crate::extract::ExtractedFile {
+                                path: file.path.clone(),
+                                content: kg_content,
+                                language: String::new(),
+                            });
+                            recovered_count += 1;
+                        } else {
+                            println!(
+                                "    ⚠ 文件 {} 的 known_good 版本也不完整, 保持 AI 输出",
+                                file.path
+                            );
+                            result_files.push(file);
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "    读取 known_good 文件 {} 失败: {}",
+                            snap_file_path.display(),
+                            e
+                        );
+                        result_files.push(file);
+                    }
+                }
+            } else {
+                // known_good 快照中没有此文件 (可能是新文件)
+                debug!(
+                    "    文件 {} 不在 known_good 快照中 (可能是新文件), 保持 AI 输出",
+                    file.path
+                );
+                result_files.push(file);
+            }
+        }
+
+        Ok((result_files, recovered_count))
+    }
 }
 
 // ============================================================================
@@ -1312,9 +1424,10 @@ where
         files: Vec<crate::extract::ExtractedFile>,
     ) -> Vec<crate::extract::ExtractedFile> {
         use crate::extract::{
-            apply_fixes_dry_run, apply_staged_fixes, apply_staged_fixes_preview,
+            apply_fixes_dry_run, apply_staged_fixes_preview, apply_staged_fixes_with_validation,
             compute_line_diff_unified, ensure_external_imports, format_diff_summary,
-            format_diff_unified_colored, format_diff_unified_with_options, verify_imports,
+            format_diff_unified_colored, format_diff_unified_with_options, validate_rust_braces,
+            verify_imports,
         };
 
         let mut fixed_files = Vec::with_capacity(files.len());
@@ -1351,9 +1464,19 @@ where
                     continue;
                 }
 
-                // Session 121: 分阶段修复时直接使用 apply_staged_fixes
+                // Session 121/145: 分阶段修复时使用带验证的 apply_staged_fixes_with_validation
+                // Session 145: 验证函数使用 validate_rust_braces (括号配对检查), 失败自动回滚
                 let mut fixed_content = if self.staged_fix_enabled {
-                    apply_staged_fixes(&file.content)
+                    let validation = apply_staged_fixes_with_validation(&file.content, |code| {
+                        validate_rust_braces(code).is_none()
+                    });
+                    if validation.any_rolled_back {
+                        println!(
+                            "    ⚠️  分阶段修复 {} 回滚阶段: {:?}",
+                            file.path, validation.rolled_back_stages
+                        );
+                    }
+                    validation.final_result
                 } else {
                     let preview = apply_fixes_dry_run(&file.content);
                     if preview.is_changed {
@@ -4827,11 +4950,11 @@ where
                 println!("      {} ({}字符)", f.path, f.content.len());
             }
 
-            // === Session 140: 写入前预验证 — 检查 Rust 文件括号配对 ===
+            // === Session 140/146: 写入前预验证 — 检查 Rust 文件括号配对 ===
             // 如果括号不配对, 说明文件可能被截断, 跳过写入直接进入修复轮
-            // 这比"写入后编译失败再修复"更高效, 节省 1 轮修复
+            // Session 146: 最终轮次时尝试从 known_good 恢复截断文件
             let truncated = crate::extract::detect_truncated_files(&files);
-            if !truncated.is_empty() {
+            let files = if !truncated.is_empty() {
                 let truncation_msg: Vec<String> = truncated
                     .iter()
                     .map(|(path, issue)| format!("  文件 {} 括号不配对: {}", path, issue))
@@ -4842,7 +4965,7 @@ where
                 }
 
                 if attempt < self.max_rounds_per_task {
-                    // 构建修复 prompt, 明确告知 AI 哪些文件被截断
+                    // 非最终轮次: 构建修复 prompt, 明确告知 AI 哪些文件被截断
                     let truncation_list = truncated
                         .iter()
                         .map(|(path, issue)| format!("  - {}: {}", path, issue))
@@ -4855,10 +4978,19 @@ where
                     attempt += 1;
                     continue;
                 } else {
-                    // 最终轮次, 仍然写入并尝试编译
-                    println!("    (最终轮次, 仍然写入并尝试编译)");
+                    // 最终轮次: 尝试从 known_good 恢复截断文件 (Session 146)
+                    let (recovered_files, recovered_count) =
+                        VersionManager::recover_from_truncation(&self.workspace, files)?;
+                    if recovered_count > 0 {
+                        println!("    🔄 从 known_good 恢复了 {} 个截断文件", recovered_count);
+                    } else {
+                        println!("    (最终轮次, 无可恢复文件, 仍然写入并尝试编译)");
+                    }
+                    recovered_files
                 }
-            }
+            } else {
+                files
+            };
 
             // === 自动修复: 对 Rust 文件应用 apply_fixes (Session 118) ===
             let files = if self.auto_fix_enabled {
@@ -5704,6 +5836,71 @@ mod tests {
         let (_dir, ws) = make_ws_with_files();
         let result = VersionManager::rollback_to_known_good(&ws).unwrap();
         assert_eq!(result, None);
+    }
+
+    // ===== Session 146: recover_from_truncation 测试 =====
+
+    #[test]
+    fn test_recover_from_truncation_no_known_good() {
+        let (_dir, ws) = make_ws_with_files();
+        // 没有 known_good 快照, 应返回原文件不变
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn main() {".to_string(), // 截断的代码 (缺少闭合 })
+            language: String::new(),
+        }];
+        let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
+        assert_eq!(count, 0, "无 known_good 时不应恢复");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].content, "fn main() {");
+    }
+
+    #[test]
+    fn test_recover_from_truncation_recovers_from_known_good() {
+        let (_dir, ws) = make_ws_with_files();
+        // 先保存 known_good (包含完整的 src/main.rs)
+        VersionManager::save_known_good(&ws).unwrap();
+
+        // 模拟 AI 输出了截断的 main.rs
+        let truncated_files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: "fn main() {".to_string(), // 截断: 缺少闭合 }
+            language: String::new(),
+        }];
+        let (recovered, count) =
+            VersionManager::recover_from_truncation(&ws, truncated_files).unwrap();
+        assert_eq!(count, 1, "应恢复 1 个文件");
+        assert_eq!(recovered.len(), 1);
+        // 恢复后的内容应该是 known_good 版本
+        assert_eq!(
+            recovered[0].content,
+            "fn main() {\n    println!(\"hello\");\n}"
+        );
+    }
+
+    #[test]
+    fn test_recover_from_truncation_keeps_non_truncated_files() {
+        let (_dir, ws) = make_ws_with_files();
+        VersionManager::save_known_good(&ws).unwrap();
+
+        // 一个完整文件 + 一个截断文件
+        let files = vec![
+            crate::extract::ExtractedFile {
+                path: "src/main.rs".to_string(),
+                content: "fn main() {".to_string(), // 截断
+                language: String::new(),
+            },
+            crate::extract::ExtractedFile {
+                path: "src/lib.rs".to_string(),
+                content: "pub fn foo() -> i32 { 42 }".to_string(), // 完整
+                language: String::new(),
+            },
+        ];
+        let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
+        assert_eq!(count, 1, "应只恢复 1 个截断文件");
+        assert_eq!(recovered.len(), 2);
+        // lib.rs 保持不变
+        assert_eq!(recovered[1].content, "pub fn foo() -> i32 { 42 }");
     }
 
     // ===== 截断 JSON 恢复测试 =====

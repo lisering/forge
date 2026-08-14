@@ -211,7 +211,25 @@ impl SystemPrompt {
         );
         prompt.push_str(
   "❌ 禁止: 调用 .flatten()/.max()/.min()/.sum()/.product() 但未导入 use std::iter::Iterator; (Session 142 trait 方法检测)\n",
-  );
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 Enigo (enigo) / Display (x11) / HMODULE (winapi) / CGContext (core-graphics) 等外部 crate 类型但未导入 use enigo::... / use x11::... / use winapi::... / use core_graphics::... (Session 144)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 调用 .any()/.all()/.find()/.position()/.count()/.fold()/.reduce()/.partition()/.for_each() 但未导入 use std::iter::Iterator; (Session 144 trait 方法检测)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 ImageBuffer/Rgba (image) / Drawing (imageproc) / Font/PositionedGlyph (rusttype) / ChartContext (plotters) 等外部 crate 类型但未导入 use image::... / use imageproc::... / use rusttype::... / use plotters::... (Session 145)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 调用 .scan()/.unzip()/.cycle() 但未导入 use std::iter::Iterator; (Session 145 trait 方法检测)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 使用 Line/Layout/Block/Widget (ratatui) / execute/queue/terminal (crossterm) / Frame/Terminal (tui) / Display/Surface (glium) / VkHandle/VulkanObject (vulkano) / open_npz/save_npz (ndarray-npy) 等外部 crate 类型但未导入 use ratatui::... / use crossterm::... / use tui::... / use glium::... / use vulkano::... / use ndarray_npy::... (Session 146)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 调用 .chunks()/.windows()/.rchunks()/.as_chunks()/.array_chunks() 但未导入 use std::iter::Iterator; (Session 146 trait 方法检测)\n",
+        );
         prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
@@ -1439,6 +1457,142 @@ mod tests {
         assert!(
             prompt.contains("不要省略任何中间代码"),
             "系统 prompt 应包含不省略中间代码约束 (Session 140)"
+        );
+    }
+
+    // ===== Session 144: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s144_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("enigo"),
+            "系统 prompt 应包含 enigo 导入约束 (Session 144)"
+        );
+        assert!(
+            prompt.contains("x11"),
+            "系统 prompt 应包含 x11 导入约束 (Session 144)"
+        );
+        assert!(
+            prompt.contains("winapi"),
+            "系统 prompt 应包含 winapi 导入约束 (Session 144)"
+        );
+        assert!(
+            prompt.contains("core_graphics"),
+            "系统 prompt 应包含 core_graphics 导入约束 (Session 144)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s144_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".any()"),
+            "系统 prompt 应包含 .any() trait 方法检测约束 (Session 144)"
+        );
+        assert!(
+            prompt.contains(".fold()"),
+            "系统 prompt 应包含 .fold() trait 方法检测约束 (Session 144)"
+        );
+        assert!(
+            prompt.contains(".for_each()"),
+            "系统 prompt 应包含 .for_each() trait 方法检测约束 (Session 144)"
+        );
+    }
+
+    // ===== Session 146: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s146_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("ratatui"),
+            "系统 prompt 应包含 ratatui 导入约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains("crossterm"),
+            "系统 prompt 应包含 crossterm 导入约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains("tui"),
+            "系统 prompt 应包含 tui 导入约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains("glium"),
+            "系统 prompt 应包含 glium 导入约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains("vulkano"),
+            "系统 prompt 应包含 vulkano 导入约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains("ndarray_npy"),
+            "系统 prompt 应包含 ndarray_npy 导入约束 (Session 146)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s146_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".chunks()"),
+            "系统 prompt 应包含 .chunks() trait 方法检测约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains(".windows()"),
+            "系统 prompt 应包含 .windows() trait 方法检测约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains(".rchunks()"),
+            "系统 prompt 应包含 .rchunks() trait 方法检测约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains(".as_chunks()"),
+            "系统 prompt 应包含 .as_chunks() trait 方法检测约束 (Session 146)"
+        );
+        assert!(
+            prompt.contains(".array_chunks()"),
+            "系统 prompt 应包含 .array_chunks() trait 方法检测约束 (Session 146)"
+        );
+    }
+
+    // ===== Session 145: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s145_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("image"),
+            "系统 prompt 应包含 image 导入约束 (Session 145)"
+        );
+        assert!(
+            prompt.contains("imageproc"),
+            "系统 prompt 应包含 imageproc 导入约束 (Session 145)"
+        );
+        assert!(
+            prompt.contains("rusttype"),
+            "系统 prompt 应包含 rusttype 导入约束 (Session 145)"
+        );
+        assert!(
+            prompt.contains("plotters"),
+            "系统 prompt 应包含 plotters 导入约束 (Session 145)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s145_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".scan()"),
+            "系统 prompt 应包含 .scan() trait 方法检测约束 (Session 145)"
+        );
+        assert!(
+            prompt.contains(".unzip()"),
+            "系统 prompt 应包含 .unzip() trait 方法检测约束 (Session 145)"
+        );
+        assert!(
+            prompt.contains(".cycle()"),
+            "系统 prompt 应包含 .cycle() trait 方法检测约束 (Session 145)"
         );
     }
 }

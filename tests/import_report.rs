@@ -1221,3 +1221,344 @@ fn test_import_report_json_markdown_consistency_s142() {
         );
     }
 }
+
+// ===== Session 145: JSON 报告 — image/imageproc/rusttype/plotters 测试 =====
+
+#[test]
+fn test_import_report_json_image_types() {
+    let code = "fn foo() -> (ImageBuffer, Rgba<u8>, Drawing) { unimplemented!() }\nfn bar() -> (Font, PositionedGlyph, ChartContext) { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("ImageBuffer"),
+        "JSON 应包含 ImageBuffer: {}",
+        json
+    );
+    assert!(json.contains("image"), "JSON 应包含 image: {}", json);
+    assert!(json.contains("Rgba"), "JSON 应包含 Rgba: {}", json);
+    assert!(json.contains("Drawing"), "JSON 应包含 Drawing: {}", json);
+    assert!(
+        json.contains("imageproc"),
+        "JSON 应包含 imageproc: {}",
+        json
+    );
+    assert!(json.contains("Font"), "JSON 应包含 Font: {}", json);
+    assert!(json.contains("rusttype"), "JSON 应包含 rusttype: {}", json);
+    assert!(
+        json.contains("ChartContext"),
+        "JSON 应包含 ChartContext: {}",
+        json
+    );
+    assert!(json.contains("plotters"), "JSON 应包含 plotters: {}", json);
+}
+
+// ===== Session 145: Markdown 报告 — image/imageproc/rusttype/plotters 测试 =====
+
+#[test]
+fn test_import_report_markdown_image_types() {
+    let code = "fn foo() -> (ImageBuffer, Rgba<u8>, Drawing) { unimplemented!() }\nfn bar() -> (Font, PositionedGlyph, ChartContext) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("ImageBuffer"),
+        "Markdown 应包含 ImageBuffer: {}",
+        md
+    );
+    assert!(md.contains("image"), "Markdown 应包含 image: {}", md);
+    assert!(md.contains("Rgba"), "Markdown 应包含 Rgba: {}", md);
+    assert!(md.contains("Font"), "Markdown 应包含 Font: {}", md);
+    assert!(md.contains("rusttype"), "Markdown 应包含 rusttype: {}", md);
+    assert!(
+        md.contains("ChartContext"),
+        "Markdown 应包含 ChartContext: {}",
+        md
+    );
+    assert!(md.contains("plotters"), "Markdown 应包含 plotters: {}", md);
+}
+
+// ===== Session 145: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s145_issues() {
+    let code = "fn foo() -> (ImageBuffer, Font, ChartContext) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s145_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "image"
+                || i.module_path == "imageproc::drawing"
+                || i.module_path == "rusttype"
+                || i.module_path == "plotters::chart"
+        })
+        .collect();
+    assert!(
+        s145_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 145 外部 crate 导入问题: {:?}",
+        s145_issues
+    );
+}
+
+// ===== Session 145: .scan()/.unzip()/.cycle() trait 方法报告 =====
+
+#[test]
+fn test_import_report_scan_unzip_cycle_methods() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| Some(x)).unzip().cycle(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应通过 .scan()/.unzip()/.cycle() 检测到 Iterator: {}",
+        json
+    );
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应通过 .scan()/.unzip()/.cycle() 检测到 Iterator: {}",
+        md
+    );
+}
+
+// ===== Session 145: 多类型混合报告 (S144 + S145) =====
+
+#[test]
+fn test_import_report_mixed_s144_s145_types() {
+    let code = "fn foo() -> (Enigo, ImageBuffer, HMODULE, Font, CGContext, ChartContext) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.iter().scan(0, |a, &x| Some(x)).cycle(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    // Session 144 types
+    for type_name in &["Enigo", "HMODULE", "CGContext"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 S144 类型 {}: {}",
+            type_name,
+            json
+        );
+    }
+    // Session 145 types
+    for type_name in &["ImageBuffer", "Font", "ChartContext", "Iterator"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 S145 类型 {}: {}",
+            type_name,
+            json
+        );
+    }
+    // Markdown 也应包含
+    for type_name in &["Enigo", "ImageBuffer", "Font", "ChartContext", "Iterator"] {
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
+
+// ===== Session 145: JSON / Markdown 双格式一致性 (S144 + S145) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s145() {
+    let code = "fn foo() -> (Enigo, ImageBuffer, Font, ChartContext) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.iter().scan(0, |a, &x| Some(x)).unzip().cycle(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["Enigo", "ImageBuffer", "Font", "ChartContext", "Iterator"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
+
+// ===== Session 146: JSON 报告 — ratatui/crossterm/tui/glium/vulkano/ndarray-npy 测试 =====
+
+#[test]
+fn test_import_report_s146_json_ratatui_types() {
+    let code = "fn foo() -> (Line, Layout, Block) { unimplemented!() }\nfn bar(w: &dyn Widget) { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Line"), "JSON 应包含 Line: {}", json);
+    assert!(json.contains("Layout"), "JSON 应包含 Layout: {}", json);
+    assert!(json.contains("Block"), "JSON 应包含 Block: {}", json);
+    assert!(json.contains("Widget"), "JSON 应包含 Widget: {}", json);
+    assert!(json.contains("ratatui"), "JSON 应包含 ratatui: {}", json);
+}
+
+#[test]
+fn test_import_report_s146_json_glium_vulkano_types() {
+    let code = "fn foo() -> (Display, Surface, VkHandle, VulkanObject) { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Display"), "JSON 应包含 Display: {}", json);
+    assert!(json.contains("Surface"), "JSON 应包含 Surface: {}", json);
+    assert!(json.contains("VkHandle"), "JSON 应包含 VkHandle: {}", json);
+    assert!(
+        json.contains("VulkanObject"),
+        "JSON 应包含 VulkanObject: {}",
+        json
+    );
+    assert!(json.contains("glium"), "JSON 应包含 glium: {}", json);
+    assert!(json.contains("vulkano"), "JSON 应包含 vulkano: {}", json);
+}
+
+#[test]
+fn test_import_report_s146_json_ndarray_npy_types() {
+    let code = "fn foo() { open_npz(\"file.npz\"); save_npz(\"file.npz\"); }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("open_npz"), "JSON 应包含 open_npz: {}", json);
+    assert!(json.contains("save_npz"), "JSON 应包含 save_npz: {}", json);
+    assert!(
+        json.contains("ndarray_npy"),
+        "JSON 应包含 ndarray_npy: {}",
+        json
+    );
+}
+
+// ===== Session 146: Markdown 报告 — ratatui/crossterm/tui/glium/vulkano/ndarray-npy 测试 =====
+
+#[test]
+fn test_import_report_s146_md_ratatui_types() {
+    let code = "fn foo() -> (Line, Layout, Block) { unimplemented!() }\nfn bar(w: &dyn Widget) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("Line"), "Markdown 应包含 Line: {}", md);
+    assert!(md.contains("Layout"), "Markdown 应包含 Layout: {}", md);
+    assert!(md.contains("Block"), "Markdown 应包含 Block: {}", md);
+    assert!(md.contains("ratatui"), "Markdown 应包含 ratatui: {}", md);
+}
+
+#[test]
+fn test_import_report_s146_md_glium_vulkano_types() {
+    let code = "fn foo() -> (Display, Surface, VkHandle, VulkanObject) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("Display"), "Markdown 应包含 Display: {}", md);
+    assert!(md.contains("Surface"), "Markdown 应包含 Surface: {}", md);
+    assert!(md.contains("VkHandle"), "Markdown 应包含 VkHandle: {}", md);
+    assert!(
+        md.contains("VulkanObject"),
+        "Markdown 应包含 VulkanObject: {}",
+        md
+    );
+    assert!(md.contains("glium"), "Markdown 应包含 glium: {}", md);
+    assert!(md.contains("vulkano"), "Markdown 应包含 vulkano: {}", md);
+}
+
+// ===== Session 146: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s146_issues() {
+    let code = "fn foo() -> (Line, Display, VkHandle) { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s146_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "ratatui::text"
+                || i.module_path == "ratatui::layout"
+                || i.module_path == "ratatui::widgets"
+                || i.module_path == "glium"
+                || i.module_path == "vulkano"
+        })
+        .collect();
+    assert!(
+        s146_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 146 外部 crate 导入问题: {:?}",
+        s146_issues
+    );
+}
+
+// ===== Session 146: .chunks()/.windows()/.rchunks() trait 方法报告 =====
+
+#[test]
+fn test_import_report_chunks_windows_rchunks_methods() {
+    let code = "fn foo(v: Vec<i32>) { v.chunks(2); v.windows(3); v.rchunks(4); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应通过 .chunks()/.windows()/.rchunks() 检测到 Iterator: {}",
+        json
+    );
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应通过 .chunks()/.windows()/.rchunks() 检测到 Iterator: {}",
+        md
+    );
+}
+
+// ===== Session 146: 多类型混合报告 (S145 + S146) =====
+
+#[test]
+fn test_import_report_mixed_s145_s146_types() {
+    let code = "fn foo() -> (ImageBuffer, Line, Font, Display, ChartContext, VkHandle) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.chunks(2).windows(3); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "ImageBuffer",
+        "Line",
+        "Font",
+        "Display",
+        "ChartContext",
+        "VkHandle",
+        "Iterator",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 S146 类型 {}: {}",
+            type_name,
+            json
+        );
+    }
+    for type_name in &[
+        "ImageBuffer",
+        "Line",
+        "Font",
+        "Display",
+        "ChartContext",
+        "VkHandle",
+        "Iterator",
+    ] {
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 S146 类型 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
+
+// ===== Session 146: JSON / Markdown 双格式一致性 (S145 + S146) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s146() {
+    let code = "fn foo() -> (ImageBuffer, Line, Display, VkHandle, ChartContext) { unimplemented!() }\nfn bar(v: Vec<i32>) { v.chunks(2).windows(3).rchunks(4); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "ImageBuffer",
+        "Line",
+        "Display",
+        "VkHandle",
+        "ChartContext",
+        "Iterator",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

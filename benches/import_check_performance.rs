@@ -77,6 +77,32 @@ fn build_missing_external_code(n: usize) -> String {
         ("FdLock", "fn f() -> FdLock { unimplemented!() }"),
         ("NixPath", "fn f() -> NixPath { unimplemented!() }"),
         ("Utf8PathBuf", "fn f() -> Utf8PathBuf { unimplemented!() }"),
+        // Session 144 types
+        ("Enigo", "fn f() -> Enigo { unimplemented!() }"),
+        ("HMODULE", "fn f() -> HMODULE { unimplemented!() }"),
+        ("CGContext", "fn f() -> CGContext { unimplemented!() }"),
+        // Session 145 types
+        ("ImageBuffer", "fn f() -> ImageBuffer { unimplemented!() }"),
+        ("Rgba", "fn f() -> Rgba<u8> { unimplemented!() }"),
+        ("Drawing", "fn f() -> Drawing { unimplemented!() }"),
+        ("Font", "fn f() -> Font { unimplemented!() }"),
+        (
+            "ChartContext",
+            "fn f() -> ChartContext { unimplemented!() }",
+        ),
+        // Session 146 types
+        ("Line", "fn f() -> Line { unimplemented!() }"),
+        ("Layout", "fn f() -> Layout { unimplemented!() }"),
+        ("Block", "fn f() -> Block { unimplemented!() }"),
+        ("Frame", "fn f(f: &mut Frame) { unimplemented!() }"),
+        ("Terminal", "fn f() -> Terminal { unimplemented!() }"),
+        ("Display", "fn f() -> Display { unimplemented!() }"),
+        ("Surface", "fn f() -> Surface { unimplemented!() }"),
+        ("VkHandle", "fn f() -> VkHandle { unimplemented!() }"),
+        (
+            "VulkanObject",
+            "fn f() -> VulkanObject { unimplemented!() }",
+        ),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -126,6 +152,23 @@ fn build_complete_imports_code(n: usize) -> String {
         "use fd_lock::FdLock;",
         "use nix::path::NixPath;",
         "use camino::Utf8PathBuf;",
+        // Session 144 imports
+        "use enigo::Enigo;",
+        "use winapi::HMODULE;",
+        "use core_graphics::CGContext;",
+        // Session 145 imports
+        "use image::ImageBuffer;",
+        "use rusttype::Font;",
+        "use plotters::chart::ChartContext;",
+        // Session 146 imports
+        "use ratatui::text::Line;",
+        "use ratatui::layout::Layout;",
+        "use ratatui::widgets::Block;",
+        "use crossterm::execute;",
+        "use tui::Frame;",
+        "use glium::Display;",
+        "use vulkano::VkHandle;",
+        "use ndarray_npy::open_npz;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -191,6 +234,21 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".min(Ord)",
         ".sum()",
         ".product()",
+        // Session 144 Iterator trait methods
+        ".any(|x| true)",
+        ".all(|x| true)",
+        ".find(|x| true)",
+        ".count()",
+        ".fold(0, |a, b| a + b)",
+        ".for_each(|x| {})",
+        // Session 145 Iterator trait methods
+        ".scan(0, |acc, x| Some(x))",
+        ".unzip()",
+        ".cycle()",
+        // Session 146 Iterator trait methods
+        ".chunks(2)",
+        ".windows(3)",
+        ".rchunks(4)",
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -528,6 +586,47 @@ fn edge_cases(c: &mut Criterion) {
     group.bench_function("s142_iterator_methods", |b| {
         b.iter(|| {
             let code = "fn foo(v: Vec<i32>) { v.iter().flatten().max(Ord).min(Ord); let s = v.iter().sum(); let p = v.iter().product(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 145: image/imageproc/rusttype/plotters 类型检测
+    group.bench_function("s145_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> (ImageBuffer, Rgba<u8>, Drawing) { unimplemented!() }\n\
+                 fn bar() -> (Font, PositionedGlyph, ChartContext) { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 145: .scan()/.unzip()/.cycle() trait 方法检测
+    group.bench_function("s145_iterator_methods", |b| {
+        b.iter(|| {
+            let code =
+                "fn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| Some(x)).unzip().cycle(); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 146: ratatui/crossterm/tui/glium/vulkano/ndarray-npy 类型检测
+    group.bench_function("s146_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo() -> (Line, Layout, Block) { unimplemented!() }\n\
+                 fn bar(f: &mut Frame) { unimplemented!() }\n\
+                 fn baz() -> (Display, Surface, VkHandle, VulkanObject) { unimplemented!() }\n\
+                 fn qux() { open_npz(\"f.npz\"); save_npz(\"f.npz\"); }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 146: .chunks()/.windows()/.rchunks() trait 方法检测
+    group.bench_function("s146_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.chunks(2); v.windows(3); v.rchunks(4); }";
             let issues = verify_imports(black_box(code));
             black_box(issues);
         });

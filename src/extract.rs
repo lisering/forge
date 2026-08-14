@@ -3460,6 +3460,126 @@ pub fn apply_staged_fixes(content: &str) -> String {
     apply_fixes(&after_stage2)
 }
 
+/// 分阶段修复验证结果 (Session 144)
+///
+/// 记录每阶段修复后的验证状态, 包括是否回滚。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedFixValidation {
+    /// 阶段 1 (高优先级) 修复后的内容
+    pub stage1_result: String,
+    /// 阶段 1 是否通过验证 (true = 通过, false = 回滚)
+    pub stage1_valid: bool,
+    /// 阶段 2 (中优先级) 修复后的内容
+    pub stage2_result: String,
+    /// 阶段 2 是否通过验证
+    pub stage2_valid: bool,
+    /// 阶段 3 (低优先级) 修复后的内容
+    pub stage3_result: String,
+    /// 阶段 3 是否通过验证
+    pub stage3_valid: bool,
+    /// 最终结果 (可能回滚到某阶段或原始内容)
+    pub final_result: String,
+    /// 是否有任何阶段被回滚
+    pub any_rolled_back: bool,
+    /// 回滚的阶段列表 (1, 2, 3)
+    pub rolled_back_stages: Vec<u8>,
+}
+
+/// 分阶段修复带验证 — 每阶段修复后调用验证函数, 失败则回滚 (Session 144)
+///
+/// 与 `apply_staged_fixes` 不同, 此函数在每个阶段修复后调用 `validate_fn` 验证。
+/// 如果验证失败 (返回 false), 该阶段修复被回滚 (使用修复前的内容)。
+///
+/// # 参数
+///
+/// - `content`: 原始代码
+/// - `validate_fn`: 验证函数, 接收修复后的代码, 返回 true 表示通过, false 表示失败
+///
+/// # 回滚策略
+///
+/// - 阶段 1 失败 → 回滚到原始内容, 继续阶段 2 (基于原始内容)
+/// - 阶段 2 失败 → 回滚到阶段 1 结果, 继续阶段 3 (基于阶段 1 结果)
+/// - 阶段 3 失败 → 回滚到阶段 2 结果
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::apply_staged_fixes_with_validation;
+///
+/// let code = "pub fn foo() { let x = bar().unwrap(); }";
+/// // 验证函数: 始终通过
+/// let result = apply_staged_fixes_with_validation(code, |_| true);
+/// assert!(!result.final_result.contains(".unwrap()"), "unwrap 应被修复");
+/// assert!(!result.any_rolled_back, "不应有回滚");
+/// ```
+pub fn apply_staged_fixes_with_validation<F>(
+    content: &str,
+    mut validate_fn: F,
+) -> StagedFixValidation
+where
+    F: FnMut(&str) -> bool,
+{
+    let stage1_exclude = [
+        IssueType::UnsafeBlock,
+        IssueType::UnsafeFn,
+        IssueType::UnsafeImpl,
+        IssueType::UnwrapOr,
+        IssueType::UnwrapOrDefault,
+        IssueType::MissingMustUse,
+        IssueType::MissingDoc,
+    ];
+    let after_stage1 = apply_fixes_except(content, &stage1_exclude);
+
+    // 阶段 1 验证
+    let (stage1_result, stage1_valid) = if validate_fn(&after_stage1) {
+        (after_stage1.clone(), true)
+    } else {
+        (content.to_string(), false) // 回滚到原始内容
+    };
+
+    let stage2_exclude = [IssueType::MissingDoc];
+    let after_stage2 = apply_fixes_except(&stage1_result, &stage2_exclude);
+
+    // 阶段 2 验证
+    let (stage2_result, stage2_valid) = if validate_fn(&after_stage2) {
+        (after_stage2.clone(), true)
+    } else {
+        (stage1_result.clone(), false) // 回滚到阶段 1 结果
+    };
+
+    let after_stage3 = apply_fixes(&stage2_result);
+
+    // 阶段 3 验证
+    let (stage3_result, stage3_valid) = if validate_fn(&after_stage3) {
+        (after_stage3.clone(), true)
+    } else {
+        (stage2_result.clone(), false) // 回滚到阶段 2 结果
+    };
+
+    let mut rolled_back_stages = Vec::new();
+    if !stage1_valid {
+        rolled_back_stages.push(1);
+    }
+    if !stage2_valid {
+        rolled_back_stages.push(2);
+    }
+    if !stage3_valid {
+        rolled_back_stages.push(3);
+    }
+
+    StagedFixValidation {
+        stage1_result,
+        stage1_valid,
+        stage2_result,
+        stage2_valid,
+        stage3_result: stage3_result.clone(),
+        stage3_valid,
+        final_result: stage3_result,
+        any_rolled_back: !rolled_back_stages.is_empty(),
+        rolled_back_stages,
+    }
+}
+
 /// 包装 Result 函数中的 `return` 语句 (Session 122)
 ///
 /// 与 `wrap_last_expression_in_ok` 互补:
@@ -5792,6 +5912,42 @@ pub fn ensure_external_imports(content: &str) -> String {
         // camino (Session 142)
         ("Utf8PathBuf", "camino"),
         ("Utf8Path", "camino"),
+        // External crates (Session 144)
+        ("Enigo", "enigo"),
+        ("Display", "x11::display"),
+        ("HMODULE", "winapi"),
+        ("CGContext", "core_graphics"),
+        // image (Session 145)
+        ("ImageBuffer", "image"),
+        ("Rgba", "image"),
+        // imageproc (Session 145)
+        ("Drawing", "imageproc::drawing"),
+        // rusttype (Session 145)
+        ("Font", "rusttype"),
+        ("PositionedGlyph", "rusttype"),
+        // plotters (Session 145)
+        ("ChartContext", "plotters::chart"),
+        // ratatui (Session 146)
+        ("Line", "ratatui::text"),
+        ("Layout", "ratatui::layout"),
+        ("Block", "ratatui::widgets"),
+        ("Widget", "ratatui::widgets"),
+        // crossterm (Session 146)
+        ("execute", "crossterm"),
+        ("queue", "crossterm"),
+        ("terminal", "crossterm"),
+        // tui (Session 146)
+        ("Frame", "tui"),
+        ("Terminal", "tui"),
+        // glium (Session 146)
+        ("Display", "glium"),
+        ("Surface", "glium::surface"),
+        // vulkano (Session 146)
+        ("VkHandle", "vulkano"),
+        ("VulkanObject", "vulkano"),
+        // ndarray-npy (Session 146)
+        ("open_npz", "ndarray_npy"),
+        ("save_npz", "ndarray_npy"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6264,7 +6420,33 @@ pub fn ensure_external_imports(content: &str) -> String {
     // 检测 .flatten() / .max() / .min() / .sum() / .product() → Iterator trait 方法调用 (Session 142)
     // .flatten() / .max( / .min( 需要 Iterator trait 在作用域中
     // .sum( / .product( 需要 Iterator trait 的 sum()/product() 方法 (通过 std::iter::Sum/Product trait)
-    let s142_iterator_methods: &[&str] = &["flatten", "max", "min", "sum", "product"];
+    let s142_iterator_methods: &[&str] = &[
+        "flatten",
+        "max",
+        "min",
+        "sum",
+        "product",
+        // Session 144: .any() / .all() / .find() / .position() / .count() / .fold() / .reduce() / .partition() / .for_each()
+        "any",
+        "all",
+        "find",
+        "position",
+        "count",
+        "fold",
+        "reduce",
+        "partition",
+        "for_each",
+        // Session 145: .scan() / .unzip() / .cycle() / .peekable() (already in s141) / .sum() / .product() (already above)
+        "scan",
+        "unzip",
+        "cycle",
+        // Session 146: .chunks() / .windows() / .rchunks() / .as_chunks() / .array_chunks()
+        "chunks",
+        "windows",
+        "rchunks",
+        "as_chunks",
+        "array_chunks",
+    ];
     let mut s142_iterator_method_found = false;
     for &method_name in s142_iterator_methods {
         let method_call = format!(".{}(", method_name);
@@ -6813,6 +6995,42 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("Errno", "nix::errno"),
         ("Utf8PathBuf", "camino"),
         ("Utf8Path", "camino"),
+        // External crates (Session 144)
+        ("Enigo", "enigo"),
+        ("Display", "x11::display"),
+        ("HMODULE", "winapi"),
+        ("CGContext", "core_graphics"),
+        // image (Session 145)
+        ("ImageBuffer", "image"),
+        ("Rgba", "image"),
+        // imageproc (Session 145)
+        ("Drawing", "imageproc::drawing"),
+        // rusttype (Session 145)
+        ("Font", "rusttype"),
+        ("PositionedGlyph", "rusttype"),
+        // plotters (Session 145)
+        ("ChartContext", "plotters::chart"),
+        // ratatui (Session 146)
+        ("Line", "ratatui::text"),
+        ("Layout", "ratatui::layout"),
+        ("Block", "ratatui::widgets"),
+        ("Widget", "ratatui::widgets"),
+        // crossterm (Session 146)
+        ("execute", "crossterm"),
+        ("queue", "crossterm"),
+        ("terminal", "crossterm"),
+        // tui (Session 146)
+        ("Frame", "tui"),
+        ("Terminal", "tui"),
+        // glium (Session 146)
+        ("Display", "glium"),
+        ("Surface", "glium::surface"),
+        // vulkano (Session 146)
+        ("VkHandle", "vulkano"),
+        ("VulkanObject", "vulkano"),
+        // ndarray-npy (Session 146)
+        ("open_npz", "ndarray_npy"),
+        ("save_npz", "ndarray_npy"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7362,6 +7580,26 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "min",
         "sum",
         "product",
+        // Session 144: .any() / .all() / .find() / .position() / .count() / .fold() / .reduce() / .partition() / .for_each()
+        "any",
+        "all",
+        "find",
+        "position",
+        "count",
+        "fold",
+        "reduce",
+        "partition",
+        "for_each",
+        // Session 145: .scan() / .unzip() / .cycle()
+        "scan",
+        "unzip",
+        "cycle",
+        // Session 146: .chunks() / .windows() / .rchunks() / .as_chunks() / .array_chunks()
+        "chunks",
+        "windows",
+        "rchunks",
+        "as_chunks",
+        "array_chunks",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -20885,6 +21123,1299 @@ fn main() {
             s142_issues.is_empty(),
             "ensure_external_imports 后不应有 Session 142 外部 crate 导入问题: {:?}",
             s142_issues
+        );
+    }
+
+    // ===== Session 144: apply_staged_fixes_with_validation 测试 =====
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_all_pass() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes_with_validation(code, |_| true);
+        assert!(
+            !result.final_result.contains(".unwrap()"),
+            "unwrap 应被修复"
+        );
+        assert!(!result.any_rolled_back, "不应有回滚");
+        assert!(result.stage1_valid, "阶段 1 应通过");
+        assert!(result.stage2_valid, "阶段 2 应通过");
+        assert!(result.stage3_valid, "阶段 3 应通过");
+        assert!(result.rolled_back_stages.is_empty(), "回滚列表应为空");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_stage1_rollback() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        // 阶段 1 验证失败 → 回滚到原始内容
+        let result = apply_staged_fixes_with_validation(code, |_| false);
+        assert!(result.any_rolled_back, "应有回滚");
+        assert!(!result.stage1_valid, "阶段 1 应未通过");
+        assert!(result.rolled_back_stages.contains(&1), "应包含阶段 1 回滚");
+        // 回滚到原始内容, unwrap 仍在
+        assert!(
+            result.final_result.contains(".unwrap()"),
+            "回滚后应保留原始 unwrap"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_stage1_only_rollback() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        // 阶段 1 失败, 但阶段 2/3 通过 (基于回滚后的内容)
+        let mut call_count = 0;
+        let result = apply_staged_fixes_with_validation(code, |_c| {
+            call_count += 1;
+            // 第一次调用 (阶段1) 失败, 后续通过
+            call_count > 1
+        });
+        assert!(!result.stage1_valid, "阶段 1 应未通过");
+        assert!(result.stage2_valid, "阶段 2 应通过");
+        assert!(result.stage3_valid, "阶段 3 应通过");
+        assert!(result.any_rolled_back, "应有回滚");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_no_change() {
+        let code = "fn foo() -> i32 { 42 }";
+        let result = apply_staged_fixes_with_validation(code, |_| true);
+        assert!(!result.any_rolled_back, "无问题不应有回滚");
+        assert_eq!(result.final_result, code, "无问题不应修改");
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_serde() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes_with_validation(code, |_| true);
+        let json = serde_json::to_string(&result).expect("序列化失败");
+        let deserialized: StagedFixValidation = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(result.any_rolled_back, deserialized.any_rolled_back);
+        assert_eq!(result.stage1_valid, deserialized.stage1_valid);
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_final_matches_stage3() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes_with_validation(code, |_| true);
+        assert_eq!(
+            result.final_result, result.stage3_result,
+            "最终结果应与阶段 3 结果一致"
+        );
+    }
+
+    #[test]
+    fn test_apply_staged_fixes_with_validation_all_stages_fail() {
+        let code = "pub fn foo() { let x = bar().unwrap(); }";
+        let result = apply_staged_fixes_with_validation(code, |_| false);
+        assert!(result.any_rolled_back, "应有回滚");
+        assert!(!result.stage1_valid, "阶段 1 应未通过");
+        assert!(!result.stage2_valid, "阶段 2 应未通过");
+        assert!(!result.stage3_valid, "阶段 3 应未通过");
+        assert_eq!(result.rolled_back_stages.len(), 3, "应有 3 个阶段回滚");
+        // 最终回滚到原始内容 (阶段1回滚→阶段2基于原始→回滚→阶段3基于阶段2=原始→回滚)
+        assert!(
+            result.final_result.contains(".unwrap()"),
+            "全回滚应保留原始内容"
+        );
+    }
+
+    // ===== Session 144: ensure_external_imports enigo/x11/winapi/core-graphics 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_enigo() {
+        let code = "fn foo() -> Enigo { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use enigo::Enigo;"),
+            "应添加 enigo::Enigo 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_x11_display() {
+        let code = "fn foo() -> Display { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use x11::display::Display;"),
+            "应添加 x11::display::Display 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_winapi_hmodule() {
+        let code = "fn foo() -> HMODULE { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use winapi::HMODULE;"),
+            "应添加 winapi::HMODULE 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_core_graphics_cgcontext() {
+        let code = "fn foo() -> CGContext { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use core_graphics::CGContext;"),
+            "应添加 core_graphics::CGContext 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s144_idempotent() {
+        let code = "fn foo() -> (Enigo, HMODULE, CGContext) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 144 新增外部 crate 检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s144_already_imported() {
+        let code = "use enigo::Enigo;\nfn foo() -> Enigo { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use enigo::Enigo;").count();
+        assert_eq!(count, 1, "已有 enigo::Enigo 导入不应重复添加: {}", result);
+    }
+
+    // ===== Session 144: ensure_external_imports .any()/.fold()/.for_each() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_any_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().any(|&x| x > 0); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .any() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fold_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().fold(0, |a, &b| a + b); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .fold() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_for_each_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().for_each(|x| println!(\"{}\", x)); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .for_each() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s144_iterator_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().any(|&x| x > 0); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.any): {}",
+            result
+        );
+    }
+
+    // ===== Session 144: verify_imports enigo/x11/winapi/core-graphics 测试 =====
+
+    #[test]
+    fn test_verify_imports_enigo_missing() {
+        let issues = verify_imports("fn foo() -> Enigo { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Enigo" && i.module_path == "enigo"),
+            "应检测到 enigo::Enigo 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_enigo_already_imported() {
+        let code = "use enigo::Enigo;\nfn foo() -> Enigo { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Enigo" && i.module_path == "enigo"),
+            "已有 enigo::Enigo 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_winapi_hmodule_missing() {
+        let issues = verify_imports("fn foo() -> HMODULE { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "HMODULE" && i.module_path == "winapi"),
+            "应检测到 winapi::HMODULE 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_core_graphics_cgcontext_missing() {
+        let issues = verify_imports("fn foo() -> CGContext { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "CGContext" && i.module_path == "core_graphics"),
+            "应检测到 core_graphics::CGContext 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s144_combined() {
+        let code = "fn foo() -> (Enigo, HMODULE, CGContext) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "Enigo"),
+            "应检测到 Enigo: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "HMODULE"),
+            "应检测到 HMODULE: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "CGContext"),
+            "应检测到 CGContext: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 144: verify_imports .any()/.fold()/.for_each() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_any_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().any(|&x| x > 0); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .any() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fold_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().fold(0, |a, &b| a + b); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .fold() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_for_each_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().for_each(|x| {}); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .for_each() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_any_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().any(|&x| x > 0); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .any() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s144_iterator_methods_combined() {
+        let code =
+            "fn foo(v: Vec<i32>) { v.iter().any(|&x| x > 0).count().fold(0, |a, &b| a + b); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 144 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 144: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s144_issues() {
+        let code = "fn foo() -> (Enigo, HMODULE, CGContext) { unimplemented!() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s144_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "enigo"
+                    || i.module_path == "x11::display"
+                    || i.module_path == "winapi"
+                    || i.module_path == "core_graphics"
+            })
+            .collect();
+        assert!(
+            s144_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 144 外部 crate 导入问题: {:?}",
+            s144_issues
+        );
+    }
+
+    // ===== Session 145: ensure_external_imports image/imageproc/rusttype/plotters 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_image_image_buffer() {
+        let code = "fn foo() -> ImageBuffer<Rgba<u8>, Vec<u8>> { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use image::{ImageBuffer, Rgba};"),
+            "应添加 image::{{ImageBuffer, Rgba}} 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_image_rgba() {
+        let code = "fn foo() -> Rgba<u8> { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use image::Rgba;"),
+            "应添加 image::Rgba 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_imageproc_drawing() {
+        let code = "fn foo(d: Drawing) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use imageproc::drawing::Drawing;"),
+            "应添加 imageproc::drawing::Drawing 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rusttype_font() {
+        let code = "fn foo() -> Font { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rusttype::Font;"),
+            "应添加 rusttype::Font 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rusttype_positioned_glyph() {
+        let code = "fn foo() -> PositionedGlyph { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use rusttype::PositionedGlyph;"),
+            "应添加 rusttype::PositionedGlyph 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_plotters_chart_context() {
+        let code = "fn foo() -> ChartContext { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use plotters::chart::ChartContext;"),
+            "应添加 plotters::chart::ChartContext 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s145_idempotent() {
+        let code =
+            "fn foo() -> (ImageBuffer<Rgba<u8>, Vec<u8>>, Font, ChartContext) { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 145 新增外部 crate 检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s145_already_imported() {
+        let code = "use image::ImageBuffer;\nfn foo() -> ImageBuffer { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use image::ImageBuffer;").count();
+        assert_eq!(
+            count, 1,
+            "已有 image::ImageBuffer 导入不应重复添加: {}",
+            result
+        );
+    }
+
+    // ===== Session 145: ensure_external_imports .scan()/.unzip()/.cycle() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_scan_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| { Some(x) }); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .scan() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_unzip_method() {
+        let code = "fn foo(v: Vec<i32>) { let (a, b): (Vec<_>, Vec<_>) = v.iter().unzip(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .unzip() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_cycle_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().cycle(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .cycle() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s145_iterator_already_imported() {
+        let code =
+            "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| Some(x)); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.scan): {}",
+            result
+        );
+    }
+
+    // ===== Session 145: verify_imports image/imageproc/rusttype/plotters 测试 =====
+
+    #[test]
+    fn test_verify_imports_image_image_buffer_missing() {
+        let issues = verify_imports("fn foo() -> ImageBuffer { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ImageBuffer" && i.module_path == "image"),
+            "应检测到 image::ImageBuffer 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_image_rgba_missing() {
+        let issues = verify_imports("fn foo() -> Rgba { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Rgba" && i.module_path == "image"),
+            "应检测到 image::Rgba 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_imageproc_drawing_missing() {
+        let issues = verify_imports("fn foo(d: Drawing) { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Drawing" && i.module_path == "imageproc::drawing"),
+            "应检测到 imageproc::drawing::Drawing 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rusttype_font_missing() {
+        let issues = verify_imports("fn foo() -> Font { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Font" && i.module_path == "rusttype"),
+            "应检测到 rusttype::Font 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_plotters_chart_context_missing() {
+        let issues = verify_imports("fn foo() -> ChartContext { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ChartContext" && i.module_path == "plotters::chart"),
+            "应检测到 plotters::chart::ChartContext 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s145_combined() {
+        let code = "fn foo() -> (ImageBuffer, Font, ChartContext) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues.iter().any(|i| i.type_name == "ImageBuffer"),
+            "应检测到 ImageBuffer: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "Font"),
+            "应检测到 Font: {:?}",
+            issues
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "ChartContext"),
+            "应检测到 ChartContext: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_image_already_imported() {
+        let code = "use image::ImageBuffer;\nfn foo() -> ImageBuffer { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "ImageBuffer" && i.module_path == "image"),
+            "已有 image::ImageBuffer 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 145: verify_imports .scan()/.unzip()/.cycle() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_scan_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| Some(x)); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .scan() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_unzip_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { let (a, b) = v.iter().unzip(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .unzip() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_cycle_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.iter().cycle(); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .cycle() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_scan_already_imported() {
+        let code =
+            "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter().scan(0, |acc, &x| Some(x)); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "已有 Iterator 导入不应通过 .scan() 重复报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s145_iterator_methods_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().scan(0, |a, &x| Some(x)).unzip().cycle(); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 145 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 146: verify_imports ratatui/crossterm/tui/glium/vulkano/ndarray-npy 测试 =====
+
+    #[test]
+    fn test_verify_imports_ratatui_line_missing() {
+        let issues = verify_imports("fn foo() -> Line { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Line" && i.module_path == "ratatui::text"),
+            "应检测到 ratatui::text::Line 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ratatui_layout_missing() {
+        let issues = verify_imports("fn foo() -> Layout { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Layout" && i.module_path == "ratatui::layout"),
+            "应检测到 ratatui::layout::Layout 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ratatui_block_missing() {
+        let issues = verify_imports("fn foo() -> Block { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Block" && i.module_path == "ratatui::widgets"),
+            "应检测到 ratatui::widgets::Block 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ratatui_already_imported() {
+        let code = "use ratatui::text::Line;\nfn foo() -> Line { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Line" && i.module_path == "ratatui::text"),
+            "已有 ratatui::text::Line 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_crossterm_execute_missing() {
+        let issues = verify_imports("fn foo() { execute!(\"cmd\"); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "execute" && i.module_path == "crossterm"),
+            "应检测到 crossterm::execute 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_crossterm_already_imported() {
+        let code = "use crossterm::execute;\nfn foo() { execute!(\"cmd\"); }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "execute" && i.module_path == "crossterm"),
+            "已有 crossterm::execute 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tui_frame_missing() {
+        let issues = verify_imports("fn foo(f: &mut Frame) { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Frame" && i.module_path == "tui"),
+            "应检测到 tui::Frame 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_tui_terminal_missing() {
+        let issues = verify_imports("fn foo() -> Terminal { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Terminal" && i.module_path == "tui"),
+            "应检测到 tui::Terminal 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_glium_display_missing() {
+        let issues = verify_imports("fn foo() -> Display { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Display" && i.module_path == "glium"),
+            "应检测到 glium::Display 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_glium_surface_missing() {
+        let issues = verify_imports("fn foo() -> Surface { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Surface" && i.module_path == "glium::surface"),
+            "应检测到 glium::surface::Surface 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_vulkano_vk_handle_missing() {
+        let issues = verify_imports("fn foo() -> VkHandle { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "VkHandle" && i.module_path == "vulkano"),
+            "应检测到 vulkano::VkHandle 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_vulkano_vulkan_object_missing() {
+        let issues = verify_imports("fn foo() -> VulkanObject { unimplemented!() }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "VulkanObject" && i.module_path == "vulkano"),
+            "应检测到 vulkano::VulkanObject 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ndarray_npy_open_npz_missing() {
+        let issues = verify_imports("fn foo() { open_npz(\"file.npz\"); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "open_npz" && i.module_path == "ndarray_npy"),
+            "应检测到 ndarray_npy::open_npz 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_ndarray_npy_save_npz_missing() {
+        let issues = verify_imports("fn foo() { save_npz(\"file.npz\"); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "save_npz" && i.module_path == "ndarray_npy"),
+            "应检测到 ndarray_npy::save_npz 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s146_combined() {
+        let code = "fn foo() -> (Line, Frame, Display, VkHandle) { unimplemented!() }\nfn bar() { open_npz(\"f.npz\"); }";
+        let issues = verify_imports(code);
+        assert!(issues.iter().any(|i| i.type_name == "Line"), "应有 Line");
+        assert!(issues.iter().any(|i| i.type_name == "Frame"), "应有 Frame");
+        assert!(
+            issues.iter().any(|i| i.type_name == "Display"),
+            "应有 Display"
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "VkHandle"),
+            "应有 VkHandle"
+        );
+        assert!(
+            issues.iter().any(|i| i.type_name == "open_npz"),
+            "应有 open_npz"
+        );
+    }
+
+    // ===== Session 146: verify_imports .chunks()/.windows()/.rchunks() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_chunks_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.chunks(2); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .chunks() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_windows_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.windows(2); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .windows() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rchunks_method_iterator() {
+        let issues = verify_imports("fn foo(v: Vec<i32>) { v.rchunks(2); }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应通过 .rchunks() 方法检测到 Iterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s146_iterator_methods_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.chunks(2); v.windows(3); v.rchunks(4); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 146 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 145: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s145_issues() {
+        let code = "fn foo() -> (ImageBuffer, Font, ChartContext) { unimplemented!() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s145_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "image"
+                    || i.module_path == "imageproc::drawing"
+                    || i.module_path == "rusttype"
+                    || i.module_path == "plotters::chart"
+            })
+            .collect();
+        assert!(
+            s145_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 145 外部 crate 导入问题: {:?}",
+            s145_issues
+        );
+    }
+
+    // ===== Session 145: 混合 S144+S145 类型验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_s144_s145_mixed() {
+        let code = "fn foo() -> (Enigo, ImageBuffer, Font, CGContext) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use enigo::Enigo;"),
+            "应包含 enigo::Enigo: {}",
+            result
+        );
+        assert!(
+            result.contains("use image::ImageBuffer;"),
+            "应包含 image::ImageBuffer: {}",
+            result
+        );
+        assert!(
+            result.contains("use rusttype::Font;"),
+            "应包含 rusttype::Font: {}",
+            result
+        );
+        assert!(
+            result.contains("use core_graphics::CGContext;"),
+            "应包含 core_graphics::CGContext: {}",
+            result
+        );
+    }
+
+    // ===== Session 146: ensure_external_imports ratatui/crossterm/tui/glium/vulkano/ndarray-npy 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_line() {
+        let code = "fn foo() -> Line { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ratatui::text::Line;"),
+            "应添加 ratatui::text::Line 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_layout() {
+        let code = "fn foo() -> Layout { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ratatui::layout::Layout;"),
+            "应添加 ratatui::layout::Layout 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_block() {
+        let code = "fn foo() -> Block { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ratatui::widgets::Block;"),
+            "应添加 ratatui::widgets::Block 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_widget() {
+        let code = "fn foo(w: &dyn Widget) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ratatui::widgets::Widget;"),
+            "应添加 ratatui::widgets::Widget 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_full_path() {
+        let code = "fn foo() -> ratatui::text::Line { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use ratatui::text::Line;"),
+            "全限定 ratatui::text::Line 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ratatui_multiple_merged() {
+        let code = "fn foo() -> (Line, Layout) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        // Line is from ratatui::text, Layout is from ratatui::layout — different paths, separate imports
+        assert!(
+            result.contains("use ratatui::text::Line;"),
+            "应包含 ratatui::text::Line: {}",
+            result
+        );
+        assert!(
+            result.contains("use ratatui::layout::Layout;"),
+            "应包含 ratatui::layout::Layout: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_execute() {
+        let code = "fn foo() { execute!(\"cmd\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use crossterm::execute;"),
+            "应添加 crossterm::execute 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_queue() {
+        let code = "fn foo() { queue!(\"cmd\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use crossterm::queue;"),
+            "应添加 crossterm::queue 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_terminal() {
+        let code = "fn foo() -> terminal { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use crossterm::terminal;"),
+            "应添加 crossterm::terminal 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_full_path() {
+        let code = "fn foo() { crossterm::execute!(\"cmd\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use crossterm::execute;"),
+            "全限定 crossterm::execute 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tui_frame() {
+        let code = "fn foo(f: &mut Frame) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tui::Frame;"),
+            "应添加 tui::Frame 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tui_terminal() {
+        let code = "fn foo() -> Terminal { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use tui::Terminal;"),
+            "应添加 tui::Terminal 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_tui_full_path() {
+        let code = "fn foo() -> tui::Terminal { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use tui::Terminal;"),
+            "全限定 tui::Terminal 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glium_display() {
+        let code = "fn foo() -> Display { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use glium::Display;"),
+            "应添加 glium::Display 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glium_surface() {
+        let code = "fn foo() -> Surface { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use glium::surface::Surface;"),
+            "应添加 glium::surface::Surface 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_glium_full_path() {
+        let code = "fn foo() -> glium::Display { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use glium::Display;"),
+            "全限定 glium::Display 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_vulkano_vk_handle() {
+        let code = "fn foo() -> VkHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use vulkano::VkHandle;"),
+            "应添加 vulkano::VkHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_vulkano_vulkan_object() {
+        let code = "fn foo() -> VulkanObject { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use vulkano::VulkanObject;"),
+            "应添加 vulkano::VulkanObject 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_vulkano_full_path() {
+        let code = "fn foo() -> vulkano::VkHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use vulkano::VkHandle;"),
+            "全限定 vulkano::VkHandle 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_vulkano_multiple_merged() {
+        let code = "fn foo() -> (VkHandle, VulkanObject) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use vulkano::{VkHandle, VulkanObject};"),
+            "多个 vulkano 类型应合并导入 (字母序): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_npy_open_npz() {
+        let code = "fn foo() { open_npz(\"file.npz\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ndarray_npy::open_npz;"),
+            "应添加 ndarray_npy::open_npz 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_npy_save_npz() {
+        let code = "fn foo() { save_npz(\"file.npz\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ndarray_npy::save_npz;"),
+            "应添加 ndarray_npy::save_npz 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_ndarray_npy_full_path() {
+        let code = "fn foo() { ndarray_npy::open_npz(\"file.npz\"); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use ndarray_npy::open_npz;"),
+            "全限定 ndarray_npy::open_npz 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s146_idempotent() {
+        let code = "fn foo() -> (Line, Layout, Block, Widget) { unimplemented!() }\n\
+             fn bar() -> (Frame, Terminal, Display, Surface) { unimplemented!() }\n\
+             fn baz() -> (VkHandle, VulkanObject) { unimplemented!() }\n\
+             fn qux() { open_npz(\"f.npz\"); save_npz(\"f.npz\"); }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "Session 146 新增外部 crate 检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s146_already_imported() {
+        let code = "use ratatui::text::Line;\nfn foo() -> Line { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use ratatui::text::Line;").count();
+        assert_eq!(
+            count, 1,
+            "已有 ratatui::text::Line 导入不应重复添加: {}",
+            result
+        );
+    }
+
+    // ===== Session 146: ensure_external_imports .chunks()/.windows()/.rchunks() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_chunks_method() {
+        let code = "fn foo(v: Vec<i32>) { v.chunks(2); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .chunks() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_windows_method() {
+        let code = "fn foo(v: Vec<i32>) { v.windows(2); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .windows() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rchunks_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rchunks(2); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .rchunks() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s146_iterator_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.chunks(2); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.chunks): {}",
+            result
         );
     }
 }
