@@ -243,6 +243,9 @@ impl SystemPrompt {
   "❌ 禁止: 调用 .iter_mut()/.split()/.splitn()/.rsplit()/.rsplitn()/.lines()/.chars()/.bytes() 但未导入 use std::iter::Iterator; (Session 148 trait 方法检测)\n",
         );
         prompt.push_str(
+  "❌ 禁止: 调用 .iter()/.try_fold()/.try_for_each()/.is_sorted()/.collect_into() 但未导入 use std::iter::Iterator; (Session 149 trait 方法检测)\n",
+        );
+        prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
 
@@ -1713,6 +1716,33 @@ mod tests {
         assert!(
             prompt.contains(".cycle()"),
             "系统 prompt 应包含 .cycle() trait 方法检测约束 (Session 145)"
+        );
+    }
+
+    // ===== Session 149: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s149_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".iter()"),
+            "系统 prompt 应包含 .iter() trait 方法检测约束 (Session 149)"
+        );
+        assert!(
+            prompt.contains(".try_fold()"),
+            "系统 prompt 应包含 .try_fold() trait 方法检测约束 (Session 149)"
+        );
+        assert!(
+            prompt.contains(".try_for_each()"),
+            "系统 prompt 应包含 .try_for_each() trait 方法检测约束 (Session 149)"
+        );
+        assert!(
+            prompt.contains(".is_sorted()"),
+            "系统 prompt 应包含 .is_sorted() trait 方法检测约束 (Session 149)"
+        );
+        assert!(
+            prompt.contains(".collect_into()"),
+            "系统 prompt 应包含 .collect_into() trait 方法检测约束 (Session 149)"
         );
     }
 }

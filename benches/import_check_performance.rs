@@ -699,6 +699,15 @@ fn edge_cases(c: &mut Criterion) {
         });
     });
 
+    // Session 149: .iter()/.try_fold()/.try_for_each()/.is_sorted()/.collect_into() trait 方法检测
+    group.bench_function("s149_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); v.collect_into(&mut Vec::new()); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
     // 嵌套 glob 导入
     group.bench_function("nested_glob", |b| {
         b.iter(|| {

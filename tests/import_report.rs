@@ -1892,3 +1892,132 @@ fn test_import_report_json_markdown_consistency_s148() {
         );
     }
 }
+
+// ===== Session 149: .iter()/.try_fold()/.try_for_each()/.is_sorted()/.collect_into() trait 方法报告 =====
+
+#[test]
+fn test_import_report_json_s149_iter_method() {
+    let code = "fn foo(v: Vec<i32>) { v.iter().for_each(|x| println!(\"{}\", x)); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (.iter()): {}",
+        json
+    );
+    assert!(
+        json.contains("std::iter"),
+        "JSON 应包含 std::iter 模块 (.iter()): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_s149_try_fold_method() {
+    let code = "fn foo(v: Vec<i32>) -> Result<i32, &'static str> { v.iter().try_fold(0, |acc, &x| acc + x) }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应包含 Iterator (.try_fold()): {}",
+        md
+    );
+    assert!(
+        md.contains("std::iter"),
+        "Markdown 应包含 std::iter 模块 (.try_fold()): {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_json_s149_try_for_each_method() {
+    let code =
+        "fn foo(v: Vec<i32>) -> Result<(), &'static str> { v.iter().try_for_each(|x| Ok(())) }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (.try_for_each()): {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_s149_is_sorted_method() {
+    let code = "fn foo(v: Vec<i32>) -> bool { v.iter().is_sorted() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应包含 Iterator (.is_sorted()): {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_json_s149_collect_into_method() {
+    let code = "fn foo(v: Vec<i32>) { let mut buf = Vec::new(); v.iter().collect_into(&mut buf); }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (.collect_into()): {}",
+        json
+    );
+}
+
+// ===== Session 149: ensure_external_imports 验证 =====
+
+#[test]
+fn test_import_report_ensure_s149_iter_method() {
+    let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); v.collect_into(&mut Vec::new()); }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s149_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+        .collect();
+    assert!(
+        s149_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 149 Iterator 导入问题: {:?}",
+        s149_issues
+    );
+}
+
+// ===== Session 149: 多 trait 方法混合报告 (S148 + S149) =====
+
+#[test]
+fn test_import_report_mixed_s148_s149_iterator_methods() {
+    let code = "fn foo(v: Vec<i32>, s: &str) { v.iter_mut(); s.lines(); v.iter(); v.try_fold(0, |a, b| a + b); v.is_sorted(); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (混合 S148+S149): {}",
+        json
+    );
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应包含 Iterator (混合 S148+S149): {}",
+        md
+    );
+}
+
+// ===== Session 149: JSON / Markdown 双格式一致性 =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s149() {
+    let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); v.collect_into(&mut Vec::new()); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["Iterator", "std::iter"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

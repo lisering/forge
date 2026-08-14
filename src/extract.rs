@@ -6505,6 +6505,16 @@ pub fn ensure_external_imports(content: &str) -> String {
         "lines",
         "chars",
         "bytes",
+        // Session 149: .iter() / .try_fold() / .try_for_each() / .is_sorted() / .collect_into()
+        // .iter() → Iterator (core method for obtaining an iterator)
+        "iter",
+        // .try_fold() / .try_for_each() → Iterator (fallible iteration)
+        "try_fold",
+        "try_for_each",
+        // .is_sorted() → Iterator (checks if iterator is sorted)
+        "is_sorted",
+        // .collect_into() → Iterator (collects into a specified collection)
+        "collect_into",
     ];
     let mut s142_iterator_method_found = false;
     for &method_name in s142_iterator_methods {
@@ -7715,6 +7725,12 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "lines",
         "chars",
         "bytes",
+        // Session 149: .iter() / .try_fold() / .try_for_each() / .is_sorted() / .collect_into()
+        "iter",
+        "try_fold",
+        "try_for_each",
+        "is_sorted",
+        "collect_into",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -23310,6 +23326,219 @@ fn main() {
         assert!(
             result.contains("use indicatif::ProgressBar;"),
             "应包含 indicatif::ProgressBar: {}",
+            result
+        );
+    }
+
+    // ===== Session 149: .iter() / .try_fold() / .try_for_each() / .is_sorted() / .collect_into() trait 方法检测 =====
+
+    #[test]
+    fn test_ensure_external_imports_iter_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().for_each(|x| println!(\"{}\", x)); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .iter() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_try_fold_method() {
+        let code = "fn foo(v: Vec<i32>) -> Result<i32, &'static str> { v.iter().try_fold(0, |acc, &x| acc + x) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .try_fold() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_try_for_each_method() {
+        let code =
+            "fn foo(v: Vec<i32>) -> Result<(), &'static str> { v.iter().try_for_each(|x| Ok(())) }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .try_for_each() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_is_sorted_method() {
+        let code = "fn foo(v: Vec<i32>) -> bool { v.iter().is_sorted() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .is_sorted() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_collect_into_method() {
+        let code =
+            "fn foo(v: Vec<i32>) { let mut buf = Vec::new(); v.iter().collect_into(&mut buf); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .collect_into() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s149_methods_idempotent() {
+        let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "S149 trait 方法检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s149_methods_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(count, 1, "已有 Iterator 导入不应重复: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s149_iter_with_glob() {
+        let code =
+            "use std::iter::*;\nfn foo(v: Vec<i32>) { v.iter(); v.try_for_each(|x| Ok(())); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use std::iter::Iterator;"),
+            "通配导入应覆盖: {}",
+            result
+        );
+    }
+
+    // ===== Session 149: verify_imports S149 trait 方法检测 =====
+
+    #[test]
+    fn test_verify_imports_iter_method() {
+        let code = "fn foo(v: Vec<i32>) { v.iter().for_each(|x| println!(\"{}\", x)); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            !iterator_issues.is_empty(),
+            "应检测到 .iter() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_fold_method() {
+        let code = "fn foo(v: Vec<i32>) -> Result<i32, &'static str> { v.iter().try_fold(0, |acc, &x| acc + x) }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            !iterator_issues.is_empty(),
+            "应检测到 .try_fold() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_try_for_each_method() {
+        let code =
+            "fn foo(v: Vec<i32>) -> Result<(), &'static str> { v.iter().try_for_each(|x| Ok(())) }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            !iterator_issues.is_empty(),
+            "应检测到 .try_for_each() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_is_sorted_method() {
+        let code = "fn foo(v: Vec<i32>) -> bool { v.iter().is_sorted() }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            !iterator_issues.is_empty(),
+            "应检测到 .is_sorted() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_collect_into_method() {
+        let code =
+            "fn foo(v: Vec<i32>) { let mut buf = Vec::new(); v.iter().collect_into(&mut buf); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            !iterator_issues.is_empty(),
+            "应检测到 .collect_into() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s149_iterator_methods_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); v.collect_into(&mut Vec::new()); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 149 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 149: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s149_issues() {
+        let code = "fn foo(v: Vec<i32>) { v.iter(); v.try_fold(0, |a, b| a + b); v.try_for_each(|x| Ok(())); v.is_sorted(); v.collect_into(&mut Vec::new()); }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s149_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert!(
+            s149_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 149 Iterator 导入问题: {:?}",
+            s149_issues
+        );
+    }
+
+    // ===== Session 149: 混合 S148+S149 trait 方法验证 =====
+
+    #[test]
+    fn test_mixed_s148_s149_iterator_methods() {
+        let code = "fn foo(v: Vec<i32>, s: &str) { v.iter(); v.iter_mut(); s.lines(); v.try_fold(0, |a, b| a + b); v.is_sorted(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应包含 Iterator 导入: {}",
             result
         );
     }

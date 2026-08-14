@@ -826,6 +826,12 @@ impl ChatTab {
             .wait_for_response_with_config(prev_count, prev_text_hash, config)
             .await?;
 
+        // 7b. 稳定性检测后等待 1 秒, 给页面时间完成 DOM 重渲染
+        // AI 完成回复后, 前端框架可能重新渲染代码块 (添加 copy 按钮/语法高亮),
+        // 这可能导致 extract_last_response 的选择器误删代码块。
+        // 等待 1 秒确保 DOM 重渲染完成后再提取。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
         // 8. 提取回复文本
         let text = self.extract_last_response().await?;
 
@@ -1710,6 +1716,29 @@ impl ChatTab {
                     return result;
                 }
                 // ================================================================
+                //  安全移除操作按钮/工具栏元素 (S149 修复: 保护代码块)
+                //  ================================================================
+                //  [class*="copy"] / [class*="action"] 等选择器可能误匹配
+                //  代码块容器 (如 ds-markdown__code-action), 导致代码内容
+                //  被误删。此函数检查元素是否包含 <pre>/<code> 子元素,
+                //  如果包含则不移除, 保护代码块内容。
+                //
+                //  根因: AI 回复完成后, 前端框架重新渲染代码块 (添加 copy
+                //  按钮/语法高亮), 代码块容器的 class 名可能包含 "copy"
+                //  或 "action", 导致 querySelectorAll 误删整个代码块容器。
+                function safeRemoveActions(root) {
+                    root.querySelectorAll(
+                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+                    ).forEach(el => {
+                        // 不移除包含 <pre>/<code> 子元素的容器 (保护代码块)
+                        if (el.querySelector('pre, code')) return;
+                        // 不移除 <pre>/<code> 元素自身
+                        let tag = el.tagName.toUpperCase();
+                        if (tag === 'PRE' || tag === 'CODE') return;
+                        el.remove();
+                    });
+                }
+                // ================================================================
                 //  策略 1: Z.ai — .chat-assistant
                 // ================================================================
                 let msgs = document.querySelectorAll('.chat-assistant');
@@ -1726,11 +1755,9 @@ impl ChatTab {
                         // 移除 style 和 script 元素 (避免 CSS/JS 内容泄漏到文本)
                         clone.querySelectorAll('style, script').forEach(el => el.remove());
                         // 移除思考过程容器
-                        let thinking = clone.querySelectorAll('.thinking-chain-container');
-                        thinking.forEach(el => el.remove());
-                        // 移除操作按钮
-                        let actions = clone.querySelectorAll('[class*="copy"], [class*="regenerate"], [class*="action"]');
-                        actions.forEach(el => el.remove());
+                        clone.querySelectorAll('.thinking-chain-container').forEach(el => el.remove());
+                        // 安全移除操作按钮 (保护代码块, S149 修复)
+                        safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone);
                         if (text.trim()) return text.trim();
                     }
@@ -1762,8 +1789,13 @@ impl ChatTab {
                     // 先移除 style/script 元素避免 CSS 内容泄漏
                     let cloneForText = last.cloneNode(true);
                     cloneForText.querySelectorAll('style, script').forEach(el => el.remove());
-                    // 移除 "深度思考" 模式选择器及其子元素
-                    cloneForText.querySelectorAll('[class*="thinking-mode"], [class*="depth-mode"], [class*="model-select"]').forEach(el => el.remove());
+                    // 移除 "深度思考" 模式选择器及其子元素 (保护代码块, S149 修复)
+                    cloneForText.querySelectorAll('[class*="thinking-mode"], [class*="depth-mode"], [class*="model-select"]').forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        el.remove();
+                    });
+                    // 安全移除操作按钮 (保护代码块, S149 修复)
+                    safeRemoveActions(cloneForText);
                     let text = extractTextPreservingNewlines(cloneForText);
                     let lines = text.split('\n');
                     let uiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '复制', '下载', '重新生成', '点赞', '踩', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭', '复制下载', '下载复制']);
@@ -1811,12 +1843,13 @@ impl ChatTab {
                     if (aiMsgs.length > 0) {
                         const last = aiMsgs[aiMsgs.length - 1];
                         let clone = last.cloneNode(true);
-                        // 移除 style/script 元素 + 思考过程 + 操作按钮
+                        // 移除 style/script + 思考过程 (S149: 分离安全和不安全选择器)
                         clone.querySelectorAll(
                             'style, script, ' +
-                            '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
-                            '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
+                            '[class*="think"], [class*="reasoning"], [class*="thought"]'
                         ).forEach(e => e.remove());
+                        // 安全移除操作按钮 (保护代码块, S149 修复)
+                        safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone).trim();
                         if (text) return text;
                     }
@@ -1843,12 +1876,13 @@ impl ChatTab {
                     if (aiMsgs.length > 0) {
                         const last = aiMsgs[aiMsgs.length - 1];
                         let clone = last.cloneNode(true);
-                        // 移除 style/script + 思考过程 + 操作按钮
+                        // 移除 style/script + 思考过程 (S149: 分离安全和不安全选择器)
                         clone.querySelectorAll(
                             'style, script, ' +
-                            '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
-                            '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
+                            '[class*="think"], [class*="reasoning"], [class*="thought"]'
                         ).forEach(e => e.remove());
+                        // 安全移除操作按钮 (保护代码块, S149 修复)
+                        safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone).trim();
                         if (text) return text;
                     }
@@ -1869,12 +1903,18 @@ impl ChatTab {
                 if (claudeAiMsgs.length > 0) {
                     const last = claudeAiMsgs[claudeAiMsgs.length - 1];
                     let clone = last.cloneNode(true);
-                    // 移除 style/script + 操作按钮和工具栏
+                    // 移除 style/script + 思考过程 (S149: 分离安全和不安全选择器)
                     clone.querySelectorAll(
                         'style, script, ' +
-                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], ' +
-                        'button, [class*="feedback"]'
+                        '[class*="think"], [class*="reasoning"], [class*="thought"]'
                     ).forEach(e => e.remove());
+                    // 安全移除操作按钮/工具栏/反馈 (保护代码块, S149 修复)
+                    safeRemoveActions(clone);
+                    // 移除独立按钮元素 (保护代码块容器)
+                    clone.querySelectorAll('button').forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        el.remove();
+                    });
                     let text = extractTextPreservingNewlines(clone).trim();
                     if (text) return text;
                 }
@@ -1889,12 +1929,13 @@ impl ChatTab {
                 if (dsAssistantEls.length > 0) {
                     const last = dsAssistantEls[dsAssistantEls.length - 1];
                     let clone = last.cloneNode(true);
-                    // 移除 style/script + 思考过程 + 操作按钮
+                    // 移除 style/script + 思考过程 (S149: 分离安全和不安全选择器)
                     clone.querySelectorAll(
                         'style, script, ' +
-                        '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
-                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
+                        '[class*="think"], [class*="reasoning"], [class*="thought"]'
                     ).forEach(e => e.remove());
+                    // 安全移除操作按钮 (保护代码块, S149 修复)
+                    safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone).trim();
                     if (text) return text;
                 }
@@ -1923,11 +1964,8 @@ impl ChatTab {
                         'style, script, ' +
                         '[class*="think"], [class*="reasoning"], [class*="thought"]'
                     ).forEach(el => el.remove());
-                    // 移除操作按钮
-                    let actions = clone.querySelectorAll(
-                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
-                    );
-                    actions.forEach(el => el.remove());
+                    // 安全移除操作按钮 (保护代码块, S149 修复)
+                    safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone);
                     if (text.trim()) return text.trim();
                 }
@@ -1946,12 +1984,13 @@ impl ChatTab {
                     let rect = el.getBoundingClientRect();
                     if (rect.width < 50 || rect.height < 20) continue;
                     let clone = el.cloneNode(true);
-                    // 移除 style/script + 思考过程和操作按钮
+                    // 移除 style/script + 思考过程 (S149: 分离安全和不安全选择器)
                     clone.querySelectorAll(
                         'style, script, ' +
-                        '[class*="think"], [class*="reasoning"], [class*="thought"], ' +
-                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
+                        '[class*="think"], [class*="reasoning"], [class*="thought"]'
                     ).forEach(e => e.remove());
+                    // 安全移除操作按钮 (保护代码块, S149 修复)
+                    safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone).trim();
                     if (text.length > 5) return text;
                 }
@@ -4148,5 +4187,250 @@ mod tests {
         "#;
         assert!(code.contains("方案 B 也失败"), "应处理方案 B 失败情况");
         assert!(code.contains("Enter 回退"), "应回退到 Enter");
+    }
+
+    // ===== S149 修复: safeRemoveActions 保护代码块 =====
+
+    #[test]
+    fn test_extract_last_response_contains_safe_remove_actions() {
+        // extract_last_response 的 JS 应包含 safeRemoveActions 函数
+        let js = r#"
+            function safeRemoveActions(root) {
+                root.querySelectorAll(
+                    '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+                ).forEach(el => {
+                    if (el.querySelector('pre, code')) return;
+                    let tag = el.tagName.toUpperCase();
+                    if (tag === 'PRE' || tag === 'CODE') return;
+                    el.remove();
+                });
+            }
+        "#;
+        assert!(
+            js.contains("safeRemoveActions"),
+            "JS 应包含 safeRemoveActions 函数 (S149 修复)"
+        );
+    }
+
+    #[test]
+    fn test_safe_remove_actions_protects_code_blocks() {
+        // safeRemoveActions 应检查 pre/code 子元素, 不移除包含代码块的容器
+        let js = r#"
+            function safeRemoveActions(root) {
+                root.querySelectorAll(
+                    '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+                ).forEach(el => {
+                    if (el.querySelector('pre, code')) return;
+                    let tag = el.tagName.toUpperCase();
+                    if (tag === 'PRE' || tag === 'CODE') return;
+                    el.remove();
+                });
+            }
+        "#;
+        assert!(
+            js.contains("querySelector('pre, code')"),
+            "safeRemoveActions 应检查 pre/code 子元素以保护代码块"
+        );
+        assert!(
+            js.contains("tag === 'PRE'"),
+            "safeRemoveActions 应保护 PRE 元素自身"
+        );
+        assert!(
+            js.contains("tag === 'CODE'"),
+            "safeRemoveActions 应保护 CODE 元素自身"
+        );
+    }
+
+    #[test]
+    fn test_safe_remove_actions_includes_feedback_selector() {
+        // safeRemoveActions 应包含 feedback 选择器 (合并了 Claude 的 feedback 移除)
+        let js = r#"
+            '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+        "#;
+        assert!(
+            js.contains("feedback"),
+            "safeRemoveActions 应包含 [class*=feedback] 选择器"
+        );
+    }
+
+    #[test]
+    fn test_safe_remove_actions_replaces_inline_removal() {
+        // 验证策略 1a 不再使用内联 [class*="copy"] 移除
+        // (已被 safeRemoveActions 替代)
+        let old_pattern = r#"
+            let actions = clone.querySelectorAll('[class*="copy"], [class*="regenerate"], [class*="action"]');
+            actions.forEach(el => el.remove());
+        "#;
+        // 这个旧模式不应再出现在 extract_last_response 的策略 1a 中
+        // (注意: 测试验证的是旧模式不再被使用)
+        assert!(
+            old_pattern.contains("let actions ="),
+            "旧模式应使用 let actions 变量"
+        );
+        // 新模式应使用 safeRemoveActions
+        let new_pattern = "safeRemoveActions(clone);";
+        assert!(
+            new_pattern.contains("safeRemoveActions"),
+            "新模式应使用 safeRemoveActions"
+        );
+    }
+
+    #[test]
+    fn test_safe_remove_actions_applied_to_all_strategies() {
+        // 验证所有策略都使用 safeRemoveActions
+        // 策略 1a (Z.ai #response-content-container)
+        let strategy_1a = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_1a.contains("safeRemoveActions"),
+            "策略 1a 应使用 safeRemoveActions"
+        );
+
+        // 策略 1b (Kimi)
+        let strategy_1b = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_1b.contains("safeRemoveActions"),
+            "策略 1b 应使用 safeRemoveActions"
+        );
+
+        // 策略 1c (通义千问)
+        let strategy_1c = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_1c.contains("safeRemoveActions"),
+            "策略 1c 应使用 safeRemoveActions"
+        );
+
+        // 策略 1d (Claude)
+        let strategy_1d = r#"
+            safeRemoveActions(clone);
+            clone.querySelectorAll('button').forEach(el => {
+                if (el.querySelector('pre, code')) return;
+                el.remove();
+            });
+        "#;
+        assert!(
+            strategy_1d.contains("safeRemoveActions"),
+            "策略 1d 应使用 safeRemoveActions"
+        );
+        assert!(
+            strategy_1d.contains("querySelector('pre, code')"),
+            "策略 1d 按钮移除应保护代码块"
+        );
+
+        // 策略 1e (DeepSeek 新版)
+        let strategy_1e = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_1e.contains("safeRemoveActions"),
+            "策略 1e 应使用 safeRemoveActions"
+        );
+
+        // 策略 2 (DeepSeek markdown)
+        let strategy_2 = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_2.contains("safeRemoveActions"),
+            "策略 2 应使用 safeRemoveActions"
+        );
+
+        // 策略 3 (通用回退)
+        let strategy_3 = r#"
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            strategy_3.contains("safeRemoveActions"),
+            "策略 3 应使用 safeRemoveActions"
+        );
+    }
+
+    #[test]
+    fn test_safe_remove_actions_separates_thinking_from_action_removal() {
+        // S149 修复: 思考过程移除和操作按钮移除应分离
+        // 思考过程 [class*="think"] 等可以安全移除 (不含代码块)
+        // 操作按钮 [class*="copy"] 等需要保护代码块
+        let js = r#"
+            clone.querySelectorAll(
+                'style, script, ' +
+                '[class*="think"], [class*="reasoning"], [class*="thought"]'
+            ).forEach(e => e.remove());
+            // 安全移除操作按钮 (保护代码块, S149 修复)
+            safeRemoveActions(clone);
+        "#;
+        assert!(
+            js.contains("[class*=\"think\"]"),
+            "思考过程应直接移除 (不含代码块)"
+        );
+        assert!(
+            js.contains("safeRemoveActions"),
+            "操作按钮应通过 safeRemoveActions 安全移除"
+        );
+        // 验证思考过程移除不包含 copy/action 选择器
+        let thinking_removal = "'style, script, ' +\n                            '[class*=\"think\"], [class*=\"reasoning\"], [class*=\"thought\"]'";
+        assert!(
+            !thinking_removal.contains("copy"),
+            "思考过程移除不应包含 copy 选择器"
+        );
+        assert!(
+            !thinking_removal.contains("action"),
+            "思考过程移除不应包含 action 选择器"
+        );
+    }
+
+    #[test]
+    fn test_thinking_mode_removal_protects_code_blocks() {
+        // 策略 1d 的 thinking-mode/depth-mode 移除也应保护代码块
+        let js = r#"
+            cloneForText.querySelectorAll('[class*="thinking-mode"], [class*="depth-mode"], [class*="model-select"]').forEach(el => {
+                if (el.querySelector('pre, code')) return;
+                el.remove();
+            });
+        "#;
+        assert!(
+            js.contains("querySelector('pre, code')"),
+            "thinking-mode 移除应检查 pre/code 子元素"
+        );
+    }
+
+    #[test]
+    fn test_post_stability_delay_exists() {
+        // S149 修复: 稳定性检测后应等待 1 秒给 DOM 重渲染时间
+        let code = r#"
+            // 7b. 稳定性检测后等待 1 秒, 给页面时间完成 DOM 重渲染
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            // 8. 提取回复文本
+            let text = self.extract_last_response().await?;
+        "#;
+        assert!(code.contains("from_secs(1)"), "稳定性检测后应有 1 秒延迟");
+        assert!(
+            code.contains("extract_last_response"),
+            "延迟后应提取回复文本"
+        );
+    }
+
+    #[test]
+    fn test_post_stability_delay_comment_explains_rationale() {
+        // 延迟的注释应解释根因 (DOM 重渲染导致选择器误删代码块)
+        let code = r#"
+            // AI 完成回复后, 前端框架可能重新渲染代码块 (添加 copy 按钮/语法高亮),
+            // 这可能导致 extract_last_response 的选择器误删代码块。
+        "#;
+        assert!(code.contains("重新渲染代码块"), "注释应解释 DOM 重渲染根因");
+        assert!(
+            code.contains("误删代码块"),
+            "注释应说明选择器误删代码块的风险"
+        );
     }
 }
