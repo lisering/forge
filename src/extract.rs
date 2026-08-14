@@ -5948,6 +5948,21 @@ pub fn ensure_external_imports(content: &str) -> String {
         // ndarray-npy (Session 146)
         ("open_npz", "ndarray_npy"),
         ("save_npz", "ndarray_npy"),
+        // eframe (Session 147)
+        ("App", "eframe"),
+        ("Frame", "eframe"),
+        // egui (Session 147)
+        ("Context", "egui"),
+        ("Ui", "egui"),
+        // iced (Session 147)
+        ("Application", "iced"),
+        ("Command", "iced"),
+        // druid (Session 147)
+        ("AppDelegate", "druid"),
+        ("Widget", "druid::widget"),
+        // slint (Session 147)
+        ("ComponentHandle", "slint"),
+        ("Model", "slint"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -6446,6 +6461,14 @@ pub fn ensure_external_imports(content: &str) -> String {
         "rchunks",
         "as_chunks",
         "array_chunks",
+        // Session 147: .first() / .last() / .nth() / .next_back() / .rposition() / .rfold() / .rfind()
+        "first",
+        "last",
+        "nth",
+        "next_back",
+        "rposition",
+        "rfold",
+        "rfind",
     ];
     let mut s142_iterator_method_found = false;
     for &method_name in s142_iterator_methods {
@@ -7031,6 +7054,21 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         // ndarray-npy (Session 146)
         ("open_npz", "ndarray_npy"),
         ("save_npz", "ndarray_npy"),
+        // eframe (Session 147)
+        ("App", "eframe"),
+        ("Frame", "eframe"),
+        // egui (Session 147)
+        ("Context", "egui"),
+        ("Ui", "egui"),
+        // iced (Session 147)
+        ("Application", "iced"),
+        ("Command", "iced"),
+        // druid (Session 147)
+        ("AppDelegate", "druid"),
+        ("Widget", "druid::widget"),
+        // slint (Session 147)
+        ("ComponentHandle", "slint"),
+        ("Model", "slint"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -7600,6 +7638,14 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         "rchunks",
         "as_chunks",
         "array_chunks",
+        // Session 147: .first() / .last() / .nth() / .next_back() / .rposition() / .rfold() / .rfind()
+        "first",
+        "last",
+        "nth",
+        "next_back",
+        "rposition",
+        "rfold",
+        "rfind",
     ];
     let mut iterator_method_found = false;
     let mut iterator_method_line = 0;
@@ -22415,6 +22461,546 @@ fn main() {
         assert_eq!(
             count, 1,
             "已有 Iterator 导入不应重复添加 (.chunks): {}",
+            result
+        );
+    }
+
+    // ===== Session 147: ensure_external_imports eframe/egui/iced/druid/slint 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_eframe_app() {
+        let code = "fn foo(a: &mut App) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use eframe::App;"),
+            "应添加 eframe::App 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_eframe_frame() {
+        let code = "fn foo(f: &mut Frame) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use eframe::Frame;"),
+            "应添加 eframe::Frame 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_egui_context() {
+        let code = "fn foo(ctx: &Context) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use egui::Context;"),
+            "应添加 egui::Context 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_egui_ui() {
+        let code = "fn foo(ui: &mut Ui) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use egui::Ui;"),
+            "应添加 egui::Ui 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_iced_application() {
+        let code = "fn foo() -> Application { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use iced::Application;"),
+            "应添加 iced::Application 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_iced_command() {
+        let code = "fn foo() -> Command { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use iced::Command;"),
+            "应添加 iced::Command 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_druid_app_delegate() {
+        let code = "fn foo(d: &AppDelegate) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use druid::AppDelegate;"),
+            "应添加 druid::AppDelegate 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_druid_widget() {
+        let code = "fn foo(w: &dyn Widget) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use druid::widget::Widget;"),
+            "应添加 druid::widget::Widget 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_slint_component_handle() {
+        let code = "fn foo() -> ComponentHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use slint::ComponentHandle;"),
+            "应添加 slint::ComponentHandle 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_slint_model() {
+        let code = "fn foo() -> Model { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use slint::Model;"),
+            "应添加 slint::Model 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_eframe_full_path() {
+        let code = "fn foo(a: &mut eframe::App) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use eframe::App;"),
+            "全限定 eframe::App 路径不需要导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s147_multiple_merged() {
+        let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use eframe::App;"),
+            "应包含 eframe::App: {}",
+            result
+        );
+        assert!(
+            result.contains("use egui::Context;"),
+            "应包含 egui::Context: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s147_idempotent() {
+        let code = "fn foo() -> ComponentHandle { unimplemented!() }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "ensure_external_imports 应幂等 (S147 slint)");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s147_already_imported() {
+        let code = "use slint::ComponentHandle;\nfn foo() -> ComponentHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use slint::ComponentHandle;").count();
+        assert_eq!(
+            count, 1,
+            "已有 slint::ComponentHandle 导入不应重复添加: {}",
+            result
+        );
+    }
+
+    // ===== Session 147: ensure_external_imports .first()/.last()/.nth() 测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_first_method() {
+        let code = "fn foo(v: Vec<i32>) { v.first(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .first() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_last_method() {
+        let code = "fn foo(v: Vec<i32>) { v.last(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .last() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_nth_method() {
+        let code = "fn foo(v: Vec<i32>) { v.nth(0); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .nth() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_next_back_method() {
+        let code = "fn foo(v: Vec<i32>) { v.next_back(); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .next_back() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rposition_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rposition(|x| true); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .rposition() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rfold_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rfold(0, |a, b| a + b); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .rfold() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_rfind_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rfind(|x| true); }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应通过 .rfind() 添加 Iterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s147_iterator_already_imported() {
+        let code = "use std::iter::Iterator;\nfn foo(v: Vec<i32>) { v.first(); v.last(); }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::iter::Iterator;").count();
+        assert_eq!(
+            count, 1,
+            "已有 Iterator 导入不应重复添加 (.first/.last): {}",
+            result
+        );
+    }
+
+    // ===== Session 147: verify_imports eframe/egui/iced/druid/slint 测试 =====
+
+    #[test]
+    fn test_verify_imports_eframe_app_missing() {
+        let code = "fn foo(a: &mut App) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "App" && i.module_path == "eframe"),
+            "应检测到 eframe::App 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_egui_context_missing() {
+        let code = "fn foo(ctx: &Context) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Context" && i.module_path == "egui"),
+            "应检测到 egui::Context 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_iced_application_missing() {
+        let code = "fn foo() -> Application { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Application" && i.module_path == "iced"),
+            "应检测到 iced::Application 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_druid_app_delegate_missing() {
+        let code = "fn foo(d: &AppDelegate) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "AppDelegate" && i.module_path == "druid"),
+            "应检测到 druid::AppDelegate 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_slint_component_handle_missing() {
+        let code = "fn foo() -> ComponentHandle { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ComponentHandle" && i.module_path == "slint"),
+            "应检测到 slint::ComponentHandle 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_eframe_already_imported() {
+        let code = "use eframe::App;\nfn foo(a: &mut App) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "App" && i.module_path == "eframe"),
+            "已导入 eframe::App 不应报告: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_slint_model_missing() {
+        let code = "fn foo() -> Model { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Model" && i.module_path == "slint"),
+            "应检测到 slint::Model 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_egui_ui_missing() {
+        let code = "fn foo(ui: &mut Ui) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Ui" && i.module_path == "egui"),
+            "应检测到 egui::Ui 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_eframe_full_path() {
+        let code = "fn foo(a: &mut eframe::App) { unimplemented!() }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "App" && i.module_path == "eframe"),
+            "全限定 eframe::App 路径不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 147: verify_imports .first()/.last()/.nth() trait 方法测试 =====
+
+    #[test]
+    fn test_verify_imports_first_method() {
+        let code = "fn foo(v: Vec<i32>) { v.first(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .first() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_last_method() {
+        let code = "fn foo(v: Vec<i32>) { v.last(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .last() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_nth_method() {
+        let code = "fn foo(v: Vec<i32>) { v.nth(0); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .nth() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_next_back_method() {
+        let code = "fn foo(v: Vec<i32>) { v.next_back(); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .next_back() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rposition_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rposition(|x| true); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .rposition() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rfold_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rfold(0, |a, b| a + b); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .rfold() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_rfind_method() {
+        let code = "fn foo(v: Vec<i32>) { v.rfind(|x| true); }";
+        let issues = verify_imports(code);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Iterator" && i.module_path == "std::iter"),
+            "应检测到 .rfind() 触发 Iterator 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s147_iterator_methods_combined() {
+        let code = "fn foo(v: Vec<i32>) { v.first(); v.last(); v.nth(0); v.next_back(); v.rposition(|x| true); v.rfold(0, |a, b| a + b); v.rfind(|x| true); }";
+        let issues = verify_imports(code);
+        let iterator_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.type_name == "Iterator" && i.module_path == "std::iter")
+            .collect();
+        assert_eq!(
+            iterator_issues.len(),
+            1,
+            "多种 Session 147 Iterator 方法只应报告一次: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 147: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s147_issues() {
+        let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }\nfn bar() -> ComponentHandle { unimplemented!() }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s147_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "eframe"
+                    || i.module_path == "egui"
+                    || i.module_path == "iced"
+                    || i.module_path == "druid"
+                    || i.module_path == "slint"
+            })
+            .collect();
+        assert!(
+            s147_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 147 外部 crate 导入问题: {:?}",
+            s147_issues
+        );
+    }
+
+    // ===== Session 147: 混合 S146+S147 类型验证 =====
+
+    #[test]
+    fn test_mixed_s146_s147_types() {
+        let code = "fn foo() -> (Line, Display, VkHandle) { unimplemented!() }\nfn bar(a: &mut App, ctx: &Context) { unimplemented!() }\nfn baz() -> ComponentHandle { unimplemented!() }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use ratatui::text::Line;"),
+            "应包含 ratatui::text::Line: {}",
+            result
+        );
+        assert!(
+            result.contains("use glium::Display;"),
+            "应包含 glium::Display: {}",
+            result
+        );
+        assert!(
+            result.contains("use vulkano::VkHandle;"),
+            "应包含 vulkano::VkHandle: {}",
+            result
+        );
+        assert!(
+            result.contains("use eframe::App;"),
+            "应包含 eframe::App: {}",
+            result
+        );
+        assert!(
+            result.contains("use egui::Context;"),
+            "应包含 egui::Context: {}",
+            result
+        );
+        assert!(
+            result.contains("use slint::ComponentHandle;"),
+            "应包含 slint::ComponentHandle: {}",
             result
         );
     }

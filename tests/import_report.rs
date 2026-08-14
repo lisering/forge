@@ -1562,3 +1562,190 @@ fn test_import_report_json_markdown_consistency_s146() {
         );
     }
 }
+
+// ===== Session 147: JSON 报告 — eframe/egui/iced/druid/slint 测试 =====
+
+#[test]
+fn test_import_report_s147_json_eframe_egui_types() {
+    let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }\nfn bar(ui: &mut Ui) { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("App"), "JSON 应包含 App: {}", json);
+    assert!(json.contains("Context"), "JSON 应包含 Context: {}", json);
+    assert!(json.contains("Ui"), "JSON 应包含 Ui: {}", json);
+    assert!(json.contains("eframe"), "JSON 应包含 eframe: {}", json);
+    assert!(json.contains("egui"), "JSON 应包含 egui: {}", json);
+}
+
+#[test]
+fn test_import_report_s147_json_iced_druid_slint_types() {
+    let code =
+        "fn foo() -> (Application, Command) { unimplemented!() }\nfn bar(d: &AppDelegate) { unimplemented!() }\nfn baz() -> ComponentHandle { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(
+        json.contains("Application"),
+        "JSON 应包含 Application: {}",
+        json
+    );
+    assert!(json.contains("Command"), "JSON 应包含 Command: {}", json);
+    assert!(
+        json.contains("AppDelegate"),
+        "JSON 应包含 AppDelegate: {}",
+        json
+    );
+    assert!(
+        json.contains("ComponentHandle"),
+        "JSON 应包含 ComponentHandle: {}",
+        json
+    );
+    assert!(json.contains("iced"), "JSON 应包含 iced: {}", json);
+    assert!(json.contains("druid"), "JSON 应包含 druid: {}", json);
+    assert!(json.contains("slint"), "JSON 应包含 slint: {}", json);
+}
+
+// ===== Session 147: Markdown 报告 — eframe/egui/iced/druid/slint 测试 =====
+
+#[test]
+fn test_import_report_s147_md_eframe_egui_types() {
+    let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }\nfn bar(ui: &mut Ui) { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("App"), "Markdown 应包含 App: {}", md);
+    assert!(md.contains("Context"), "Markdown 应包含 Context: {}", md);
+    assert!(md.contains("eframe"), "Markdown 应包含 eframe: {}", md);
+    assert!(md.contains("egui"), "Markdown 应包含 egui: {}", md);
+}
+
+#[test]
+fn test_import_report_s147_md_iced_druid_slint_types() {
+    let code =
+        "fn foo() -> (Application, Command) { unimplemented!() }\nfn bar(d: &AppDelegate) { unimplemented!() }\nfn baz() -> ComponentHandle { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        md.contains("Application"),
+        "Markdown 应包含 Application: {}",
+        md
+    );
+    assert!(md.contains("Command"), "Markdown 应包含 Command: {}", md);
+    assert!(
+        md.contains("AppDelegate"),
+        "Markdown 应包含 AppDelegate: {}",
+        md
+    );
+    assert!(
+        md.contains("ComponentHandle"),
+        "Markdown 应包含 ComponentHandle: {}",
+        md
+    );
+    assert!(md.contains("iced"), "Markdown 应包含 iced: {}", md);
+    assert!(md.contains("druid"), "Markdown 应包含 druid: {}", md);
+    assert!(md.contains("slint"), "Markdown 应包含 slint: {}", md);
+}
+
+// ===== Session 147: ensure_external_imports 后无问题验证 =====
+
+#[test]
+fn test_import_report_after_ensure_external_no_s147_issues() {
+    let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }\nfn bar() -> ComponentHandle { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s147_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| {
+            i.module_path == "eframe"
+                || i.module_path == "egui"
+                || i.module_path == "iced"
+                || i.module_path == "druid"
+                || i.module_path == "slint"
+        })
+        .collect();
+    assert!(
+        s147_issues.is_empty(),
+        "ensure_external_imports 后不应有 Session 147 外部 crate 导入问题: {:?}",
+        s147_issues
+    );
+}
+
+// ===== Session 147: .first()/.last()/.nth() trait 方法报告 =====
+
+#[test]
+fn test_import_report_first_last_nth_methods() {
+    let code = "fn foo(v: Vec<i32>) { v.first(); v.last(); v.nth(0); v.next_back(); v.rposition(|x| true); v.rfold(0, |a, b| a + b); v.rfind(|x| true); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    // 这些 trait 方法需要 Iterator trait
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应检测到 Iterator trait 方法缺失导入: {}",
+        json
+    );
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应检测到 Iterator trait 方法缺失导入: {}",
+        md
+    );
+}
+
+// ===== Session 147: 多类型混合报告 (S146 + S147) =====
+
+#[test]
+fn test_import_report_mixed_s146_s147_types() {
+    let code = "fn foo() -> (Line, Display, VkHandle) { unimplemented!() }\nfn bar(a: &mut App, ctx: &Context) { unimplemented!() }\nfn baz() -> ComponentHandle { unimplemented!() }\nfn qux(v: Vec<i32>) { v.first(); v.rfind(|x| true); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &[
+        "Line",
+        "Display",
+        "VkHandle",
+        "App",
+        "Context",
+        "ComponentHandle",
+        "Iterator",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
+
+// ===== Session 147: JSON / Markdown 双格式一致性 (S146 + S147) =====
+
+#[test]
+fn test_import_report_json_markdown_consistency_s147() {
+    let code = "fn foo(a: &mut App) { unimplemented!() }\nfn bar() -> (Application, Command) { unimplemented!() }\nfn baz() -> ComponentHandle { unimplemented!() }\nfn qux(v: Vec<i32>) { v.first(); v.last(); v.rfind(|x| true); }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    // 双格式应包含相同的关键类型
+    for type_name in &[
+        "App",
+        "Application",
+        "Command",
+        "ComponentHandle",
+        "Iterator",
+        "eframe",
+        "iced",
+        "slint",
+    ] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}

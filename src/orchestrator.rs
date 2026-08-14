@@ -256,13 +256,135 @@ impl VersionManager {
         workspace.rollback_to_known_good()
     }
 
-    /// 从截断文件中恢复 — 尝试用 known_good 版本替换截断的 AI 输出 (Session 146)
+    /// 从截断文件中提取有效前缀 (Session 147)
+    ///
+    /// 当 AI 输出被截断时, 前半部分通常是有效的。此函数通过逐行截断方式
+    /// 找到最大的有效前缀 — 即括号配对的代码片段。
+    ///
+    /// 算法: 从后向前逐行删除, 每次检查剩余部分是否括号配对。
+    /// 如果找到有效前缀 (至少有代码内容), 返回该前缀。
+    /// 如果无法找到有效前缀, 返回 None。
+    fn find_valid_prefix(content: &str) -> Option<String> {
+        use crate::extract::validate_rust_braces;
+
+        // 空内容返回 None
+        if content.is_empty() {
+            return None;
+        }
+
+        // 检查是否至少有代码 (不能是空或只有注释)
+        let has_code = content.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//")
+        });
+        if !has_code {
+            return None;
+        }
+
+        // 如果整体已经是有效的, 直接返回
+        if validate_rust_braces(content).is_none() {
+            return Some(content.to_string());
+        }
+
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return None;
+        }
+
+        // 从后向前逐行删除, 寻找有效前缀
+        for cut in (1..=lines.len()).rev() {
+            let prefix = lines[..cut].join("\n");
+            // 需要 prefix 至少有一些代码 (不能是空或只有注释)
+            let prefix_has_code = prefix.lines().any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with("//")
+            });
+            if prefix_has_code && validate_rust_braces(&prefix).is_none() {
+                // 找到有效前缀
+                // 追加换行以保持格式
+                return Some(format!("{}\n", prefix));
+            }
+        }
+
+        None
+    }
+
+    /// 合并截断的有效前缀与 known_good 后缀 (Session 147)
+    ///
+    /// 尝试找到一个合理的合并点:
+    /// 1. 在截断前缀中找到最后一个非空非注释行
+    /// 2. 在 known_good 中搜索该行作为合并锚点
+    /// 3. 如果找到匹配, 截取 known_good 从该行之后的内容作为后缀
+    /// 4. 如果找不到合适边界, 回退到全量 known_good 替换
+    fn merge_partial_content(truncated_prefix: &str, kg_content: &str) -> String {
+        let prefix_lines: Vec<&str> = truncated_prefix.lines().collect();
+        let kg_lines: Vec<&str> = kg_content.lines().collect();
+
+        if prefix_lines.is_empty() || kg_lines.is_empty() {
+            return kg_content.to_string();
+        }
+
+        // 找到截断前缀最后一个有意义的代码行作为合并锚点
+        // 只使用看起来像完整语句的行 (以 ; } 或 { 结尾) 或函数签名行
+        let mut last_anchor_line_idx = None;
+        for (i, line) in prefix_lines.iter().enumerate().rev() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            // 只用看起来像完整语句的行作为锚点
+            if trimmed.ends_with(';')
+                || trimmed.ends_with('}')
+                || trimmed.ends_with('{')
+                || trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("struct ")
+                || trimmed.starts_with("enum ")
+                || trimmed.starts_with("impl ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("mod ")
+                || trimmed.starts_with("trait ")
+            {
+                last_anchor_line_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = last_anchor_line_idx {
+            let search_line = prefix_lines[idx];
+            // 在 known_good 中搜索该行
+            for (kg_idx, kg_line) in kg_lines.iter().enumerate() {
+                if kg_line.trim() == search_line.trim() {
+                    // 找到匹配行, 截取 known_good 从下一行开始的内容
+                    if kg_idx + 1 < kg_lines.len() {
+                        let kg_suffix: Vec<&str> = kg_lines[(kg_idx + 1)..].to_vec();
+                        let merged =
+                            format!("{}\n{}", truncated_prefix.trim_end(), kg_suffix.join("\n"));
+                        return merged;
+                    }
+                }
+            }
+        }
+
+        // 回退: 全量 known_good 替换
+        kg_content.to_string()
+    }
+
+    /// 从截断文件中恢复 — 部分恢复或全量恢复 (Session 146 + 147)
     ///
     /// 当 `detect_truncated_files` 在最终轮次仍检测到截断文件时, 此方法:
     /// 1. 获取 known_good 快照 ID
     /// 2. 对每个截断文件, 尝试从 known_good 快照目录读取对应文件
-    /// 3. 如果 known_good 版本通过括号配对检查, 用 known_good 版本替换截断的 AI 输出
-    /// 4. 返回恢复后的文件列表和恢复的文件数
+    /// 3. **Session 147 增强**: 首先尝试从截断的 AI 输出中提取有效前缀,
+    ///    与 known_good 后半部分合并 (部分恢复), 保留 AI 最新修改
+    /// 4. 如果部分恢复失败, 回退到全量 known_good 替换 (Session 146 行为)
+    /// 5. 返回恢复后的文件列表和恢复的文件数
+    ///
+    /// 部分恢复策略 (Session 147):
+    /// - 提取截断内容的有效前缀 (逐行截断找到括号配对点)
+    /// - 在 known_good 中找到匹配的代码行作为合并点
+    /// - 合并: 截断前缀 + known_good 后缀
+    /// - 验证合并结果括号配对
     ///
     /// 如果没有 known_good 快照, 或快照中不包含对应文件, 保持 AI 输出不变。
     ///
@@ -325,19 +447,52 @@ impl VersionManager {
                         // 验证 known_good 版本的括号配对
                         // validate_rust_braces 返回 None 表示格式正常
                         if validate_rust_braces(&kg_content).is_none() {
-                            println!(
-                                "    🔄 文件 {} 从 known_good 快照 #{} 恢复 ({} 字符 → {} 字符)",
-                                file.path,
-                                kg_id,
-                                file.content.len(),
-                                kg_content.len()
-                            );
-                            result_files.push(crate::extract::ExtractedFile {
-                                path: file.path.clone(),
-                                content: kg_content,
-                                language: String::new(),
-                            });
-                            recovered_count += 1;
+                            // Session 147: 首先尝试部分恢复
+                            // 提取截断 AI 输出的有效前缀
+                            let mut recovered = false;
+
+                            if let Some(valid_prefix) = Self::find_valid_prefix(&file.content) {
+                                // 尝试合并截断前缀与 known_good 后缀
+                                let merged =
+                                    Self::merge_partial_content(&valid_prefix, &kg_content);
+
+                                // 验证合并结果
+                                if validate_rust_braces(&merged).is_none()
+                                    && merged.len() > valid_prefix.len()
+                                {
+                                    println!(
+                                        "    🔄 文件 {} 部分恢复 (截断前缀 {} 字符 + known_good 后缀 → {} 字符, 原始 {} 字符)",
+                                        file.path,
+                                        valid_prefix.len(),
+                                        merged.len(),
+                                        file.content.len()
+                                    );
+                                    result_files.push(crate::extract::ExtractedFile {
+                                        path: file.path.clone(),
+                                        content: merged,
+                                        language: String::new(),
+                                    });
+                                    recovered_count += 1;
+                                    recovered = true;
+                                }
+                            }
+
+                            if !recovered {
+                                // 回退: 全量 known_good 替换 (Session 146 行为)
+                                println!(
+                                    "    🔄 文件 {} 从 known_good 快照 #{} 全量恢复 ({} 字符 → {} 字符)",
+                                    file.path,
+                                    kg_id,
+                                    file.content.len(),
+                                    kg_content.len()
+                                );
+                                result_files.push(crate::extract::ExtractedFile {
+                                    path: file.path.clone(),
+                                    content: kg_content,
+                                    language: String::new(),
+                                });
+                                recovered_count += 1;
+                            }
                         } else {
                             println!(
                                 "    ⚠ 文件 {} 的 known_good 版本也不完整, 保持 AI 输出",
@@ -5901,6 +6056,160 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         // lib.rs 保持不变
         assert_eq!(recovered[1].content, "pub fn foo() -> i32 { 42 }");
+    }
+
+    // ===== Session 147: find_valid_prefix 测试 =====
+
+    #[test]
+    fn test_find_valid_prefix_complete_code() {
+        let code = "fn main() {\n    println!(\"hello\");\n}\n";
+        let prefix = VersionManager::find_valid_prefix(code);
+        assert!(prefix.is_some(), "完整代码应返回有效前缀");
+        assert_eq!(prefix.unwrap(), code, "完整代码的有效前缀就是自身");
+    }
+
+    #[test]
+    fn test_find_valid_prefix_truncated_code() {
+        // 多函数文件: 第一个函数完整, 第二个截断
+        let code = "fn first() -> i32 { 42 }\n\nfn second() -> i32 {\n    42\n";
+        let prefix = VersionManager::find_valid_prefix(code);
+        assert!(prefix.is_some(), "多函数截断代码应找到有效前缀");
+        let prefix_str = prefix.unwrap();
+        assert!(
+            prefix_str.contains("fn first()"),
+            "前缀应包含完整的第一个函数"
+        );
+        assert!(
+            !prefix_str.contains("fn second()"),
+            "前缀不应包含截断的第二个函数"
+        );
+    }
+
+    #[test]
+    fn test_find_valid_prefix_deeply_truncated() {
+        // 多函数: 第一个有嵌套结构且完整, 第二个截断
+        let code =
+            "fn foo() {\n    if true {\n        let x = { 42 };\n    }\n}\n\nfn bar() {\n    42\n";
+        let prefix = VersionManager::find_valid_prefix(code);
+        assert!(prefix.is_some(), "多函数嵌套截断代码应找到有效前缀");
+        let prefix_str = prefix.unwrap();
+        assert!(prefix_str.contains("fn foo()"), "前缀应包含完整的嵌套函数");
+    }
+
+    #[test]
+    fn test_find_valid_prefix_empty() {
+        let prefix = VersionManager::find_valid_prefix("");
+        assert!(prefix.is_none(), "空代码应返回 None");
+    }
+
+    #[test]
+    fn test_find_valid_prefix_only_comments() {
+        let code = "// only comments\n// nothing else\n";
+        let prefix = VersionManager::find_valid_prefix(code);
+        assert!(prefix.is_none(), "只有注释的代码应返回 None");
+    }
+
+    // ===== Session 147: merge_partial_content 测试 =====
+
+    #[test]
+    fn test_merge_partial_content_matching_line() {
+        let prefix = "fn foo() -> i32 {\n    let x = 42;\n";
+        let kg_content = "fn foo() -> i32 {\n    let x = 42;\n    // some comment\n}\n";
+        let merged = VersionManager::merge_partial_content(prefix, kg_content);
+        assert!(merged.contains("fn foo()"), "合并结果应包含 fn foo()");
+        assert!(
+            merged.contains("// some comment"),
+            "合并结果应包含 known_good 后缀"
+        );
+    }
+
+    #[test]
+    fn test_merge_partial_content_no_match() {
+        // prefix 和 kg_content 的函数名完全不同, 且无共同语句行
+        let prefix = "fn unique_function() {\n    let y = 99;\n";
+        let kg_content = "fn different_function() {\n    let z = 0;\n}\n";
+        let merged = VersionManager::merge_partial_content(prefix, kg_content);
+        // 无匹配时回退到全量 known_good
+        assert_eq!(merged, kg_content, "无匹配时应回退到全量 known_good");
+    }
+
+    #[test]
+    fn test_merge_partial_content_empty_prefix() {
+        let kg_content = "fn foo() {}\n";
+        let merged = VersionManager::merge_partial_content("", kg_content);
+        assert_eq!(merged, kg_content, "空前缀应回退到全量 known_good");
+    }
+
+    #[test]
+    fn test_merge_partial_content_multiple_functions() {
+        let prefix = "fn first() {}\n\nfn second() -> i32 {\n    let x = 42;\n";
+        let kg_content =
+            "fn first() {}\n\nfn second() -> i32 {\n    let x = 42;\n    // known_good comment\n}\n";
+        let merged = VersionManager::merge_partial_content(prefix, kg_content);
+        assert!(merged.contains("fn first()"), "合并结果应包含 first()");
+        assert!(merged.contains("fn second()"), "合并结果应包含 second()");
+        assert!(
+            merged.contains("// known_good comment"),
+            "合并结果应包含 known_good 后缀"
+        );
+    }
+
+    // ===== Session 147: recover_from_truncation 部分恢复测试 =====
+
+    #[test]
+    fn test_recover_from_truncation_partial_recovery() {
+        let (_dir, ws) = make_ws_with_files();
+        VersionManager::save_known_good(&ws).unwrap();
+
+        // 截断的 AI 输出: 前半部分是有效的, 但后半部分被截断
+        let truncated = "fn main() {\n    println!(\"hello\");\n";
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: truncated.to_string(),
+            language: String::new(),
+        }];
+        let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
+        assert_eq!(count, 1, "应恢复 1 个文件");
+        // 恢复后的内容应该通过括号配对检查
+        assert!(
+            crate::extract::validate_rust_braces(&recovered[0].content).is_none(),
+            "恢复后的内容应通过括号配对检查"
+        );
+    }
+
+    #[test]
+    fn test_recover_from_truncation_partial_with_modified_code() {
+        let (_dir, ws) = make_ws_with_files();
+        VersionManager::save_known_good(&ws).unwrap();
+
+        // AI 修改了 main.rs 的前半部分, 但输出被截断
+        let truncated = "fn main() {\n    println!(\"modified\");\n    // new comment\n";
+        let files = vec![crate::extract::ExtractedFile {
+            path: "src/main.rs".to_string(),
+            content: truncated.to_string(),
+            language: String::new(),
+        }];
+        let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
+        assert_eq!(count, 1, "应恢复 1 个文件");
+        assert!(
+            crate::extract::validate_rust_braces(&recovered[0].content).is_none(),
+            "恢复后的内容应通过括号配对检查"
+        );
+    }
+
+    #[test]
+    fn test_recover_from_truncation_non_rs_file_kept() {
+        let (_dir, ws) = make_ws_with_files();
+        VersionManager::save_known_good(&ws).unwrap();
+
+        let files = vec![crate::extract::ExtractedFile {
+            path: "Cargo.toml".to_string(),
+            content: "[package]\nname = \"test\"".to_string(),
+            language: String::new(),
+        }];
+        let (recovered, count) = VersionManager::recover_from_truncation(&ws, files).unwrap();
+        assert_eq!(count, 0, "非 .rs 文件不应恢复");
+        assert_eq!(recovered[0].content, "[package]\nname = \"test\"");
     }
 
     // ===== 截断 JSON 恢复测试 =====

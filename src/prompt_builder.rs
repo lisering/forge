@@ -231,6 +231,12 @@ impl SystemPrompt {
 "❌ 禁止: 调用 .chunks()/.windows()/.rchunks()/.as_chunks()/.array_chunks() 但未导入 use std::iter::Iterator; (Session 146 trait 方法检测)\n",
         );
         prompt.push_str(
+"❌ 禁止: 使用 App/Frame (eframe) / Context/Ui (egui) / Application/Command (iced) / AppDelegate/Widget (druid) / ComponentHandle/Model (slint) 等外部 crate 类型但未导入 use eframe::... / use egui::... / use iced::... / use druid::... / use slint::... (Session 147)\n",
+        );
+        prompt.push_str(
+"❌ 禁止: 调用 .first()/.last()/.nth()/.next_back()/.rposition()/.rfold()/.rfind() 但未导入 use std::iter::Iterator; (Session 147 trait 方法检测)\n",
+        );
+        prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
 
@@ -1553,6 +1559,66 @@ mod tests {
         assert!(
             prompt.contains(".array_chunks()"),
             "系统 prompt 应包含 .array_chunks() trait 方法检测约束 (Session 146)"
+        );
+    }
+
+    // ===== Session 147: 导入约束测试 =====
+
+    #[test]
+    fn test_build_contains_s147_external_crate_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("eframe"),
+            "系统 prompt 应包含 eframe 导入约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains("egui"),
+            "系统 prompt 应包含 egui 导入约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains("iced"),
+            "系统 prompt 应包含 iced 导入约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains("druid"),
+            "系统 prompt 应包含 druid 导入约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains("slint"),
+            "系统 prompt 应包含 slint 导入约束 (Session 147)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s147_trait_method_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains(".first()"),
+            "系统 prompt 应包含 .first() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".last()"),
+            "系统 prompt 应包含 .last() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".nth()"),
+            "系统 prompt 应包含 .nth() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".next_back()"),
+            "系统 prompt 应包含 .next_back() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".rposition()"),
+            "系统 prompt 应包含 .rposition() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".rfold()"),
+            "系统 prompt 应包含 .rfold() trait 方法检测约束 (Session 147)"
+        );
+        assert!(
+            prompt.contains(".rfind()"),
+            "系统 prompt 应包含 .rfind() trait 方法检测约束 (Session 147)"
         );
     }
 

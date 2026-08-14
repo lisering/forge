@@ -103,6 +103,19 @@ fn build_missing_external_code(n: usize) -> String {
             "VulkanObject",
             "fn f() -> VulkanObject { unimplemented!() }",
         ),
+        // Session 147 types
+        ("App", "fn f(a: &mut App) { unimplemented!() }"),
+        ("Frame", "fn f(f: &mut Frame) { unimplemented!() }"),
+        ("Context", "fn f(ctx: &Context) { unimplemented!() }"),
+        ("Ui", "fn f(ui: &mut Ui) { unimplemented!() }"),
+        ("Application", "fn f() -> Application { unimplemented!() }"),
+        ("Command", "fn f() -> Command { unimplemented!() }"),
+        ("AppDelegate", "fn f(d: &AppDelegate) { unimplemented!() }"),
+        (
+            "ComponentHandle",
+            "fn f() -> ComponentHandle { unimplemented!() }",
+        ),
+        ("Model", "fn f() -> Model { unimplemented!() }"),
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -162,13 +175,17 @@ fn build_complete_imports_code(n: usize) -> String {
         "use plotters::chart::ChartContext;",
         // Session 146 imports
         "use ratatui::text::Line;",
-        "use ratatui::layout::Layout;",
-        "use ratatui::widgets::Block;",
         "use crossterm::execute;",
         "use tui::Frame;",
         "use glium::Display;",
         "use vulkano::VkHandle;",
         "use ndarray_npy::open_npz;",
+        // Session 147 imports
+        "use eframe::App;",
+        "use egui::Context;",
+        "use iced::Application;",
+        "use druid::AppDelegate;",
+        "use slint::ComponentHandle;",
     ];
     let mut code = String::new();
     for imp in &imports {
@@ -249,6 +266,14 @@ fn build_trait_method_heavy_code(n: usize) -> String {
         ".chunks(2)",
         ".windows(3)",
         ".rchunks(4)",
+        // Session 147 Iterator trait methods
+        ".first()",
+        ".last()",
+        ".nth(0)",
+        ".next_back()",
+        ".rposition(|x| true)",
+        ".rfold(0, |a, b| a + b)",
+        ".rfind(|x| true)",
     ];
     let mut code = String::new();
     for i in 0..n {
@@ -627,6 +652,27 @@ fn edge_cases(c: &mut Criterion) {
     group.bench_function("s146_iterator_methods", |b| {
         b.iter(|| {
             let code = "fn foo(v: Vec<i32>) { v.chunks(2); v.windows(3); v.rchunks(4); }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
+    // Session 147: eframe/egui/iced/druid/slint 类型检测
+    group.bench_function("s147_external_types", |b| {
+        b.iter(|| {
+            let code = "fn foo(a: &mut App, ctx: &Context) { unimplemented!() }\n\
+                 fn bar() -> (Application, Command) { unimplemented!() }\n\
+                 fn baz(d: &AppDelegate) { unimplemented!() }\n\
+                 fn qux() -> ComponentHandle { unimplemented!() }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 147: .first()/.last()/.nth()/.next_back()/.rposition()/.rfold()/.rfind() trait 方法检测
+    group.bench_function("s147_iterator_methods", |b| {
+        b.iter(|| {
+            let code = "fn foo(v: Vec<i32>) { v.first(); v.last(); v.nth(0); v.next_back(); v.rposition(|x| true); v.rfold(0, |a, b| a + b); v.rfind(|x| true); }";
             let issues = verify_imports(black_box(code));
             black_box(issues);
         });
