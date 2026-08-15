@@ -258,7 +258,7 @@ impl SystemPrompt {
   "❌ 禁止: 在测试函数中混合返回类型 — 如果测试函数返回 Result<T, E>, 则所有 ? 操作符必须操作 Result 类型, 不能操作 Option 类型 (Session 150 测试代码质量)\n",
   );
         prompt.push_str(
-  "❌ 禁止: 使用 FromStr/Write/Deref/DerefMut/Index/IndexMut/Drop/FusedIterator/DoubleEndedIterator/ExactSizeIterator 等 trait 但未导入 use std::str::FromStr / use std::fmt::Write / use std::ops::{...} / use std::iter::{...} (Session 150 导入检测)\n",
+  "❌ 禁止: 使用 FromStr/Write/Deref/DerefMut/Index/IndexMut/Drop/FusedIterator/DoubleEndedIterator/ExactSizeIterator/Error 等 trait 但未导入 use std::str::FromStr / use std::fmt::Write / use std::ops::{...} / use std::iter::{...} / use std::error::Error (Session 150+S152 导入检测)\n",
   );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
@@ -1805,6 +1805,19 @@ mod tests {
         assert!(
             prompt.contains("FusedIterator"),
             "系统 prompt 应包含 FusedIterator 导入约束 (Session 150)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s152_error_trait_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Error"),
+            "系统 prompt 应包含 Error 导入约束 (S152)"
+        );
+        assert!(
+            prompt.contains("std::error::Error"),
+            "系统 prompt 应包含 use std::error::Error 导入路径 (S152)"
         );
     }
 }

@@ -5564,6 +5564,8 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("FusedIterator", "std::iter"),
         ("DoubleEndedIterator", "std::iter"),
         ("ExactSizeIterator", "std::iter"),
+        // S152: std::error::Error — needed when using Box<dyn Error> or impl Error
+        ("Error", "std::error"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -6022,6 +6024,8 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("FusedIterator", "std::iter"),
         ("DoubleEndedIterator", "std::iter"),
         ("ExactSizeIterator", "std::iter"),
+        // S152: std::error::Error — needed when using Box<dyn Error> or impl Error
+        ("Error", "std::error"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -7189,6 +7193,8 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("FusedIterator", "std::iter"),
         ("DoubleEndedIterator", "std::iter"),
         ("ExactSizeIterator", "std::iter"),
+        // S152: std::error::Error — needed when using Box<dyn Error> or impl Error
+        ("Error", "std::error"),
     ];
 
     for &(type_name, module_path) in type_modules {

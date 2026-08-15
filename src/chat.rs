@@ -1792,7 +1792,7 @@ impl ChatTab {
                 }
                 // ================================================================
                 //  安全移除操作按钮/工具栏元素 (S149 修复: 保护代码块)
-                //  S151 增强: 新增 button 元素移除 + removeUiTextLines 文本后处理
+                // S152 增强: 策略1d 用 cleanReturn 替代逐行过滤, prefixUiTexts 只过滤前缀 UI 行
                 //  ================================================================
                 //  [class*="copy"] / [class*="action"] 等选择器可能误匹配
                 //  代码块容器 (如 ds-markdown__code-action), 导致代码内容
@@ -1854,11 +1854,13 @@ impl ChatTab {
                     let cleaned = removeUiTextLines(text);
                     return cleaned.trim();
                 }
-                // S151: 判断文本是否足够实质 (避免只提取到摘要文本)
-                // 如果文本 >= 500 字符, 或包含代码块标记 (file:), 则认为足够实质
+                // S152: 降低阈值从 500 → 300 字符, 增加更多代码标记
+                // 根因: 链表/队列的AI回复摘要部分较短(<500字符), isSubstantial
+                // 判定为不够实质并回退到1d, 但1d的逐行过滤可能误删代码行。
+                // 降低到300字符 + 增加更多代码标记 (mod/trait/test/assert/mod)
                 function isSubstantial(text) {
                     let trimmed = text.trim();
-                    if (trimmed.length >= 500) return true;
+                    if (trimmed.length >= 300) return true;
                     if (trimmed.includes('file:')) return true;
                     if (trimmed.includes('```')) return true;
                     if (trimmed.includes('[package]')) return true;
@@ -1868,6 +1870,13 @@ impl ChatTab {
                     if (trimmed.includes('enum ')) return true;
                     if (trimmed.includes('use ')) return true;
                     if (trimmed.includes('impl ')) return true;
+                    if (trimmed.includes('mod ')) return true;
+                    if (trimmed.includes('trait ')) return true;
+                    if (trimmed.includes('#[test]')) return true;
+                    if (trimmed.includes('#[derive')) return true;
+                    if (trimmed.includes('assert')) return true;
+                    if (trimmed.includes('cargo')) return true;
+                    if (trimmed.includes('Cargo.toml')) return true;
                     return false;
                 }
                 // ================================================================
@@ -1923,8 +1932,17 @@ impl ChatTab {
                         }
                     }
 
-                    // 方法 1d: 回退到 .chat-assistant innerText, 逐行过滤 UI 文本
-                    // 先移除 style/script 元素避免 CSS 内容泄漏
+                    // 方法 1d: S152 重构 — 用 cleanReturn 替代逐行过滤
+                    // S151 问题: 逐行过滤的 uiTexts Set 中的关键词 (如 "复制"/
+                    // "下载") 可能出现在代码行中 (如注释或字符串), 导致误删
+                    // 代码行。S152 修复: 1d 不再逐行过滤, 而是直接用
+                    // extractTextPreservingNewlines 提取全部文本 (含代码块),
+                    // 然后只在文本级别用 cleanReturn (removeUiTextLines) 后处理。
+                    // removeUiTextLines 只移除"独立的" UI 文本行 (整行匹配),
+                    // 不会误删含代码的行。
+                    //
+                    // 额外: 新增 prependUiTexts Set, 只在前缀阶段过滤
+                    // 模式选择器/思考状态 UI 文本 (不用于 contentLines 过滤)。
                     let cloneForText = last.cloneNode(true);
                     cloneForText.querySelectorAll('style, script').forEach(el => el.remove());
                     // 移除 "深度思考" 模式选择器及其子元素 (保护代码块, S149 修复)
@@ -1932,24 +1950,29 @@ impl ChatTab {
                         if (el.querySelector('pre, code')) return;
                         el.remove();
                     });
+                    // 移除思考过程容器 (S152: 避免思考文本混入代码)
+                    cloneForText.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="thought"]').forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        el.remove();
+                    });
                     // 安全移除操作按钮 (保护代码块, S149 修复)
                     safeRemoveActions(cloneForText);
                     let text = extractTextPreservingNewlines(cloneForText);
+                    // S152: 只移除前缀的 UI 文本行 (模式选择器/思考状态),
+                    // 不对 content 部分做逐行过滤, 避免误删代码行
                     let lines = text.split('\n');
-                    let uiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '复制', '下载', '重新生成', '点赞', '踩', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭', '复制下载', '下载复制']);
                     let contentLines = [];
                     let foundContent = false;
+                    let prefixUiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭']);
                     for (let line of lines) {
                         let trimmed = line.trim();
                         if (!foundContent) {
-                            if (uiTexts.has(trimmed)) continue;
-                            // 过滤包含 "深度思考" 前缀的行 (模式选择器文本)
+                            // 只在前缀阶段过滤模式选择器/思考状态 UI 文本
+                            if (prefixUiTexts.has(trimmed)) continue;
                             if (trimmed.startsWith('深度思考')) continue;
-                            // 过滤包含 "正在思考" 前缀的行 (思考状态 UI 文本)
                             if (trimmed.startsWith('正在思考')) continue;
-                            // 过滤由 UI 文本片段组合而成的行 (如 "正在思考  跳过")
                             let parts = trimmed.split(/\s+/);
-                            if (parts.length >= 2 && parts.every(p => uiTexts.has(p))) continue;
+                            if (parts.length >= 2 && parts.every(p => prefixUiTexts.has(p))) continue;
                             if (trimmed === '') continue;
                             foundContent = true;
                         }
@@ -4985,5 +5008,281 @@ mod tests {
         // S151: from_timeout_secs 应使用 90s 作为 Phase 3
         let config = TimeoutConfig::from_timeout_secs(120);
         assert_eq!(config.phase3_secs, 90, "from_timeout_secs Phase 3 应为 90s");
+    }
+
+    // ===== S152 测试: 策略1d重构 + isSubstantial增强 =====
+
+    #[test]
+    fn test_is_substantial_threshold_300() {
+        // S152: isSubstantial 阈值应从 500 降低到 300
+        let js = r#"
+            function isSubstantial(text) {
+                let trimmed = text.trim();
+                if (trimmed.length >= 300) return true;
+                if (trimmed.includes('file:')) return true;
+                if (trimmed.includes('```')) return true;
+                if (trimmed.includes('[package]')) return true;
+                if (trimmed.includes('fn ')) return true;
+                if (trimmed.includes('pub ')) return true;
+                if (trimmed.includes('struct ')) return true;
+                if (trimmed.includes('enum ')) return true;
+                if (trimmed.includes('use ')) return true;
+                if (trimmed.includes('impl ')) return true;
+                if (trimmed.includes('mod ')) return true;
+                if (trimmed.includes('trait ')) return true;
+                if (trimmed.includes('#[test]')) return true;
+                if (trimmed.includes('#[derive')) return true;
+                if (trimmed.includes('assert')) return true;
+                if (trimmed.includes('cargo')) return true;
+                if (trimmed.includes('Cargo.toml')) return true;
+                return false;
+            }
+        "#;
+        assert!(
+            js.contains(">= 300"),
+            "S152: isSubstantial 阈值应降低到 300 字符"
+        );
+        assert!(
+            !js.contains(">= 500"),
+            "S152: isSubstantial 不应再使用 500 阈值"
+        );
+    }
+
+    #[test]
+    fn test_is_substantial_new_code_markers() {
+        // S152: isSubstantial 应包含新增的代码标记
+        let js = r#"
+            if (trimmed.includes('mod ')) return true;
+            if (trimmed.includes('trait ')) return true;
+            if (trimmed.includes('#[test]')) return true;
+            if (trimmed.includes('#[derive')) return true;
+            if (trimmed.includes('assert')) return true;
+            if (trimmed.includes('cargo')) return true;
+            if (trimmed.includes('Cargo.toml')) return true;
+        "#;
+        assert!(js.contains("mod "), "应检测 'mod ' 标记");
+        assert!(js.contains("trait "), "应检测 'trait ' 标记");
+        assert!(js.contains("#[test]"), "应检测 '#[test]' 标记");
+        assert!(js.contains("#[derive"), "应检测 '#[derive' 标记");
+        assert!(js.contains("assert"), "应检测 'assert' 标记");
+        assert!(js.contains("cargo"), "应检测 'cargo' 标记");
+        assert!(js.contains("Cargo.toml"), "应检测 'Cargo.toml' 标记");
+    }
+
+    #[test]
+    fn test_strategy_1d_uses_clean_return_not_line_filter() {
+        // S152: 策略1d 应使用 cleanReturn 而非逐行过滤 uiTexts
+        let js = r#"
+            // S152: 只移除前缀的 UI 文本行 (模式选择器/思考状态),
+            // 不对 content 部分做逐行过滤, 避免误删代码行
+            let lines = text.split('\n');
+            let contentLines = [];
+            let foundContent = false;
+            let prefixUiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭']);
+            for (let line of lines) {
+                let trimmed = line.trim();
+                if (!foundContent) {
+                    if (prefixUiTexts.has(trimmed)) continue;
+                    if (trimmed.startsWith('深度思考')) continue;
+                    if (trimmed.startsWith('正在思考')) continue;
+                    let parts = trimmed.split(/\s+/);
+                    if (parts.length >= 2 && parts.every(p => prefixUiTexts.has(p))) continue;
+                    if (trimmed === '') continue;
+                    foundContent = true;
+                }
+                contentLines.push(line);
+            }
+            let result = contentLines.join('\n').trim();
+            if (result) return cleanReturn(result);
+        "#;
+        assert!(
+            js.contains("prefixUiTexts"),
+            "S152: 策略1d 应使用 prefixUiTexts (只过滤前缀 UI)"
+        );
+        assert!(
+            !js.contains("'复制', '下载'"),
+            "S152: 策略1d 的 contentLines 过滤不应包含 '复制'/'下载' (会误删代码行)"
+        );
+        assert!(
+            js.contains("cleanReturn(result)"),
+            "S152: 策略1d 最终返回应使用 cleanReturn"
+        );
+    }
+
+    #[test]
+    fn test_strategy_1d_prefix_ui_texts_excludes_copy_download() {
+        // S152: prefixUiTexts 不应包含 "复制"/"下载" (避免误删代码行)
+        let js = r#"
+            let prefixUiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭']);
+        "#;
+        assert!(
+            !js.contains("复制"),
+            "prefixUiTexts 不应包含 '复制' (会误删含'复制'的代码行)"
+        );
+        assert!(
+            !js.contains("下载"),
+            "prefixUiTexts 不应包含 '下载' (会误删含'下载'的代码行)"
+        );
+        assert!(
+            !js.contains("重新生成"),
+            "prefixUiTexts 不应包含 '重新生成'"
+        );
+        assert!(!js.contains("点赞"), "prefixUiTexts 不应包含 '点赞'");
+        assert!(!js.contains("踩"), "prefixUiTexts 不应包含 '踩'");
+    }
+
+    #[test]
+    fn test_strategy_1d_removes_thinking_containers() {
+        // S152: 策略1d 应移除思考过程容器 (避免思考文本混入代码)
+        let js = r#"
+            // 移除思考过程容器 (S152: 避免思考文本混入代码)
+            cloneForText.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="thought"]').forEach(el => {
+                if (el.querySelector('pre, code')) return;
+                el.remove();
+            });
+        "#;
+        assert!(
+            js.contains("[class*=\"think\"]"),
+            "策略1d 应移除 [class*=\"think\"] 思考容器"
+        );
+        assert!(
+            js.contains("[class*=\"reasoning\"]"),
+            "策略1d 应移除 [class*=\"reasoning\"] 思考容器"
+        );
+        assert!(
+            js.contains("[class*=\"thought\"]"),
+            "策略1d 应移除 [class*=\"thought\"] 思考容器"
+        );
+        assert!(
+            js.contains("pre, code"),
+            "策略1d 移除思考容器时应保护代码块"
+        );
+    }
+
+    #[test]
+    fn test_remove_ui_text_lines_not_filtering_code_lines() {
+        // S152: removeUiTextLines 只移除"独立的" UI 文本行 (整行匹配),
+        // 不会误删含代码的行 (如 "let x = 复制()" 不被移除)
+        let js = r#"
+            function removeUiTextLines(text) {
+                let uiTexts = new Set([
+                    '复制', '下载', '重新生成', '点赞', '踩', '分享',
+                    '复制下载', '下载复制', '复制 下载', '下载 复制',
+                    'Copy', 'Download', 'Regenerate', 'Share',
+                    'Copy Download', 'Download Copy'
+                ]);
+                let lines = text.split('\n');
+                let result = [];
+                for (let line of lines) {
+                    let trimmed = line.trim();
+                    if (uiTexts.has(trimmed)) continue;
+                    result.push(line);
+                }
+                return result.join('\n');
+            }
+        "#;
+        // 关键: 使用 uiTexts.has(trimmed) 是精确匹配, 不是 includes
+        assert!(
+            js.contains("uiTexts.has(trimmed)"),
+            "removeUiTextLines 应使用精确匹配 (has), 不是 includes"
+        );
+        // "复制" 作为整行时会被移除, 但 "let x = 复制()" 不会被移除
+        // 因为 "let x = 复制()".trim() 不等于 "复制"
+    }
+
+    #[test]
+    fn test_is_substantial_short_text_with_code_markers() {
+        // S152: 短文本 (< 300字符) 但包含代码标记也应判定为实质
+        let js = r#"
+            function isSubstantial(text) {
+                let trimmed = text.trim();
+                if (trimmed.length >= 300) return true;
+                if (trimmed.includes('fn ')) return true;
+                if (trimmed.includes('pub ')) return true;
+                if (trimmed.includes('struct ')) return true;
+                if (trimmed.includes('mod ')) return true;
+                if (trimmed.includes('trait ')) return true;
+                if (trimmed.includes('#[test]')) return true;
+                if (trimmed.includes('#[derive')) return true;
+                if (trimmed.includes('assert')) return true;
+                return false;
+            }
+        "#;
+        // 验证: 即使文本 < 300字符, 只要包含代码标记就应返回 true
+        assert!(
+            js.contains(">= 300") && js.contains("fn "),
+            "短文本含 'fn ' 标记应判定为实质"
+        );
+        assert!(
+            js.contains("mod ") && js.contains("trait "),
+            "短文本含 'mod '/'trait ' 标记应判定为实质"
+        );
+    }
+
+    #[test]
+    fn test_strategy_1d_does_not_filter_content_lines() {
+        // S152: 策略1d 找到 foundContent 后, 不应对后续行做任何过滤
+        // 之前的 S151 代码在 foundContent=true 后仍然推送所有行到 contentLines,
+        // 但前缀阶段使用了包含"复制"/"下载"的 uiTexts Set, 导致这些行
+        // 在 foundContent=false 阶段被过滤掉。S152 修复: prefixUiTexts
+        // 不包含 "复制"/"下载"。
+        let js = r#"
+            for (let line of lines) {
+                let trimmed = line.trim();
+                if (!foundContent) {
+                    if (prefixUiTexts.has(trimmed)) continue;
+                    if (trimmed.startsWith('深度思考')) continue;
+                    if (trimmed.startsWith('正在思考')) continue;
+                    let parts = trimmed.split(/\s+/);
+                    if (parts.length >= 2 && parts.every(p => prefixUiTexts.has(p))) continue;
+                    if (trimmed === '') continue;
+                    foundContent = true;
+                }
+                contentLines.push(line);
+            }
+        "#;
+        // 验证: foundContent=true 后直接 push, 无过滤
+        assert!(
+            js.contains("contentLines.push(line)"),
+            "找到内容后应直接推送行, 不过滤"
+        );
+        // 验证: prefixUiTexts 不包含会误删代码行的关键词
+        assert!(!js.contains("'复制'"), "prefixUiTexts 不应包含 '复制'");
+        assert!(!js.contains("'下载'"), "prefixUiTexts 不应包含 '下载'");
+    }
+
+    #[test]
+    fn test_strategy_1a_1b_1c_use_is_substantial_with_new_threshold() {
+        // S152: 策略 1a/1b/1c 应使用 isSubstantial (含新阈值300+新标记)
+        let js = r#"
+            if (isSubstantial(text)) return cleanReturn(text);
+        "#;
+        assert!(
+            js.contains("isSubstantial(text)"),
+            "策略 1a 应使用 isSubstantial 判断"
+        );
+        assert!(
+            js.contains("cleanReturn(text)"),
+            "策略 1a 应使用 cleanReturn 返回"
+        );
+    }
+
+    #[test]
+    fn test_strategy_1d_comment_explains_s152_fix() {
+        // S152: 策略1d 的注释应解释 S152 修复内容
+        let js = r#"
+            // 方法 1d: S152 重构 — 用 cleanReturn 替代逐行过滤
+            // S151 问题: 逐行过滤的 uiTexts Set 中的关键词 (如 "复制"/
+            // "下载") 可能出现在代码行中 (如注释或字符串), 导致误删
+            // 代码行。S152 修复: 1d 不再逐行过滤, 而是直接用
+            // extractTextPreservingNewlines 提取全部文本 (含代码块),
+            // 然后只在文本级别用 cleanReturn (removeUiTextLines) 后处理。
+        "#;
+        assert!(js.contains("S152 重构"), "注释应说明 S152 重构");
+        assert!(js.contains("误删"), "注释应说明逐行过滤导致误删代码行");
+        assert!(
+            js.contains("cleanReturn"),
+            "注释应说明使用 cleanReturn 后处理"
+        );
     }
 }

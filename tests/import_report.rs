@@ -2142,3 +2142,129 @@ fn test_import_report_json_markdown_consistency_s150() {
         );
     }
 }
+
+// ===== Session 152: std::error::Error trait 报告 (Box<dyn Error>) =====
+
+#[test]
+fn test_import_report_json_s152_error() {
+    let code = "fn foo() -> Box<dyn Error> { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Error"), "JSON 应包含 Error: {}", json);
+    assert!(
+        json.contains("std::error"),
+        "JSON 应包含 std::error 模块路径: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_s152_error() {
+    let code = "fn foo() -> Box<dyn Error> { unimplemented!() }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("Error"), "Markdown 应包含 Error: {}", md);
+    assert!(
+        md.contains("std::error"),
+        "Markdown 应包含 std::error 模块路径: {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_ensure_s152_error() {
+    let code = "fn foo() -> Box<dyn Error> { unimplemented!() }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let error_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "Error" && i.module_path == "std::error")
+        .collect();
+    assert!(
+        error_issues.is_empty(),
+        "ensure_external_imports 后不应有 Error 导入问题: {:?}",
+        error_issues
+    );
+    assert!(
+        fixed.contains("use std::error::Error;"),
+        "应添加 use std::error::Error; 导入: {}",
+        fixed
+    );
+}
+
+#[test]
+fn test_import_report_s152_error_already_imported() {
+    let code = "use std::error::Error;\nfn foo() -> Box<dyn Error> { unimplemented!() }";
+    let issues = verify_imports(code);
+    let error_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "Error" && i.module_path == "std::error")
+        .collect();
+    assert!(
+        error_issues.is_empty(),
+        "已有 std::error::Error 导入不应报告: {:?}",
+        error_issues
+    );
+}
+
+#[test]
+fn test_import_report_s152_error_full_path_no_issue() {
+    let code = "fn foo() -> Box<dyn std::error::Error> { unimplemented!() }";
+    let issues = verify_imports(code);
+    let error_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "Error" && i.module_path == "std::error")
+        .collect();
+    assert!(
+        error_issues.is_empty(),
+        "全限定路径 std::error::Error 不应报告: {:?}",
+        error_issues
+    );
+}
+
+#[test]
+fn test_import_report_mixed_s150_s152_types() {
+    let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nfn foo() -> Box<dyn Error> { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        json.contains("Deref"),
+        "JSON 应包含 Deref (混合 S150+S152): {}",
+        json
+    );
+    assert!(
+        json.contains("Error"),
+        "JSON 应包含 Error (混合 S150+S152): {}",
+        json
+    );
+    assert!(
+        md.contains("Deref"),
+        "Markdown 应包含 Deref (混合 S150+S152): {}",
+        md
+    );
+    assert!(
+        md.contains("Error"),
+        "Markdown 应包含 Error (混合 S150+S152): {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_json_markdown_consistency_s152() {
+    let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nfn foo() -> Box<dyn Error> { unimplemented!() }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["Deref", "Error"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
