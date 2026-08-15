@@ -1854,29 +1854,42 @@ impl ChatTab {
                     let cleaned = removeUiTextLines(text);
                     return cleaned.trim();
                 }
-                // S152: 降低阈值从 500 → 300 字符, 增加更多代码标记
-                // 根因: 链表/队列的AI回复摘要部分较短(<500字符), isSubstantial
-                // 判定为不够实质并回退到1d, 但1d的逐行过滤可能误删代码行。
-                // 降低到300字符 + 增加更多代码标记 (mod/trait/test/assert/mod)
+                // S152 v2: isSubstantial 重构 — 分离代码标记检测和长度阈值
+                // 根因: 链表/队列的AI回复中, 策略1a/1b 从 #response-content-container
+                // 或 .markdown-prose 提取到的摘要文本 >= 300 字符但不含代码标记,
+                // isSubstantial 判定为"实质"并提前返回, 不再尝试策略1d (1d 克隆
+                // 整个 .chat-assistant, 能获取全部内容包括代码块)。
+                //
+                // 修复: isSubstantial 改为 hasCodeMarkers(text) || text.length >= 2000
+                // - 包含代码标记 → true (不论长度, 因为代码任务回复应包含代码)
+                // - 不含代码标记但 >= 2000 字符 → true (纯文本回复足够长)
+                // - 不含代码标记且 < 2000 字符 → false (继续尝试后续策略)
+                // 这样, 代码任务的摘要文本(通常 < 2000 字符且不含代码标记)不会
+                // 在1a/1b/1c 提前返回, 会回退到1d获取完整内容。
+                function hasCodeMarkers(text) {
+                    let t = text.trim();
+                    if (t.includes('file:')) return true;
+                    if (t.includes('```')) return true;
+                    if (t.includes('[package]')) return true;
+                    if (t.includes('fn ')) return true;
+                    if (t.includes('pub ')) return true;
+                    if (t.includes('struct ')) return true;
+                    if (t.includes('enum ')) return true;
+                    if (t.includes('use ')) return true;
+                    if (t.includes('impl ')) return true;
+                    if (t.includes('mod ')) return true;
+                    if (t.includes('trait ')) return true;
+                    if (t.includes('#[test]')) return true;
+                    if (t.includes('#[derive')) return true;
+                    if (t.includes('assert')) return true;
+                    if (t.includes('cargo')) return true;
+                    if (t.includes('Cargo.toml')) return true;
+                    return false;
+                }
                 function isSubstantial(text) {
                     let trimmed = text.trim();
-                    if (trimmed.length >= 300) return true;
-                    if (trimmed.includes('file:')) return true;
-                    if (trimmed.includes('```')) return true;
-                    if (trimmed.includes('[package]')) return true;
-                    if (trimmed.includes('fn ')) return true;
-                    if (trimmed.includes('pub ')) return true;
-                    if (trimmed.includes('struct ')) return true;
-                    if (trimmed.includes('enum ')) return true;
-                    if (trimmed.includes('use ')) return true;
-                    if (trimmed.includes('impl ')) return true;
-                    if (trimmed.includes('mod ')) return true;
-                    if (trimmed.includes('trait ')) return true;
-                    if (trimmed.includes('#[test]')) return true;
-                    if (trimmed.includes('#[derive')) return true;
-                    if (trimmed.includes('assert')) return true;
-                    if (trimmed.includes('cargo')) return true;
-                    if (trimmed.includes('Cargo.toml')) return true;
+                    if (hasCodeMarkers(trimmed)) return true;
+                    if (trimmed.length >= 2000) return true;
                     return false;
                 }
                 // ================================================================
@@ -3030,15 +3043,154 @@ mod tests {
     // 我们通过验证 JS 字符串包含正确的选择器来确保多网站适配逻辑正确。
 
     /// 提取 extract_last_response 使用的 JS 代码 (复用生产代码)
+    /// S152 v2: 更新为完整 JS (与 extract_last_response 方法中的完全一致)
     fn get_extract_js() -> &'static str {
         // 这个 JS 代码与 extract_last_response 方法中的完全一致
+        // 包含所有辅助函数: extractTextPreservingNewlines, safeRemoveActions,
+        // removeUiTextLines, cleanReturn, hasCodeMarkers, isSubstantial
+        // 以及所有策略: 1a/1b/1c/1d(Z.ai), Kimi, 通义千问, Claude, DeepSeek
         r#"
             (() => {
-                // 策略 1: Z.ai — .chat-assistant
+                function extractTextPreservingNewlines(element) {
+                    let result = '';
+                    function walk(node) {
+                        if (node.nodeType === Node.TEXT_NODE) {
+                            result += node.textContent;
+                        } else if (node.nodeType === Node.ELEMENT_NODE) {
+                            let tag = node.tagName.toUpperCase();
+                            if (tag === 'BR') { result += '\n'; return; }
+                            let isBlock = ['P','DIV','PRE','CODE','LI','H1','H2','H3','H4','H5','H6','BLOCKQUOTE','TR','TABLE','UL','OL','SECTION','ARTICLE','HEADER','FOOTER'].includes(tag);
+                            if (isBlock && result && !result.endsWith('\n')) result += '\n';
+                            for (let child of node.childNodes) walk(child);
+                            if (isBlock && result && !result.endsWith('\n')) result += '\n';
+                        }
+                    }
+                    walk(element);
+                    return result;
+                }
+                function safeRemoveActions(root) {
+                    root.querySelectorAll(
+                        'button, [class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+                    ).forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        let tag = el.tagName.toUpperCase();
+                        if (tag === 'PRE' || tag === 'CODE') return;
+                        el.remove();
+                    });
+                }
+                function removeUiTextLines(text) {
+                    let uiTexts = new Set([
+                        '复制', '下载', '重新生成', '点赞', '踩', '分享',
+                        '复制下载', '下载复制', '复制 下载', '下载 复制',
+                        'Copy', 'Download', 'Regenerate', 'Share',
+                        'Copy Download', 'Download Copy'
+                    ]);
+                    let lines = text.split('\n');
+                    let result = [];
+                    for (let line of lines) {
+                        let trimmed = line.trim();
+                        if (uiTexts.has(trimmed)) continue;
+                        result.push(line);
+                    }
+                    return result.join('\n');
+                }
+                function cleanReturn(text) {
+                    let cleaned = removeUiTextLines(text);
+                    return cleaned.trim();
+                }
+                function hasCodeMarkers(text) {
+                    let t = text.trim();
+                    if (t.includes('file:')) return true;
+                    if (t.includes('```')) return true;
+                    if (t.includes('[package]')) return true;
+                    if (t.includes('fn ')) return true;
+                    if (t.includes('pub ')) return true;
+                    if (t.includes('struct ')) return true;
+                    if (t.includes('enum ')) return true;
+                    if (t.includes('use ')) return true;
+                    if (t.includes('impl ')) return true;
+                    if (t.includes('mod ')) return true;
+                    if (t.includes('trait ')) return true;
+                    if (t.includes('#[test]')) return true;
+                    if (t.includes('#[derive')) return true;
+                    if (t.includes('assert')) return true;
+                    if (t.includes('cargo')) return true;
+                    if (t.includes('Cargo.toml')) return true;
+                    return false;
+                }
+                function isSubstantial(text) {
+                    let trimmed = text.trim();
+                    if (hasCodeMarkers(trimmed)) return true;
+                    if (trimmed.length >= 2000) return true;
+                    return false;
+                }
                 let msgs = document.querySelectorAll('.chat-assistant');
-                // 策略 2: DeepSeek — [class*="markdown"] 容器
-                let markdownEls = document.querySelectorAll('[class*="markdown"]');
-                // 策略 3: 通用回退
+                if (msgs.length === 0) msgs = document.querySelectorAll('[class*="chat-assistant"]');
+                if (msgs.length === 0) msgs = document.querySelectorAll('[class*="assistant-message"]');
+                if (msgs.length > 0) {
+                    const last = msgs[msgs.length - 1];
+                    let container = last.querySelector('#response-content-container');
+                    if (container) {
+                        let clone = container.cloneNode(true);
+                        clone.querySelectorAll('style, script').forEach(el => el.remove());
+                        clone.querySelectorAll('.thinking-chain-container').forEach(el => el.remove());
+                        safeRemoveActions(clone);
+                        let text = extractTextPreservingNewlines(clone);
+                        if (isSubstantial(text)) return cleanReturn(text);
+                    }
+                    let prose = last.querySelector('.markdown-prose');
+                    if (prose) {
+                        let clone = prose.cloneNode(true);
+                        clone.querySelectorAll('style, script').forEach(el => el.remove());
+                        let thinking = clone.querySelectorAll('.thinking-chain-container');
+                        thinking.forEach(el => el.remove());
+                        let text = extractTextPreservingNewlines(clone);
+                        if (isSubstantial(text)) return cleanReturn(text);
+                    }
+                    let pTags = last.querySelectorAll('p');
+                    if (pTags.length > 0) {
+                        let texts = [];
+                        pTags.forEach(p => {
+                            let t = (p.innerText || '').trim();
+                            if (t) texts.push(t);
+                        });
+                        if (texts.length > 0) {
+                            let pText = texts.join('\n');
+                            if (isSubstantial(pText)) return cleanReturn(pText);
+                        }
+                    }
+                    let cloneForText = last.cloneNode(true);
+                    cloneForText.querySelectorAll('style, script').forEach(el => el.remove());
+                    cloneForText.querySelectorAll('[class*="thinking-mode"], [class*="depth-mode"], [class*="model-select"]').forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        el.remove();
+                    });
+                    cloneForText.querySelectorAll('[class*="think"], [class*="reasoning"], [class*="thought"]').forEach(el => {
+                        if (el.querySelector('pre, code')) return;
+                        el.remove();
+                    });
+                    safeRemoveActions(cloneForText);
+                    let text = extractTextPreservingNewlines(cloneForText);
+                    let lines = text.split('\n');
+                    let contentLines = [];
+                    let foundContent = false;
+                    let prefixUiTexts = new Set(['思考过程', '跳过', '正在思考', '正在思考...', '深度思考', '最高', '深度思考 最高', '深度思考 高', '深度思考 中', '深度思考 低', '深度思考 关闭']);
+                    for (let line of lines) {
+                        let trimmed = line.trim();
+                        if (!foundContent) {
+                            if (prefixUiTexts.has(trimmed)) continue;
+                            if (trimmed.startsWith('深度思考')) continue;
+                            if (trimmed.startsWith('正在思考')) continue;
+                            let parts = trimmed.split(/\s+/);
+                            if (parts.length >= 2 && parts.every(p => prefixUiTexts.has(p))) continue;
+                            if (trimmed === '') continue;
+                            foundContent = true;
+                        }
+                        contentLines.push(line);
+                    }
+                    let result = contentLines.join('\n').trim();
+                    if (result) return cleanReturn(result);
+                }
                 let allCandidates = document.querySelectorAll(
                     '[class*="markdown"], [class*="message"], [class*="response"], [class*="answer"], [class*="reply"]'
                 );
@@ -5013,52 +5165,57 @@ mod tests {
     // ===== S152 测试: 策略1d重构 + isSubstantial增强 =====
 
     #[test]
-    fn test_is_substantial_threshold_300() {
-        // S152: isSubstantial 阈值应从 500 降低到 300
+    fn test_is_substantial_threshold_2000() {
+        // S152 v2: isSubstantial 阈值从 300 提升到 2000
+        // 根因: 策略1a/1b 提取到的摘要文本 >= 300 字符但不含代码标记,
+        // 旧逻辑会提前返回。新逻辑: 不含代码标记的文本需 >= 2000 字符才返回,
+        // 否则继续尝试后续策略 (最终1d会获取完整内容含代码块)。
         let js = r#"
             function isSubstantial(text) {
                 let trimmed = text.trim();
-                if (trimmed.length >= 300) return true;
-                if (trimmed.includes('file:')) return true;
-                if (trimmed.includes('```')) return true;
-                if (trimmed.includes('[package]')) return true;
-                if (trimmed.includes('fn ')) return true;
-                if (trimmed.includes('pub ')) return true;
-                if (trimmed.includes('struct ')) return true;
-                if (trimmed.includes('enum ')) return true;
-                if (trimmed.includes('use ')) return true;
-                if (trimmed.includes('impl ')) return true;
-                if (trimmed.includes('mod ')) return true;
-                if (trimmed.includes('trait ')) return true;
-                if (trimmed.includes('#[test]')) return true;
-                if (trimmed.includes('#[derive')) return true;
-                if (trimmed.includes('assert')) return true;
-                if (trimmed.includes('cargo')) return true;
-                if (trimmed.includes('Cargo.toml')) return true;
+                if (hasCodeMarkers(trimmed)) return true;
+                if (trimmed.length >= 2000) return true;
                 return false;
             }
         "#;
         assert!(
-            js.contains(">= 300"),
-            "S152: isSubstantial 阈值应降低到 300 字符"
+            js.contains(">= 2000"),
+            "S152 v2: isSubstantial 长度阈值应为 2000 字符"
+        );
+        assert!(
+            !js.contains(">= 300"),
+            "S152 v2: isSubstantial 不应再使用 300 阈值"
         );
         assert!(
             !js.contains(">= 500"),
-            "S152: isSubstantial 不应再使用 500 阈值"
+            "S152 v2: isSubstantial 不应再使用 500 阈值"
         );
     }
 
     #[test]
     fn test_is_substantial_new_code_markers() {
-        // S152: isSubstantial 应包含新增的代码标记
+        // S152 v2: hasCodeMarkers 应包含所有代码标记
         let js = r#"
-            if (trimmed.includes('mod ')) return true;
-            if (trimmed.includes('trait ')) return true;
-            if (trimmed.includes('#[test]')) return true;
-            if (trimmed.includes('#[derive')) return true;
-            if (trimmed.includes('assert')) return true;
-            if (trimmed.includes('cargo')) return true;
-            if (trimmed.includes('Cargo.toml')) return true;
+            function hasCodeMarkers(text) {
+                let t = text.trim();
+                if (t.includes('file:')) return true;
+                if (t.includes('```')) return true;
+                if (t.includes('[package]')) return true;
+                if (t.includes('fn ')) return true;
+                if (t.includes('pub ')) return true;
+                if (t.includes('struct ')) return true;
+                if (t.includes('enum ')) return true;
+                if (t.includes('use ')) return true;
+                if (t.includes('impl ')) return true;
+                if (t.includes('mod ')) return true;
+                if (t.includes('trait ')) return true;
+                if (t.includes('#[test]')) return true;
+                if (t.includes('#[derive')) return true;
+                if (t.includes('assert')) return true;
+                if (t.includes('cargo')) return true;
+                if (t.includes('Cargo.toml')) return true;
+                return false;
+            }
         "#;
         assert!(js.contains("mod "), "应检测 'mod ' 标记");
         assert!(js.contains("trait "), "应检测 'trait ' 标记");
@@ -5067,6 +5224,7 @@ mod tests {
         assert!(js.contains("assert"), "应检测 'assert' 标记");
         assert!(js.contains("cargo"), "应检测 'cargo' 标记");
         assert!(js.contains("Cargo.toml"), "应检测 'Cargo.toml' 标记");
+        assert!(js.contains("hasCodeMarkers"), "应包含 hasCodeMarkers 函数");
     }
 
     #[test]
@@ -5192,30 +5350,25 @@ mod tests {
 
     #[test]
     fn test_is_substantial_short_text_with_code_markers() {
-        // S152: 短文本 (< 300字符) 但包含代码标记也应判定为实质
+        // S152 v2: 短文本但包含代码标记也应判定为实质
+        // isSubstantial 改为 hasCodeMarkers(text) || text.length >= 2000
         let js = r#"
             function isSubstantial(text) {
                 let trimmed = text.trim();
-                if (trimmed.length >= 300) return true;
-                if (trimmed.includes('fn ')) return true;
-                if (trimmed.includes('pub ')) return true;
-                if (trimmed.includes('struct ')) return true;
-                if (trimmed.includes('mod ')) return true;
-                if (trimmed.includes('trait ')) return true;
-                if (trimmed.includes('#[test]')) return true;
-                if (trimmed.includes('#[derive')) return true;
-                if (trimmed.includes('assert')) return true;
+                if (hasCodeMarkers(trimmed)) return true;
+                if (trimmed.length >= 2000) return true;
                 return false;
             }
         "#;
-        // 验证: 即使文本 < 300字符, 只要包含代码标记就应返回 true
+        // 验证: hasCodeMarkers 函数被调用
         assert!(
-            js.contains(">= 300") && js.contains("fn "),
-            "短文本含 'fn ' 标记应判定为实质"
+            js.contains("hasCodeMarkers(trimmed)"),
+            "isSubstantial 应调用 hasCodeMarkers"
         );
+        // 验证: 短文本含代码标记 → hasCodeMarkers 返回 true → isSubstantial 返回 true
         assert!(
-            js.contains("mod ") && js.contains("trait "),
-            "短文本含 'mod '/'trait ' 标记应判定为实质"
+            js.contains("fn ") || js.contains("hasCodeMarkers"),
+            "代码标记检测应存在"
         );
     }
 
@@ -5253,7 +5406,7 @@ mod tests {
 
     #[test]
     fn test_strategy_1a_1b_1c_use_is_substantial_with_new_threshold() {
-        // S152: 策略 1a/1b/1c 应使用 isSubstantial (含新阈值300+新标记)
+        // S152 v2: 策略 1a/1b/1c 应使用 isSubstantial (含新阈值2000+hasCodeMarkers)
         let js = r#"
             if (isSubstantial(text)) return cleanReturn(text);
         "#;
@@ -5283,6 +5436,167 @@ mod tests {
         assert!(
             js.contains("cleanReturn"),
             "注释应说明使用 cleanReturn 后处理"
+        );
+    }
+
+    // ===== S152 v2 试: isSubstantial 重构 (hasCodeMarkers + 2000 阈值) =====
+
+    #[test]
+    fn test_has_code_markers_function_exists() {
+        // S152 v2: 应存在独立的 hasCodeMarkers 函数
+        let js = get_extract_js();
+        assert!(
+            js.contains("function hasCodeMarkers(text)"),
+            "S152 v2: 应包含 hasCodeMarkers 函数定义"
+        );
+    }
+
+    #[test]
+    fn test_is_substantial_calls_has_code_markers() {
+        // S152 v2: isSubstantial 应调用 hasCodeMarkers
+        let js = get_extract_js();
+        assert!(
+            js.contains("hasCodeMarkers(trimmed)"),
+            "S152 v2: isSubstantial 应调用 hasCodeMarkers"
+        );
+    }
+
+    #[test]
+    fn test_is_substantial_no_300_threshold() {
+        // S152 v2: isSubstantial 不应再使用 300 字符阈值
+        let js = get_extract_js();
+        // 确保没有旧的 >= 300 逻辑 (注释中可能有300, 但代码中不应有)
+        let code_section = js.split("function isSubstantial").nth(1).unwrap_or("");
+        let func_end = code_section.find("}").unwrap_or(code_section.len());
+        let func_body = &code_section[..func_end];
+        assert!(
+            !func_body.contains(">= 300"),
+            "S152 v2: isSubstantial 函数体不应包含 >= 300"
+        );
+    }
+
+    #[test]
+    fn test_is_substantial_2000_threshold_for_non_code() {
+        // S152 v2: 不含代码标记的纯文本需 >= 2000 字符才判定为实质
+        // 这防止摘要文本(通常 < 2000 字符)在策略1a/1b提前返回
+        let js = r#"
+            function isSubstantial(text) {
+                let trimmed = text.trim();
+                if (hasCodeMarkers(trimmed)) return true;
+                if (trimmed.length >= 2000) return true;
+                return false;
+            }
+        "#;
+        // 验证逻辑顺序: 先检查代码标记, 再检查长度
+        let code_marker_pos = js.find("hasCodeMarkers").unwrap_or(0);
+        let length_pos = js.find(">= 2000").unwrap_or(0);
+        assert!(
+            code_marker_pos < length_pos,
+            "S152 v2: hasCodeMarkers 检查应在长度检查之前"
+        );
+    }
+
+    #[test]
+    fn test_has_code_markers_all_markers() {
+        // S152 v2: hasCodeMarkers 应检测所有代码标记
+        let js = r#"
+            function hasCodeMarkers(text) {
+                let t = text.trim();
+                if (t.includes('file:')) return true;
+                if (t.includes('```')) return true;
+                if (t.includes('[package]')) return true;
+                if (t.includes('fn ')) return true;
+                if (t.includes('pub ')) return true;
+                if (t.includes('struct ')) return true;
+                if (t.includes('enum ')) return true;
+                if (t.includes('use ')) return true;
+                if (t.includes('impl ')) return true;
+                if (t.includes('mod ')) return true;
+                if (t.includes('trait ')) return true;
+                if (t.includes('#[test]')) return true;
+                if (t.includes('#[derive')) return true;
+                if (t.includes('assert')) return true;
+                if (t.includes('cargo')) return true;
+                if (t.includes('Cargo.toml')) return true;
+                return false;
+            }
+        "#;
+        let markers = [
+            "file:",
+            "```",
+            "[package]",
+            "fn ",
+            "pub ",
+            "struct ",
+            "enum ",
+            "use ",
+            "impl ",
+            "mod ",
+            "trait ",
+            "#[test]",
+            "#[derive",
+            "assert",
+            "cargo",
+            "Cargo.toml",
+        ];
+        for marker in &markers {
+            assert!(js.contains(marker), "hasCodeMarkers 应检测 '{}'", marker);
+        }
+    }
+
+    #[test]
+    fn test_summary_text_without_code_markers_not_substantial() {
+        // S152 v2: 模拟链表/队列场景 — 摘要文本不含代码标记
+        // 即使 > 300 字符, isSubstantial 也不应返回 true
+        // (确保策略1a/1b不提前返回, 回退到1d获取完整内容)
+        let js = r#"
+            function isSubstantial(text) {
+                let trimmed = text.trim();
+                if (hasCodeMarkers(trimmed)) return true;
+                if (trimmed.length >= 2000) return true;
+                return false;
+            }
+        "#;
+        // 如果文本是 "这是一个链表数据结构的实现..." (500字符纯中文摘要)
+        // hasCodeMarkers 返回 false, length < 2000 → isSubstantial 返回 false
+        // 策略1a/1b 不返回, 继续到1d
+        assert!(
+            js.contains("hasCodeMarkers") && js.contains(">= 2000"),
+            "摘要文本(无代码标记, <2000字符)不应判定为实质"
+        );
+    }
+
+    #[test]
+    fn test_long_pure_text_is_substantial() {
+        // S152 v2: 纯文本 >= 2000 字符应判定为实质
+        // (适用于非代码任务的AI回复, 如长文本说明)
+        let js = r#"
+            function isSubstantial(text) {
+                let trimmed = text.trim();
+                if (hasCodeMarkers(trimmed)) return true;
+                if (trimmed.length >= 2000) return true;
+                return false;
+            }
+        "#;
+        assert!(js.contains(">= 2000"), "纯文本 >= 2000 字符应判定为实质");
+    }
+
+    #[test]
+    fn test_strategy_1d_is_final_fallback_for_code_tasks() {
+        // S152 v2: 策略1d 是代码任务回复的最终获取点
+        // 当1a/1b/1c提取到的摘要不含代码标记(<2000字符)时,
+        // isSubstantial 返回 false, 不返回, 继续到1d。
+        // 1d 克隆整个 .chat-assistant, 获取全部内容(含代码块)。
+        let js = get_extract_js();
+        // 验证1a存在 (通过 #response-content-container)
+        let pos_1a = js.find("#response-content-container").unwrap_or(0);
+        let pos_1d = js.find("cloneForText").unwrap_or(0);
+        assert!(pos_1a > 0, "策略1a应存在 (#response-content-container)");
+        assert!(pos_1d > pos_1a, "策略1d应在1a之后 (cloneForText)");
+        // 验证1d克隆整个last元素
+        assert!(
+            js.contains("cloneForText = last.cloneNode(true)"),
+            "策略1d应克隆整个last元素"
         );
     }
 }

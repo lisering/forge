@@ -260,6 +260,9 @@ impl SystemPrompt {
         prompt.push_str(
   "❌ 禁止: 使用 FromStr/Write/Deref/DerefMut/Index/IndexMut/Drop/FusedIterator/DoubleEndedIterator/ExactSizeIterator/Error 等 trait 但未导入 use std::str::FromStr / use std::fmt::Write / use std::ops::{...} / use std::iter::{...} / use std::error::Error (Session 150+S152 导入检测)\n",
   );
+        prompt.push_str(
+  "❌ 禁止: 使用外部 crate (tracing/thiserror/serde/regex/chrono/tokio/reqwest/clap/uuid 等) 但未在 Cargo.toml [dependencies] 中添加对应依赖 — 使用 use tracing::... 时必须确保 Cargo.toml 中有 tracing = \"...\" (Session 152 v2 L2测试发现)\n",
+  );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1818,6 +1821,24 @@ mod tests {
         assert!(
             prompt.contains("std::error::Error"),
             "系统 prompt 应包含 use std::error::Error 导入路径 (S152)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s152_v2_cargo_toml_dependency_constraint() {
+        // S152 v2: L2 测试中发现 AI 使用 use tracing::... 但未在 Cargo.toml 中添加依赖
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Cargo.toml"),
+            "系统 prompt 应包含 Cargo.toml 依赖检查约束 (S152 v2)"
+        );
+        assert!(
+            prompt.contains("tracing"),
+            "系统 prompt 应包含 tracing crate 依赖检查 (S152 v2)"
+        );
+        assert!(
+            prompt.contains("[dependencies]"),
+            "系统 prompt 应包含 [dependencies] 提醒 (S152 v2)"
         );
     }
 }
