@@ -261,8 +261,11 @@ impl SystemPrompt {
   "❌ 禁止: 使用 FromStr/Write/Deref/DerefMut/Index/IndexMut/Drop/FusedIterator/DoubleEndedIterator/ExactSizeIterator/Error 等 trait 但未导入 use std::str::FromStr / use std::fmt::Write / use std::ops::{...} / use std::iter::{...} / use std::error::Error (Session 150+S152 导入检测)\n",
   );
         prompt.push_str(
-  "❌ 禁止: 使用外部 crate (tracing/thiserror/serde/regex/chrono/tokio/reqwest/clap/uuid 等) 但未在 Cargo.toml [dependencies] 中添加对应依赖 — 使用 use tracing::... 时必须确保 Cargo.toml 中有 tracing = \"...\" (Session 152 v2 L2测试发现)\n",
-  );
+"❌ 禁止: 使用外部 crate (tracing/thiserror/serde/regex/chrono/tokio/reqwest/clap/uuid 等) 但未在 Cargo.toml [dependencies] 中添加对应依赖 — 使用 use tracing::... 时必须确保 Cargo.toml 中有 tracing = \"...\" (Session 152 v2 L2测试发现)\n",
+);
+        prompt.push_str(
+"⚠️ 注意: crossterm 的 execute!/queue! 是宏调用, 只有 execute!()/queue!() 形式才需要 use crossterm::execute / use crossterm::queue; 普通变量名 queue/execute 不会触发导入检测 (Session 153 误报修复)\n",
+);
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1839,6 +1842,20 @@ mod tests {
         assert!(
             prompt.contains("[dependencies]"),
             "系统 prompt 应包含 [dependencies] 提醒 (S152 v2)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s153_crossterm_macro_constraint() {
+        // S153: crossterm execute!/queue! only triggers import for macro form
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("crossterm"),
+            "系统 prompt 应包含 crossterm 约束 (S153)"
+        );
+        assert!(
+            prompt.contains("execute!") || prompt.contains("queue!"),
+            "系统 prompt 应包含 execute!/queue! 宏形式说明 (S153)"
         );
     }
 }

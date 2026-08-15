@@ -5954,10 +5954,9 @@ pub fn ensure_external_imports(content: &str) -> String {
         ("Layout", "ratatui::layout"),
         ("Block", "ratatui::widgets"),
         ("Widget", "ratatui::widgets"),
-        // crossterm (Session 146)
-        ("execute", "crossterm"),
-        ("queue", "crossterm"),
-        ("terminal", "crossterm"),
+        // crossterm execute!/queue! macros and terminal module — Session 153:
+        // Moved to macro-based detection below; bare "execute"/"queue"/"terminal"
+        // are too generic and cause false positives (e.g. variable names).
         // tui (Session 146)
         ("Frame", "tui"),
         ("Terminal", "tui"),
@@ -6578,6 +6577,43 @@ pub fn ensure_external_imports(content: &str) -> String {
         }
     }
 
+    // 检测 crossterm execute!/queue! 宏使用 (Session 153)
+    // execute!(...)/queue!(...) → use crossterm::{execute, queue};
+    // Session 153 修复: 原来在 type_modules 中用裸 "execute"/"queue" 词边界匹配,
+    // 导致变量名 queue/execute 误报。改为只检测 macro!() 形式。
+    let crossterm_macros: &[&str] = &["execute", "queue"];
+    let mut crossterm_macro_needed: Vec<&str> = Vec::new();
+
+    for &macro_name in crossterm_macros {
+        let macro_bang = format!("{}!(", macro_name);
+        let full_path = format!("crossterm::{}!", macro_name);
+
+        let bare_macro = content.contains(&macro_bang) && !content.contains(&full_path);
+
+        if bare_macro {
+            let already_imported = content.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(&format!("use crossterm::{};", macro_name))
+                    || (trimmed.contains("use crossterm::{")
+                        && contains_type_usage(trimmed, macro_name))
+                    || trimmed.starts_with("use crossterm::*;")
+            }) || has_covering_glob_import(&glob_imports, "crossterm");
+
+            if !already_imported {
+                crossterm_macro_needed.push(macro_name);
+            }
+        }
+    }
+
+    if !crossterm_macro_needed.is_empty() {
+        crossterm_macro_needed.sort();
+        crossterm_macro_needed.dedup();
+        needed
+            .entry("crossterm")
+            .or_default()
+            .extend(crossterm_macro_needed);
+    }
+
     if needed.is_empty() {
         return content.to_string();
     }
@@ -7123,10 +7159,9 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         ("Layout", "ratatui::layout"),
         ("Block", "ratatui::widgets"),
         ("Widget", "ratatui::widgets"),
-        // crossterm (Session 146)
-        ("execute", "crossterm"),
-        ("queue", "crossterm"),
-        ("terminal", "crossterm"),
+        // crossterm execute!/queue! macros and terminal module — Session 153:
+        // Moved to macro-based detection below; bare "execute"/"queue"/"terminal"
+        // are too generic and cause false positives (e.g. variable names).
         // tui (Session 146)
         ("Frame", "tui"),
         ("Terminal", "tui"),
@@ -7821,6 +7856,47 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
                 type_name: "Iterator".to_string(),
                 module_path: "std::iter".to_string(),
                 usage_line: iterator_method_line,
+            });
+        }
+    }
+
+    // 检测 crossterm execute!/queue! 宏使用 (Session 153)
+    // Session 153 修复: 原来在 type_modules 中用裸 "execute"/"queue" 词边界匹配,
+    // 导致变量名 queue/execute 误报。改为只检测 macro!() 形式。
+    let crossterm_verify_macros: &[&str] = &["execute", "queue"];
+    let mut crossterm_verify_macro_found = false;
+    let mut crossterm_verify_macro_line = 0;
+    for (i, line) in lines.iter().enumerate() {
+        for &macro_name in crossterm_verify_macros {
+            let macro_bang = format!("{}!(", macro_name);
+            let full_path = format!("crossterm::{}!", macro_name);
+            if line.contains(&macro_bang) && !line.contains(&full_path) {
+                crossterm_verify_macro_found = true;
+                crossterm_verify_macro_line = i + 1;
+                break;
+            }
+        }
+        if crossterm_verify_macro_found {
+            break;
+        }
+    }
+
+    if crossterm_verify_macro_found {
+        let already_imported = content.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("use crossterm::execute;")
+                || trimmed.starts_with("use crossterm::queue;")
+                || (trimmed.contains("use crossterm::{")
+                    && (contains_type_usage(trimmed, "execute")
+                        || contains_type_usage(trimmed, "queue")))
+                || trimmed.starts_with("use crossterm::*;")
+        });
+
+        if !already_imported {
+            issues.push(ImportIssue {
+                type_name: "execute".to_string(),
+                module_path: "crossterm".to_string(),
+                usage_line: crossterm_verify_macro_line,
             });
         }
     }
@@ -22055,6 +22131,32 @@ fn main() {
     }
 
     #[test]
+    fn test_verify_imports_crossterm_queue_not_bare() {
+        // Session 153: bare "queue" (variable name) should NOT trigger crossterm import
+        let issues = verify_imports("fn foo() { let queue = 42; queue }");
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "execute" && i.module_path == "crossterm"),
+            "裸 queue 变量名不应触发 crossterm 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_crossterm_execute_not_bare() {
+        // Session 153: bare "execute" (variable name) should NOT trigger crossterm import
+        let issues = verify_imports("fn foo() { let execute = 42; execute }");
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "execute" && i.module_path == "crossterm"),
+            "裸 execute 变量名不应触发 crossterm 导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
     fn test_verify_imports_tui_frame_missing() {
         let issues = verify_imports("fn foo(f: &mut Frame) { unimplemented!() }");
         assert!(
@@ -22350,34 +22452,62 @@ fn main() {
     }
 
     #[test]
-    fn test_ensure_external_imports_crossterm_execute() {
+    fn test_ensure_external_imports_crossterm_execute_macro() {
+        // Session 153: execute!() macro form should trigger crossterm import
         let code = "fn foo() { execute!(\"cmd\"); }";
         let result = ensure_external_imports(code);
         assert!(
             result.contains("use crossterm::execute;"),
-            "应添加 crossterm::execute 导入: {}",
+            "execute!() 宏应添加 crossterm::execute 导入: {}",
             result
         );
     }
 
     #[test]
-    fn test_ensure_external_imports_crossterm_queue() {
+    fn test_ensure_external_imports_crossterm_execute_not_bare() {
+        // Session 153: bare "execute" (variable name) should NOT trigger crossterm import
+        let code = "fn foo() { let execute = 1; execute }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use crossterm::execute;"),
+            "裸 execute 变量名不应触发 crossterm 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_queue_macro() {
+        // Session 153: queue!() macro form should trigger crossterm import
         let code = "fn foo() { queue!(\"cmd\"); }";
         let result = ensure_external_imports(code);
         assert!(
             result.contains("use crossterm::queue;"),
-            "应添加 crossterm::queue 导入: {}",
+            "queue!() 宏应添加 crossterm::queue 导入: {}",
             result
         );
     }
 
     #[test]
-    fn test_ensure_external_imports_crossterm_terminal() {
+    fn test_ensure_external_imports_crossterm_queue_not_bare() {
+        // Session 153: bare "queue" (variable name) should NOT trigger crossterm import
+        let code = "fn foo() { let queue = VecDeque::new(); queue }
+use std::collections::VecDeque;";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use crossterm::queue;"),
+            "裸 queue 变量名不应触发 crossterm 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_crossterm_terminal_not_bare() {
+        // Session 153: bare "terminal" should NOT trigger crossterm import (too generic)
         let code = "fn foo() -> terminal { unimplemented!() }";
         let result = ensure_external_imports(code);
         assert!(
-            result.contains("use crossterm::terminal;"),
-            "应添加 crossterm::terminal 导入: {}",
+            !result.contains("use crossterm::terminal;"),
+            "裸 terminal 不应触发 crossterm 导入: {}",
             result
         );
     }
