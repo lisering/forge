@@ -15,7 +15,7 @@
 //! default_site = "deepseek"
 //! phase1_timeout = 30
 //! phase2_timeout = 60
-//! phase3_timeout = 45
+//! phase3_timeout = 90
 //!
 //! [storage]
 //! trace_backend = "jsonl"
@@ -152,7 +152,7 @@ fn default_phase2_timeout() -> u64 {
     60
 }
 fn default_phase3_timeout() -> u64 {
-    45
+    90
 }
 fn default_stuck_threshold() -> u64 {
     180
@@ -428,7 +428,7 @@ mod tests {
         let config = ChatConfig::default();
         assert_eq!(config.phase1_timeout, 30);
         assert_eq!(config.phase2_timeout, 60);
-        assert_eq!(config.phase3_timeout, 45);
+        assert_eq!(config.phase3_timeout, 90);
         assert_eq!(config.stuck_threshold, 180);
         assert_eq!(config.max_context_turns, 30);
     }

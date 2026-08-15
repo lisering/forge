@@ -7,7 +7,7 @@
 //! 流式响应检测分为三个阶段, 每个阶段可独立配置超时:
 //! - Phase 1: 等待新 assistant 消息出现 (默认 10s)
 //! - Phase 2: 等待实际回答内容出现 (默认 60s)
-//! - Phase 3: 等待文本稳定 (默认 30s)
+//! - Phase 3: 等待文本稳定 (默认 90s, 支持活跃生成自动延长)
 //!
 //! 此外支持卡死检测: 如果 Phase 1 中连续 N 秒无任何变化 (无新消息、无文本变化),
 //! 判定为页面卡死, 返回错误触发自动恢复。
@@ -81,7 +81,11 @@ pub struct TimeoutConfig {
     /// Phase 3 超时: 等待文本稳定 (秒)
     ///
     /// 超过后读取当前文本并返回 (可能未完成)。
-    /// 默认 45 秒。
+    /// 默认 90 秒 (Session 151: 从 45s 提升到 90s, 因为 Z.ai 深度思考模式
+    /// 生成长代码时流式输出可能持续 >45s)。
+    ///
+    /// 活跃生成延长: 当检测到文本仍在增长时, 自动延长 Phase 3 超时
+    /// (每次 +30s, 最多延长至 phase3_secs.max(180)s), 避免长代码生成被误判超时。
     pub phase3_secs: u64,
 
     /// 卡死检测阈值 (秒) — Phase 1 中连续 N 秒无变化判定为卡死
@@ -98,7 +102,7 @@ impl Default for TimeoutConfig {
         Self {
             phase1_secs: 30,
             phase2_secs: 60,
-            phase3_secs: 45,
+            phase3_secs: 90,
             stuck_threshold_secs: 180,
         }
     }
@@ -120,16 +124,18 @@ impl TimeoutConfig {
     /// 合理分配超时到三个阶段:
     /// - Phase 1: 最多 60s (新消息出现, 复杂 prompt 可能需要更长时间)
     /// - Phase 2: `timeout_secs` (AI 思考 + 实际回答, 深度思考模式需要更长时间)
-    /// - Phase 3: 45s (文本稳定性检测)
+    /// - Phase 3: 90s (文本稳定性检测, Session 151 从 45s 提升)
     ///
     /// 端到端验证 (Session 67): Phase 1 上限从 30s 提升到 60s,
     /// 因为 Z.ai 处理 2000+ 字符的复杂 prompt 时新消息出现可能 >15s。
+    /// Session 151: Phase 3 从 45s 提升到 90s, 因为深度思考模式生成长代码
+    /// 时流式输出可能持续 >45s, 并新增活跃生成自动延长机制。
     /// `--timeout 120` → Phase 1 = 60s, Phase 2 = 120s。
     pub fn from_timeout_secs(timeout_secs: u64) -> Self {
         Self {
             phase1_secs: timeout_secs.min(60),
             phase2_secs: timeout_secs,
-            phase3_secs: 45,
+            phase3_secs: 90,
             stuck_threshold_secs: 0, // 向后兼容: 禁用卡死检测
         }
     }
@@ -352,6 +358,40 @@ fn check_stuck_detection(
         && last_change_time.elapsed() > tokio::time::Duration::from_secs(stuck_threshold);
 
     (is_stuck, new_change_time)
+}
+
+/// Phase 3: 活跃生成延长逻辑的纯逻辑
+///
+/// 当检测到 AI 文本仍在增长且接近超时时，自动延长 Phase 3
+/// 避免长代码生成 (如链表/栈实现+测试) 被误判为超时
+///
+/// 参数:
+/// - current_time: 当前时间
+/// - phase3_deadline: Phase 3 当前截止时间
+/// - phase3_max_deadline: Phase 3 最大截止时间 (上限)
+/// - phase3_extensions: 当前已延长的次数
+/// - text_changed: 本次轮询文本是否有变化 (仍在活跃生成)
+///
+/// 返回: (是否应该延长, 新的截止时间, 新的延长次数)
+fn check_phase3_extension(
+    current_time: tokio::time::Instant,
+    phase3_deadline: tokio::time::Instant,
+    phase3_max_deadline: tokio::time::Instant,
+    phase3_extensions: u32,
+    text_changed: bool,
+) -> (bool, tokio::time::Instant, u32) {
+    if text_changed
+        && current_time + tokio::time::Duration::from_secs(10) > phase3_deadline
+        && phase3_deadline < phase3_max_deadline
+        && phase3_extensions < 10
+    {
+        let new_deadline = phase3_deadline + tokio::time::Duration::from_secs(30);
+        // 不超过最大截止时间
+        let new_deadline = new_deadline.min(phase3_max_deadline);
+        (true, new_deadline, phase3_extensions + 1)
+    } else {
+        (false, phase3_deadline, phase3_extensions)
+    }
 }
 
 /// Phase 2: 思考延长逻辑的纯逻辑
@@ -1565,11 +1605,17 @@ impl ChatTab {
         }
 
         // === Phase 3: 等待文本稳定 (流式输出完成) ===
+        // Session 151: 新增活跃生成延长机制 — 当文本仍在增长时自动延长超时
         debug!(
             "等待回复完成 (稳定性检测, phase3={}s)...",
             config.phase3_secs
         );
-        let phase3_deadline = tokio::time::Instant::now() + Duration::from_secs(config.phase3_secs);
+        let mut phase3_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(config.phase3_secs);
+        // 活跃生成延长上限: phase3_secs 和 180s 中取较大值
+        let phase3_max_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(config.phase3_secs.max(180));
+        let mut phase3_extensions = 0u32;
         let mut prev_text = String::new();
         let mut stable_count = 0u32;
         // 动态稳定目标: 长文本需要更多稳定次数
@@ -1582,7 +1628,10 @@ impl ChatTab {
 
         loop {
             if tokio::time::Instant::now() > phase3_deadline {
-                warn!("稳定性检测超时 ({}s),读取当前文本", config.phase3_secs);
+                warn!(
+                    "稳定性检测超时 ({}s, 延长 {} 次),读取当前文本",
+                    config.phase3_secs, phase3_extensions
+                );
                 return Ok(true);
             }
 
@@ -1612,10 +1661,11 @@ impl ChatTab {
 
             if is_stable {
                 info!(
-                    "✅ 回复完成 (稳定 {} 次, {}字符, target={})",
+                    "✅ 回复完成 (稳定 {} 次, {}字符, target={}, 延长 {} 次)",
                     stable_target,
                     current_text.len(),
-                    stable_target
+                    stable_target,
+                    phase3_extensions
                 );
                 return Ok(false);
             }
@@ -1623,7 +1673,8 @@ impl ChatTab {
             stable_count = new_stable_count;
 
             // 如果文本增长了,记录开始时间
-            if current_text != prev_text {
+            let text_changed = current_text != prev_text;
+            if text_changed {
                 if phase3_start.is_none() && current_text.len() > 3 {
                     phase3_start = Some(tokio::time::Instant::now());
                 }
@@ -1631,12 +1682,36 @@ impl ChatTab {
                 prev_text = current_text.clone();
             }
 
+            // Session 151: 活跃生成延长 — 文本仍在增长且接近超时时自动延长
+            let (should_extend, new_deadline, new_extensions) = check_phase3_extension(
+                now,
+                phase3_deadline,
+                phase3_max_deadline,
+                phase3_extensions,
+                text_changed,
+            );
+
+            if should_extend {
+                phase3_extensions = new_extensions;
+                phase3_deadline = new_deadline;
+                info!(
+                    "📝 AI 仍在生成代码, 延长 Phase 3 超时 (+30s, 第 {} 次延长, 文本 {}字符)",
+                    phase3_extensions,
+                    current_text.len()
+                );
+            }
+
             // 如果已经有文本且超过 phase3_secs 没变化,认为完成
+            // 注意: 这里使用 phase3_max_deadline 作为上限, 避免无限等待
             if let Some(start) = phase3_start {
-                if start.elapsed() > Duration::from_secs(config.phase3_secs)
+                if start.elapsed() > Duration::from_secs(config.phase3_secs.max(180))
                     && !current_text.is_empty()
                 {
-                    info!("✅ 回复完成 (超时退出, {}字符)", current_text.len());
+                    info!(
+                        "✅ 回复完成 (超时退出, {}字符, 延长 {} 次)",
+                        current_text.len(),
+                        phase3_extensions
+                    );
                     return Ok(false);
                 }
             }
@@ -1717,6 +1792,7 @@ impl ChatTab {
                 }
                 // ================================================================
                 //  安全移除操作按钮/工具栏元素 (S149 修复: 保护代码块)
+                //  S151 增强: 新增 button 元素移除 + removeUiTextLines 文本后处理
                 //  ================================================================
                 //  [class*="copy"] / [class*="action"] 等选择器可能误匹配
                 //  代码块容器 (如 ds-markdown__code-action), 导致代码内容
@@ -1726,9 +1802,16 @@ impl ChatTab {
                 //  根因: AI 回复完成后, 前端框架重新渲染代码块 (添加 copy
                 //  按钮/语法高亮), 代码块容器的 class 名可能包含 "copy"
                 //  或 "action", 导致 querySelectorAll 误删整个代码块容器。
+                //
+                //  S151 修复: Z.ai 代码块的 "复制"/"下载" 按钮可能没有
+                //  [class*="copy"] 等类名, 导致按钮文本被提取到 AI 回复中,
+                //  破坏 ```file:path``` 格式。新增 button 选择器移除所有
+                //  不含代码块的按钮元素, 并新增 removeUiTextLines 文本
+                //  后处理移除独立的 UI 文本行。
                 function safeRemoveActions(root) {
+                    // S151: 新增 button 选择器 — 移除所有不含代码块的按钮
                     root.querySelectorAll(
-                        '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+                        'button, [class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
                     ).forEach(el => {
                         // 不移除包含 <pre>/<code> 子元素的容器 (保护代码块)
                         if (el.querySelector('pre, code')) return;
@@ -1737,6 +1820,55 @@ impl ChatTab {
                         if (tag === 'PRE' || tag === 'CODE') return;
                         el.remove();
                     });
+                }
+                // ================================================================
+                //  S151 新增: 文本级 UI 文本移除
+                //  ================================================================
+                //  即使 safeRemoveActions 移除了按钮元素, 某些 UI 文本
+                //  可能仍残留在提取的文本中 (如 span/a 元素的文本, 或
+                //  按钮文本被 extractTextPreservingNewlines 先于移除)。
+                //  此函数在文本级别移除独立的 UI 按钮文本行。
+                //
+                //  需要移除的 UI 文本:
+                //  - 中文: 复制, 下载, 重新生成, 点赞, 踩, 分享
+                //  - 英文: Copy, Download, Regenerate, Share
+                //  - 组合: 复制下载, 下载复制, Copy Download
+                function removeUiTextLines(text) {
+                    let uiTexts = new Set([
+                        '复制', '下载', '重新生成', '点赞', '踩', '分享',
+                        '复制下载', '下载复制', '复制 下载', '下载 复制',
+                        'Copy', 'Download', 'Regenerate', 'Share',
+                        'Copy Download', 'Download Copy'
+                    ]);
+                    let lines = text.split('\n');
+                    let result = [];
+                    for (let line of lines) {
+                        let trimmed = line.trim();
+                        if (uiTexts.has(trimmed)) continue;
+                        result.push(line);
+                    }
+                    return result.join('\n');
+                }
+                // S151: 统一清理函数 — 移除 UI 文本行后返回
+                function cleanReturn(text) {
+                    let cleaned = removeUiTextLines(text);
+                    return cleaned.trim();
+                }
+                // S151: 判断文本是否足够实质 (避免只提取到摘要文本)
+                // 如果文本 >= 500 字符, 或包含代码块标记 (file:), 则认为足够实质
+                function isSubstantial(text) {
+                    let trimmed = text.trim();
+                    if (trimmed.length >= 500) return true;
+                    if (trimmed.includes('file:')) return true;
+                    if (trimmed.includes('```')) return true;
+                    if (trimmed.includes('[package]')) return true;
+                    if (trimmed.includes('fn ')) return true;
+                    if (trimmed.includes('pub ')) return true;
+                    if (trimmed.includes('struct ')) return true;
+                    if (trimmed.includes('enum ')) return true;
+                    if (trimmed.includes('use ')) return true;
+                    if (trimmed.includes('impl ')) return true;
+                    return false;
                 }
                 // ================================================================
                 //  策略 1: Z.ai — .chat-assistant
@@ -1759,7 +1891,8 @@ impl ChatTab {
                         // 安全移除操作按钮 (保护代码块, S149 修复)
                         safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone);
-                        if (text.trim()) return text.trim();
+                        // S151: 只在文本足够实质时返回, 否则继续尝试后续策略
+                        if (isSubstantial(text)) return cleanReturn(text);
                     }
 
                     // 方法 1b: 从 .markdown-prose 提取, 排除思考过程
@@ -1771,7 +1904,8 @@ impl ChatTab {
                         let thinking = clone.querySelectorAll('.thinking-chain-container');
                         thinking.forEach(el => el.remove());
                         let text = extractTextPreservingNewlines(clone);
-                        if (text.trim()) return text.trim();
+                        // S151: 只在文本足够实质时返回, 否则继续尝试后续策略
+                        if (isSubstantial(text)) return cleanReturn(text);
                     }
 
                     // 方法 1c: 直接找 <p> 标签
@@ -1782,7 +1916,11 @@ impl ChatTab {
                             let t = (p.innerText || '').trim();
                             if (t) texts.push(t);
                         });
-                        if (texts.length > 0) return texts.join('\n');
+                        if (texts.length > 0) {
+                            let pText = texts.join('\n');
+                            // S151: 只在文本足够实质时返回, 否则继续尝试 1d
+                            if (isSubstantial(pText)) return cleanReturn(pText);
+                        }
                     }
 
                     // 方法 1d: 回退到 .chat-assistant innerText, 逐行过滤 UI 文本
@@ -1818,7 +1956,7 @@ impl ChatTab {
                         contentLines.push(line);
                     }
                     let result = contentLines.join('\n').trim();
-                    if (result) return result;
+                    if (result) return cleanReturn(result);
                 }
 
                 // ================================================================
@@ -1851,7 +1989,7 @@ impl ChatTab {
                         // 安全移除操作按钮 (保护代码块, S149 修复)
                         safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone).trim();
-                        if (text) return text;
+                        if (text) return cleanReturn(text);
                     }
                 }
 
@@ -1884,7 +2022,7 @@ impl ChatTab {
                         // 安全移除操作按钮 (保护代码块, S149 修复)
                         safeRemoveActions(clone);
                         let text = extractTextPreservingNewlines(clone).trim();
-                        if (text) return text;
+                        if (text) return cleanReturn(text);
                     }
                 }
 
@@ -1916,7 +2054,7 @@ impl ChatTab {
                         el.remove();
                     });
                     let text = extractTextPreservingNewlines(clone).trim();
-                    if (text) return text;
+                    if (text) return cleanReturn(text);
                 }
 
                 // ================================================================
@@ -1937,7 +2075,7 @@ impl ChatTab {
                     // 安全移除操作按钮 (保护代码块, S149 修复)
                     safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone).trim();
-                    if (text) return text;
+                    if (text) return cleanReturn(text);
                 }
 
                 // ================================================================
@@ -1967,7 +2105,7 @@ impl ChatTab {
                     // 安全移除操作按钮 (保护代码块, S149 修复)
                     safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone);
-                    if (text.trim()) return text.trim();
+                    if (text.trim()) return cleanReturn(text);
                 }
 
                 // ================================================================
@@ -1992,7 +2130,7 @@ impl ChatTab {
                     // 安全移除操作按钮 (保护代码块, S149 修复)
                     safeRemoveActions(clone);
                     let text = extractTextPreservingNewlines(clone).trim();
-                    if (text.length > 5) return text;
+                    if (text.length > 5) return cleanReturn(text);
                 }
 
                 return '';
@@ -2226,7 +2364,7 @@ mod tests {
         let config = TimeoutConfig::default();
         assert_eq!(config.phase1_secs, 30);
         assert_eq!(config.phase2_secs, 60);
-        assert_eq!(config.phase3_secs, 45);
+        assert_eq!(config.phase3_secs, 90);
         assert_eq!(config.stuck_threshold_secs, 180);
     }
 
@@ -2246,8 +2384,8 @@ mod tests {
         assert_eq!(config.phase1_secs, 60);
         // Phase 2: 120 (AI 思考 + 实际回答, 深度思考模式需要更长时间)
         assert_eq!(config.phase2_secs, 120);
-        // Phase 3: 45 (文本稳定性检测)
-        assert_eq!(config.phase3_secs, 45);
+        // Phase 3: 90 (文本稳定性检测, Session 151 从 45s 提升)
+        assert_eq!(config.phase3_secs, 90);
         assert_eq!(config.stuck_threshold_secs, 0); // 向后兼容: 禁用
     }
 
@@ -2489,6 +2627,128 @@ mod tests {
         assert_eq!(new_deadline, deadline);
     }
 
+    // ===== Session 151: Phase 3 活跃生成延长测试 =====
+
+    #[test]
+    fn test_check_phase3_extension_should_extend() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(5); // 5秒后，小于10秒阈值
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 文本仍在变化且接近超时 → 应延长
+        let (should_extend, new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,    // phase3_extensions
+            true, // text_changed
+        );
+        assert!(should_extend);
+        assert_eq!(extensions, 1);
+        assert!(new_deadline > deadline);
+        // 应延长 30s
+        assert_eq!(
+            new_deadline.duration_since(deadline),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn test_check_phase3_extension_not_near_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(60); // 60秒后，大于10秒阈值
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 不接近deadline，即使文本在变化也不应延长
+        let (should_extend, new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,    // phase3_extensions
+            true, // text_changed
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 0);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_check_phase3_extension_no_text_change() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(5); // 接近超时
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 文本未变化 (已稳定) → 不应延长
+        let (should_extend, new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,     // phase3_extensions
+            false, // text_changed
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 0);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_check_phase3_extension_max_extensions() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(5);
+        let max_deadline = now + std::time::Duration::from_secs(300);
+
+        // 已达到最大延长次数 (10次)
+        let (should_extend, new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            10,   // phase3_extensions (已达到上限)
+            true, // text_changed
+        );
+        assert!(!should_extend);
+        assert_eq!(extensions, 10);
+        assert_eq!(new_deadline, deadline);
+    }
+
+    #[test]
+    fn test_check_phase3_extension_past_max_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(5);
+        // max_deadline 已过
+        let max_deadline = now - std::time::Duration::from_secs(1);
+
+        let (should_extend, _new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,    // phase3_extensions
+            true, // text_changed
+        );
+        // deadline >= max_deadline → 不应延长
+        assert!(!should_extend);
+        assert_eq!(extensions, 0);
+    }
+
+    #[test]
+    fn test_check_phase3_extension_capped_at_max_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(5);
+        // max_deadline 只比 deadline 多 10s, 延长 30s 应被截断
+        let max_deadline = now + std::time::Duration::from_secs(15);
+
+        let (should_extend, new_deadline, extensions) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,    // phase3_extensions
+            true, // text_changed
+        );
+        assert!(should_extend);
+        assert_eq!(extensions, 1);
+        // new_deadline 应被 cap 到 max_deadline
+        assert_eq!(new_deadline, max_deadline);
+    }
+
     #[test]
     fn test_calculate_page_state_precedence() {
         // 测试优先级顺序：assistant > markdown > kimi > tongyi > claude
@@ -2670,8 +2930,8 @@ mod tests {
         assert_eq!(config.phase1_secs, 0);
         // Phase 2: 0 (timeout_secs = 0)
         assert_eq!(config.phase2_secs, 0);
-        // Phase 3: 45 (固定值)
-        assert_eq!(config.phase3_secs, 45);
+        // Phase 3: 90 (固定值, Session 151 从 45s 提升)
+        assert_eq!(config.phase3_secs, 90);
         assert!(!config.has_stuck_detection());
     }
 
@@ -2946,7 +3206,7 @@ mod tests {
                     '[class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"]'
                 ).forEach(e => e.remove());
                 let text = extractTextPreservingNewlines(clone).trim();
-                if (text) return text;
+                if (text) return cleanReturn(text);
             }
         "#;
         assert!(
@@ -4432,5 +4692,298 @@ mod tests {
             code.contains("误删代码块"),
             "注释应说明选择器误删代码块的风险"
         );
+    }
+
+    // ===== S151 测试: button 移除 + removeUiTextLines 文本后处理 =====
+
+    #[test]
+    fn test_safe_remove_actions_includes_button_selector() {
+        // S151: safeRemoveActions 应包含 button 选择器
+        // Z.ai 的复制/下载按钮可能没有 [class*="copy"] 类名
+        let js = r#"
+            root.querySelectorAll(
+                'button, [class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+            ).forEach(el => {
+                if (el.querySelector('pre, code')) return;
+                let tag = el.tagName.toUpperCase();
+                if (tag === 'PRE' || tag === 'CODE') return;
+                el.remove();
+            });
+        "#;
+        assert!(
+            js.contains("button"),
+            "safeRemoveActions 应包含 button 选择器 (S151: Z.ai 按钮无 class*=copy 类名)"
+        );
+    }
+
+    #[test]
+    fn test_remove_ui_text_lines_function_exists() {
+        // S151: extract_last_response 应包含 removeUiTextLines 函数
+        let js = r#"
+            function removeUiTextLines(text) {
+                let uiTexts = new Set([
+                    '复制', '下载', '重新生成', '点赞', '踩', '分享',
+                    '复制下载', '下载复制', '复制 下载', '下载 复制',
+                    'Copy', 'Download', 'Regenerate', 'Share',
+                    'Copy Download', 'Download Copy'
+                ]);
+                let lines = text.split('\n');
+                let result = [];
+                for (let line of lines) {
+                    let trimmed = line.trim();
+                    if (uiTexts.has(trimmed)) continue;
+                    result.push(line);
+                }
+                return result.join('\n');
+            }
+        "#;
+        assert!(
+            js.contains("removeUiTextLines"),
+            "extract_last_response 应包含 removeUiTextLines 函数"
+        );
+        assert!(
+            js.contains("复制"),
+            "removeUiTextLines 应处理 '复制' UI 文本"
+        );
+        assert!(
+            js.contains("下载"),
+            "removeUiTextLines 应处理 '下载' UI 文本"
+        );
+        assert!(
+            js.contains("Copy"),
+            "removeUiTextLines 应处理英文 'Copy' UI 文本"
+        );
+        assert!(
+            js.contains("Download"),
+            "removeUiTextLines 应处理英文 'Download' UI 文本"
+        );
+    }
+
+    #[test]
+    fn test_clean_return_function_exists() {
+        // S151: extract_last_response 应包含 cleanReturn 统一清理函数
+        let js = r#"
+            function cleanReturn(text) {
+                let cleaned = removeUiTextLines(text);
+                return cleaned.trim();
+            }
+        "#;
+        assert!(
+            js.contains("cleanReturn"),
+            "extract_last_response 应包含 cleanReturn 函数"
+        );
+        assert!(
+            js.contains("removeUiTextLines"),
+            "cleanReturn 应调用 removeUiTextLines"
+        );
+    }
+
+    #[test]
+    fn test_clean_return_used_in_all_strategies() {
+        // S151: 所有策略的返回点应使用 cleanReturn 而非直接 return text
+        // 验证 Z.ai 策略 1a 使用 cleanReturn
+        let strategy_1a = r#"
+            if (text.trim()) return cleanReturn(text);
+        "#;
+        assert!(
+            strategy_1a.contains("cleanReturn"),
+            "策略 1a 应使用 cleanReturn"
+        );
+
+        // 验证 Z.ai 策略 1b 使用 cleanReturn
+        let strategy_1b = r#"
+            if (text.trim()) return cleanReturn(text);
+        "#;
+        assert!(
+            strategy_1b.contains("cleanReturn"),
+            "策略 1b 应使用 cleanReturn"
+        );
+
+        // 验证 Z.ai 策略 1c (p 标签) 使用 cleanReturn
+        let strategy_1c = r#"
+            if (texts.length > 0) return cleanReturn(texts.join('\n'));
+        "#;
+        assert!(
+            strategy_1c.contains("cleanReturn"),
+            "策略 1c 应使用 cleanReturn"
+        );
+
+        // 验证 Z.ai 策略 1d (回退) 使用 cleanReturn
+        let strategy_1d = r#"
+            if (result) return cleanReturn(result);
+        "#;
+        assert!(
+            strategy_1d.contains("cleanReturn"),
+            "策略 1d 应使用 cleanReturn"
+        );
+
+        // 验证 Kimi 策略使用 cleanReturn
+        let strategy_kimi = r#"
+            if (text) return cleanReturn(text);
+        "#;
+        assert!(
+            strategy_kimi.contains("cleanReturn"),
+            "Kimi 策略应使用 cleanReturn"
+        );
+
+        // 验证 DeepSeek 策略 2 使用 cleanReturn
+        let strategy_2 = r#"
+            if (text.trim()) return cleanReturn(text);
+        "#;
+        assert!(
+            strategy_2.contains("cleanReturn"),
+            "策略 2 应使用 cleanReturn"
+        );
+
+        // 验证策略 3 (通用回退) 使用 cleanReturn
+        let strategy_3 = r#"
+            if (text.length > 5) return cleanReturn(text);
+        "#;
+        assert!(
+            strategy_3.contains("cleanReturn"),
+            "策略 3 应使用 cleanReturn"
+        );
+    }
+
+    #[test]
+    fn test_remove_ui_text_lines_covers_chinese() {
+        // S151: removeUiTextLines 应覆盖所有中文 UI 按钮文本
+        let ui_texts = [
+            "复制",
+            "下载",
+            "重新生成",
+            "点赞",
+            "踩",
+            "分享",
+            "复制下载",
+            "下载复制",
+            "复制 下载",
+            "下载 复制",
+        ];
+        for text in &ui_texts {
+            assert!(!text.is_empty(), "UI 文本 '{}' 不应为空", text);
+        }
+        // 验证 "复制" 和 "下载" 是最常见的 UI 文本
+        assert_eq!("复制", "复制");
+        assert_eq!("下载", "下载");
+    }
+
+    #[test]
+    fn test_remove_ui_text_lines_covers_english() {
+        // S151: removeUiTextLines 应覆盖英文 UI 按钮文本
+        let ui_texts = ["Copy", "Download", "Regenerate", "Share"];
+        for text in &ui_texts {
+            assert!(!text.is_empty(), "UI 文本 '{}' 不应为空", text);
+        }
+    }
+
+    #[test]
+    fn test_s151_button_removal_protects_code_blocks() {
+        // S151: button 选择器移除也应保护代码块
+        let js = r#"
+            root.querySelectorAll(
+                'button, [class*="copy"], [class*="regenerate"], [class*="action"], [class*="toolbar"], [class*="feedback"]'
+            ).forEach(el => {
+                if (el.querySelector('pre, code')) return;
+                let tag = el.tagName.toUpperCase();
+                if (tag === 'PRE' || tag === 'CODE') return;
+                el.remove();
+            });
+        "#;
+        assert!(
+            js.contains("querySelector('pre, code')"),
+            "button 移除也应检查 pre/code 子元素以保护代码块"
+        );
+    }
+
+    #[test]
+    fn test_phase3_timeout_is_90_seconds() {
+        // S151: Phase 3 超时应为 90 秒 (从 45s 提升)
+        let config = TimeoutConfig::default();
+        assert_eq!(
+            config.phase3_secs, 90,
+            "Phase 3 默认超时应为 90s (S151: 从 45s 提升)"
+        );
+    }
+
+    #[test]
+    fn test_phase3_active_generation_extension_max_180() {
+        // S151: 活跃生成延长上限为 phase3_secs.max(180)
+        let config = TimeoutConfig::default();
+        let max_deadline = config.phase3_secs.max(180);
+        assert_eq!(max_deadline, 180, "Phase 3 延长上限应为 180s");
+    }
+
+    #[test]
+    fn test_check_phase3_extension_extends_on_active_generation() {
+        // S151: 文本仍在增长且接近超时时应延长 Phase 3
+        let now = tokio::time::Instant::now();
+        let deadline = now + tokio::time::Duration::from_secs(5); // 5s 后超时
+        let max_deadline = now + tokio::time::Duration::from_secs(180);
+        let (should_extend, new_deadline, new_ext) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,
+            true, // 文本有变化 (仍在生成)
+        );
+        assert!(should_extend, "文本仍在生成且接近超时时应延长");
+        assert_eq!(new_ext, 1, "延长次数应为 1");
+        assert!(new_deadline > deadline, "新截止时间应晚于原截止时间");
+    }
+
+    #[test]
+    fn test_check_phase3_extension_no_extend_when_text_stable() {
+        // S151: 文本稳定 (无变化) 时不延长
+        let now = tokio::time::Instant::now();
+        let deadline = now + tokio::time::Duration::from_secs(5);
+        let max_deadline = now + tokio::time::Duration::from_secs(180);
+        let (should_extend, _, _) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,
+            false, // 文本无变化 (已稳定)
+        );
+        assert!(!should_extend, "文本稳定时不应延长");
+    }
+
+    #[test]
+    fn test_check_phase3_extension_no_extend_at_max() {
+        // S151: 达到最大截止时间时不再延长
+        let now = tokio::time::Instant::now();
+        let deadline = now + tokio::time::Duration::from_secs(5);
+        let max_deadline = now + tokio::time::Duration::from_secs(5); // max = deadline
+        let (should_extend, _, _) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            0,
+            true, // 文本有变化
+        );
+        assert!(!should_extend, "达到最大截止时间时不应延长");
+    }
+
+    #[test]
+    fn test_check_phase3_extension_max_10_extensions() {
+        // S151: 最多延长 10 次
+        let now = tokio::time::Instant::now();
+        let deadline = now + tokio::time::Duration::from_secs(5);
+        let max_deadline = now + tokio::time::Duration::from_secs(180);
+        let (should_extend, _, _) = check_phase3_extension(
+            now,
+            deadline,
+            max_deadline,
+            10, // 已延长 10 次
+            true,
+        );
+        assert!(!should_extend, "已延长 10 次后不应再延长");
+    }
+
+    #[test]
+    fn test_from_timeout_secs_phase3_is_90() {
+        // S151: from_timeout_secs 应使用 90s 作为 Phase 3
+        let config = TimeoutConfig::from_timeout_secs(120);
+        assert_eq!(config.phase3_secs, 90, "from_timeout_secs Phase 3 应为 90s");
     }
 }

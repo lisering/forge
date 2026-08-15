@@ -22,7 +22,7 @@ fn test_timeout_config_default_values() {
     let config = TimeoutConfig::default();
     assert_eq!(config.phase1_secs, 30);
     assert_eq!(config.phase2_secs, 60);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
     assert_eq!(config.stuck_threshold_secs, 180);
 }
 
@@ -40,7 +40,7 @@ fn test_timeout_config_from_timeout_secs() {
     let config = TimeoutConfig::from_timeout_secs(300);
     assert_eq!(config.phase1_secs, 60);
     assert_eq!(config.phase2_secs, 300);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
     assert_eq!(config.stuck_threshold_secs, 0);
 }
 
@@ -49,7 +49,7 @@ fn test_timeout_config_from_timeout_secs_short() {
     let config = TimeoutConfig::from_timeout_secs(30);
     assert_eq!(config.phase1_secs, 30);
     assert_eq!(config.phase2_secs, 30);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn test_timeout_config_from_timeout_secs_zero() {
     let config = TimeoutConfig::from_timeout_secs(0);
     assert_eq!(config.phase1_secs, 0);
     assert_eq!(config.phase2_secs, 0);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
 }
 
 // ============================================================================
@@ -106,7 +106,7 @@ fn test_timeout_config_has_stuck_detection_from_timeout_secs_false() {
 #[test]
 fn test_total_max_secs_default() {
     let config = TimeoutConfig::default();
-    assert_eq!(config.total_max_secs(), 30 + 60 + 45);
+    assert_eq!(config.total_max_secs(), 30 + 60 + 90);
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn test_total_max_secs_custom() {
 #[test]
 fn test_total_max_secs_from_timeout_secs() {
     let config = TimeoutConfig::from_timeout_secs(300);
-    assert_eq!(config.total_max_secs(), 60 + 300 + 45);
+    assert_eq!(config.total_max_secs(), 60 + 300 + 90);
 }
 
 #[test]
@@ -133,21 +133,21 @@ fn test_total_max_secs_zero_phases() {
 
 #[test]
 fn test_for_site_type_deepseek_below_minimum_raised() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::DeepSeek);
     assert_eq!(adjusted.phase1_secs, 30);
 }
 
 #[test]
 fn test_for_site_type_deepseek_at_minimum_kept() {
-    let config = TimeoutConfig::new(30, 60, 45);
+    let config = TimeoutConfig::new(30, 60, 90);
     let adjusted = config.for_site_type(SiteType::DeepSeek);
     assert_eq!(adjusted.phase1_secs, 30);
 }
 
 #[test]
 fn test_for_site_type_deepseek_above_minimum_kept() {
-    let config = TimeoutConfig::new(60, 60, 45);
+    let config = TimeoutConfig::new(60, 60, 90);
     let adjusted = config.for_site_type(SiteType::DeepSeek);
     assert_eq!(adjusted.phase1_secs, 60);
 }
@@ -168,21 +168,21 @@ fn test_for_site_type_deepseek_preserves_other_phases() {
 
 #[test]
 fn test_for_site_type_zai_below_minimum_raised() {
-    let config = TimeoutConfig::new(15, 60, 45);
+    let config = TimeoutConfig::new(15, 60, 90);
     let adjusted = config.for_site_type(SiteType::Zai);
     assert_eq!(adjusted.phase1_secs, 30);
 }
 
 #[test]
 fn test_for_site_type_zai_at_minimum_kept() {
-    let config = TimeoutConfig::new(30, 60, 45);
+    let config = TimeoutConfig::new(30, 60, 90);
     let adjusted = config.for_site_type(SiteType::Zai);
     assert_eq!(adjusted.phase1_secs, 30);
 }
 
 #[test]
 fn test_for_site_type_zai_above_minimum_kept() {
-    let config = TimeoutConfig::new(45, 60, 45);
+    let config = TimeoutConfig::new(45, 60, 90);
     let adjusted = config.for_site_type(SiteType::Zai);
     assert_eq!(adjusted.phase1_secs, 45);
 }
@@ -193,35 +193,35 @@ fn test_for_site_type_zai_above_minimum_kept() {
 
 #[test]
 fn test_for_site_type_kimi_below_minimum_raised() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::Kimi);
     assert_eq!(adjusted.phase1_secs, 20);
 }
 
 #[test]
 fn test_for_site_type_tongyi_below_minimum_raised() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::Tongyi);
     assert_eq!(adjusted.phase1_secs, 20);
 }
 
 #[test]
 fn test_for_site_type_claude_below_minimum_raised() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::Claude);
     assert_eq!(adjusted.phase1_secs, 20);
 }
 
 #[test]
 fn test_for_site_type_kimi_at_minimum_kept() {
-    let config = TimeoutConfig::new(20, 60, 45);
+    let config = TimeoutConfig::new(20, 60, 90);
     let adjusted = config.for_site_type(SiteType::Kimi);
     assert_eq!(adjusted.phase1_secs, 20);
 }
 
 #[test]
 fn test_for_site_type_claude_above_minimum_kept() {
-    let config = TimeoutConfig::new(40, 60, 45);
+    let config = TimeoutConfig::new(40, 60, 90);
     let adjusted = config.for_site_type(SiteType::Claude);
     assert_eq!(adjusted.phase1_secs, 40);
 }
@@ -232,14 +232,14 @@ fn test_for_site_type_claude_above_minimum_kept() {
 
 #[test]
 fn test_for_site_type_unknown_no_adjustment() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::Unknown);
     assert_eq!(adjusted.phase1_secs, 10);
 }
 
 #[test]
 fn test_for_site_type_unknown_zero_kept() {
-    let config = TimeoutConfig::new(0, 60, 45);
+    let config = TimeoutConfig::new(0, 60, 90);
     let adjusted = config.for_site_type(SiteType::Unknown);
     assert_eq!(adjusted.phase1_secs, 0);
 }
@@ -250,14 +250,14 @@ fn test_for_site_type_unknown_zero_kept() {
 
 #[test]
 fn test_for_site_type_does_not_modify_original() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let _adjusted = config.for_site_type(SiteType::DeepSeek);
     assert_eq!(config.phase1_secs, 10);
 }
 
 #[test]
 fn test_for_site_type_returns_new_instance() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let adjusted = config.for_site_type(SiteType::DeepSeek);
     assert_ne!(config.phase1_secs, adjusted.phase1_secs);
 }
@@ -268,7 +268,7 @@ fn test_for_site_type_returns_new_instance() {
 
 #[test]
 fn test_for_site_type_all_sites_minimum_threshold() {
-    let config = TimeoutConfig::new(5, 60, 45);
+    let config = TimeoutConfig::new(5, 60, 90);
 
     let deepseek = config.for_site_type(SiteType::DeepSeek);
     assert_eq!(deepseek.phase1_secs, 30);
@@ -320,28 +320,28 @@ fn test_for_site_type_high_values_unchanged_across_sites() {
 fn test_total_timeout_budget_default() {
     let config = TimeoutConfig::default();
     let total = config.total_max_secs();
-    assert_eq!(total, 135);
+    assert_eq!(total, 180);
 }
 
 #[test]
 fn test_total_timeout_budget_with_stuck_detection() {
     let config = TimeoutConfig::default().with_stuck_threshold(300);
     let total = config.total_max_secs();
-    assert_eq!(total, 135);
+    assert_eq!(total, 180);
     assert_eq!(config.stuck_threshold_secs, 300);
 }
 
 #[test]
 fn test_total_timeout_budget_exceeds_phase2() {
-    let config = TimeoutConfig::new(30, 300, 45);
+    let config = TimeoutConfig::new(30, 300, 90);
     let total = config.total_max_secs();
-    assert_eq!(total, 375);
+    assert_eq!(total, 420);
     assert!(total > config.phase2_secs);
 }
 
 #[test]
 fn test_phase2_dominates_total_budget() {
-    let config = TimeoutConfig::new(30, 600, 45);
+    let config = TimeoutConfig::new(30, 600, 90);
     let total = config.total_max_secs();
     let phase2_ratio = config.phase2_secs as f64 / total as f64;
     assert!(
@@ -364,7 +364,7 @@ fn test_phase1_is_smallest_phase() {
 
 #[test]
 fn test_multi_site_timeout_configuration() {
-    let base = TimeoutConfig::new(10, 120, 45);
+    let base = TimeoutConfig::new(10, 120, 90);
 
     let deepseek_config = base.for_site_type(SiteType::DeepSeek);
     let zai_config = base.for_site_type(SiteType::Zai);
@@ -377,15 +377,15 @@ fn test_multi_site_timeout_configuration() {
 
 #[test]
 fn test_multi_site_total_max_secs_comparison() {
-    let base = TimeoutConfig::new(10, 120, 45);
+    let base = TimeoutConfig::new(10, 120, 90);
 
     let deepseek_total = base.for_site_type(SiteType::DeepSeek).total_max_secs();
     let kimi_total = base.for_site_type(SiteType::Kimi).total_max_secs();
     let unknown_total = base.for_site_type(SiteType::Unknown).total_max_secs();
 
-    assert_eq!(deepseek_total, 30 + 120 + 45);
-    assert_eq!(kimi_total, 20 + 120 + 45);
-    assert_eq!(unknown_total, 10 + 120 + 45);
+    assert_eq!(deepseek_total, 30 + 120 + 90);
+    assert_eq!(kimi_total, 20 + 120 + 90);
+    assert_eq!(unknown_total, 10 + 120 + 90);
 
     assert!(deepseek_total > kimi_total);
     assert!(kimi_total > unknown_total);
@@ -393,7 +393,7 @@ fn test_multi_site_total_max_secs_comparison() {
 
 #[test]
 fn test_stuck_threshold_independent_of_site_type() {
-    let base = TimeoutConfig::new(10, 120, 45).with_stuck_threshold(250);
+    let base = TimeoutConfig::new(10, 120, 90).with_stuck_threshold(250);
 
     let deepseek = base.for_site_type(SiteType::DeepSeek);
     let kimi = base.for_site_type(SiteType::Kimi);
@@ -410,9 +410,9 @@ fn test_stuck_threshold_independent_of_site_type() {
 
 #[test]
 fn test_timeout_config_zero_phase1() {
-    let config = TimeoutConfig::new(0, 60, 45);
+    let config = TimeoutConfig::new(0, 60, 90);
     assert_eq!(config.phase1_secs, 0);
-    assert_eq!(config.total_max_secs(), 105);
+    assert_eq!(config.total_max_secs(), 150);
 }
 
 #[test]
@@ -434,7 +434,7 @@ fn test_timeout_config_from_timeout_secs_large() {
     let config = TimeoutConfig::from_timeout_secs(u64::MAX);
     assert_eq!(config.phase1_secs, 60);
     assert_eq!(config.phase2_secs, u64::MAX);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
 }
 
 #[test]
@@ -564,18 +564,18 @@ fn test_chat_session_with_messages() {
 
 #[test]
 fn test_e2e_timeout_config_for_deepseek_workflow() {
-    let config = TimeoutConfig::new(15, 120, 45)
+    let config = TimeoutConfig::new(15, 120, 90)
         .with_stuck_threshold(180)
         .for_site_type(SiteType::DeepSeek);
 
     assert_eq!(config.phase1_secs, 30);
     assert_eq!(config.phase2_secs, 120);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
     assert_eq!(config.stuck_threshold_secs, 180);
     assert!(config.has_stuck_detection());
 
     let total = config.total_max_secs();
-    assert_eq!(total, 30 + 120 + 45);
+    assert_eq!(total, 30 + 120 + 90);
 }
 
 #[test]
@@ -584,7 +584,7 @@ fn test_e2e_timeout_config_for_zai_workflow() {
 
     assert_eq!(config.phase1_secs, 30);
     assert_eq!(config.phase2_secs, 60);
-    assert_eq!(config.phase3_secs, 45);
+    assert_eq!(config.phase3_secs, 90);
     assert!(config.has_stuck_detection());
 }
 
@@ -613,7 +613,7 @@ fn test_e2e_timeout_config_with_site_type_and_stuck_threshold() {
 
 #[test]
 fn test_e2e_multi_tab_timeout_configuration() {
-    let base = TimeoutConfig::new(10, 120, 45).with_stuck_threshold(200);
+    let base = TimeoutConfig::new(10, 120, 90).with_stuck_threshold(200);
 
     let tab0 = base.for_site_type(SiteType::DeepSeek);
     let tab1 = base.for_site_type(SiteType::Zai);
@@ -637,7 +637,7 @@ fn test_e2e_multi_tab_timeout_configuration() {
 fn test_failover_timeout_progression() {
     let configs: Vec<TimeoutConfig> = [SiteType::DeepSeek, SiteType::Zai, SiteType::Kimi]
         .iter()
-        .map(|&site| TimeoutConfig::new(10, 120, 45).for_site_type(site))
+        .map(|&site| TimeoutConfig::new(10, 120, 90).for_site_type(site))
         .collect();
 
     assert_eq!(configs[0].phase1_secs, 30);
@@ -646,26 +646,26 @@ fn test_failover_timeout_progression() {
 
     for config in &configs {
         assert_eq!(config.phase2_secs, 120);
-        assert_eq!(config.phase3_secs, 45);
+        assert_eq!(config.phase3_secs, 90);
     }
 }
 
 /// 验证 failover 后的超时不会累积
 #[test]
 fn test_failover_timeout_no_accumulation() {
-    let base = TimeoutConfig::new(10, 120, 45);
+    let base = TimeoutConfig::new(10, 120, 90);
 
     let first = base.for_site_type(SiteType::DeepSeek);
     let second = base.for_site_type(SiteType::Zai);
 
     assert_eq!(first.total_max_secs(), second.total_max_secs());
-    assert_eq!(first.total_max_secs(), 30 + 120 + 45);
+    assert_eq!(first.total_max_secs(), 30 + 120 + 90);
 }
 
 /// 验证 stuck_threshold 在 failover 场景中保持一致
 #[test]
 fn test_failover_stuck_threshold_consistent() {
-    let base = TimeoutConfig::new(10, 120, 45).with_stuck_threshold(300);
+    let base = TimeoutConfig::new(10, 120, 90).with_stuck_threshold(300);
 
     for site in [SiteType::DeepSeek, SiteType::Zai, SiteType::Kimi] {
         let config = base.for_site_type(site);
@@ -683,7 +683,7 @@ fn test_failover_stuck_threshold_consistent() {
 
 #[test]
 fn test_for_site_type_deepseek_vs_kimi_threshold_difference() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let deepseek = config.for_site_type(SiteType::DeepSeek);
     let kimi = config.for_site_type(SiteType::Kimi);
 
@@ -694,7 +694,7 @@ fn test_for_site_type_deepseek_vs_kimi_threshold_difference() {
 
 #[test]
 fn test_for_site_type_deepseek_vs_zai_same_threshold() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
     let deepseek = config.for_site_type(SiteType::DeepSeek);
     let zai = config.for_site_type(SiteType::Zai);
 
@@ -703,7 +703,7 @@ fn test_for_site_type_deepseek_vs_zai_same_threshold() {
 
 #[test]
 fn test_for_site_type_kimi_tongyi_claude_same_threshold() {
-    let config = TimeoutConfig::new(10, 60, 45);
+    let config = TimeoutConfig::new(10, 60, 90);
 
     let kimi = config.for_site_type(SiteType::Kimi);
     let tongyi = config.for_site_type(SiteType::Tongyi);
@@ -716,7 +716,7 @@ fn test_for_site_type_kimi_tongyi_claude_same_threshold() {
 
 #[test]
 fn test_for_site_type_unknown_lower_than_known() {
-    let config = TimeoutConfig::new(5, 60, 45);
+    let config = TimeoutConfig::new(5, 60, 90);
 
     let unknown = config.for_site_type(SiteType::Unknown);
     let deepseek = config.for_site_type(SiteType::DeepSeek);
