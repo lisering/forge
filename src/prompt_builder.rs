@@ -248,6 +248,18 @@ impl SystemPrompt {
         prompt.push_str(
   "❌ 禁止: 输出不完整的文件 — 每个文件必须从第一行到最后一行完整输出, 不要省略中间部分 (Session 140 截断检测)\n",
   );
+        prompt.push_str(
+  "❌ 禁止: 在集成测试(#[cfg(test)] 模块外的测试函数)中使用 ? 操作符操作 Option 类型 — Option 的 ? 只能用于返回 Option 的函数, 返回 Result 的函数中不能用 ? 操作 Option (Session 150 测试代码质量)\n",
+  );
+        prompt.push_str(
+  "❌ 禁止: 在测试代码中生成不配对的括号 — 每个测试函数的 { } ( ) [ ] 必须严格配对, 特别是 assert_eq! / assert! 宏调用中的括号 (Session 150 测试代码质量)\n",
+  );
+        prompt.push_str(
+  "❌ 禁止: 在测试函数中混合返回类型 — 如果测试函数返回 Result<T, E>, 则所有 ? 操作符必须操作 Result 类型, 不能操作 Option 类型 (Session 150 测试代码质量)\n",
+  );
+        prompt.push_str(
+  "❌ 禁止: 使用 FromStr/Write/Deref/DerefMut/Index/IndexMut/Drop/FusedIterator/DoubleEndedIterator/ExactSizeIterator 等 trait 但未导入 use std::str::FromStr / use std::fmt::Write / use std::ops::{...} / use std::iter::{...} (Session 150 导入检测)\n",
+  );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1743,6 +1755,56 @@ mod tests {
         assert!(
             prompt.contains(".collect_into()"),
             "系统 prompt 应包含 .collect_into() trait 方法检测约束 (Session 149)"
+        );
+    }
+
+    // ===== Session 150: 测试代码质量约束测试 =====
+
+    #[test]
+    fn test_build_contains_s150_option_question_mark_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("? 操作符操作 Option"),
+            "系统 prompt 应包含 ? 操作符操作 Option 类型的禁止约束 (Session 150)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s150_test_bracket_pairing_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("测试代码中生成不配对的括号"),
+            "系统 prompt 应包含测试代码括号配对约束 (Session 150)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s150_mixed_return_type_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("混合返回类型"),
+            "系统 prompt 应包含测试函数混合返回类型禁止约束 (Session 150)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s150_std_trait_imports_constraint() {
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("FromStr"),
+            "系统 prompt 应包含 FromStr 导入约束 (Session 150)"
+        );
+        assert!(
+            prompt.contains("Deref"),
+            "系统 prompt 应包含 Deref 导入约束 (Session 150)"
+        );
+        assert!(
+            prompt.contains("IndexMut"),
+            "系统 prompt 应包含 IndexMut 导入约束 (Session 150)"
+        );
+        assert!(
+            prompt.contains("FusedIterator"),
+            "系统 prompt 应包含 FusedIterator 导入约束 (Session 150)"
         );
     }
 }

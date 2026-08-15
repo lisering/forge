@@ -708,6 +708,24 @@ fn edge_cases(c: &mut Criterion) {
         });
     });
 
+    // Session 150: std::str::FromStr / std::fmt::Write / std::ops::Deref/Index/Drop 类型检测
+    group.bench_function("s150_std_trait_types", |b| {
+        b.iter(|| {
+            let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl Index<usize> for A { type Output = i32; fn index(&self, _: usize) -> &i32 { &0 } }\nimpl Drop for A { fn drop(&mut self) {} }";
+            let result = ensure_external_imports(black_box(code));
+            black_box(result);
+        });
+    });
+
+    // Session 150: verify_imports std trait 类型检测
+    group.bench_function("s150_verify_std_trait_types", |b| {
+        b.iter(|| {
+            let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl IndexMut<usize> for A { fn index_mut(&mut self, _: usize) -> &mut i32 { unimplemented!() } }\nimpl FusedIterator for MyIter { }";
+            let issues = verify_imports(black_box(code));
+            black_box(issues);
+        });
+    });
+
     // 嵌套 glob 导入
     group.bench_function("nested_glob", |b| {
         b.iter(|| {

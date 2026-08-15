@@ -398,6 +398,10 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    // Session 150: 串行化环境变量测试, 防止并行竞态
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     // ===== 默认值测试 =====
 
     #[test]
@@ -560,6 +564,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_port() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_BROWSER_PORT");
         std::env::set_var("FORGE_BROWSER_PORT", "9224");
 
@@ -576,6 +581,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_auto_launch() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_BROWSER_AUTO_LAUNCH");
         std::env::set_var("FORGE_BROWSER_AUTO_LAUNCH", "true");
 
@@ -592,6 +598,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_chat_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_CHAT_PHASE1_TIMEOUT");
         std::env::set_var("FORGE_CHAT_PHASE1_TIMEOUT", "90");
 
@@ -608,6 +615,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_recovery() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved1 = std::env::var_os("FORGE_RECOVERY_MAX_RETRIES");
         let saved2 = std::env::var_os("FORGE_RECOVERY_AUTO_FAILOVER");
         std::env::set_var("FORGE_RECOVERY_MAX_RETRIES", "5");
@@ -632,6 +640,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_invalid_port_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var_os("FORGE_BROWSER_PORT");
         std::env::set_var("FORGE_BROWSER_PORT", "not-a-number");
 
@@ -649,6 +658,7 @@ default_site = "zai"
 
     #[test]
     fn test_apply_env_overrides_no_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // 确保环境变量未设置
         let saved = std::env::var_os("FORGE_BROWSER_PORT");
         std::env::remove_var("FORGE_BROWSER_PORT");

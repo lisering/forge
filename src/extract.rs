@@ -2003,7 +2003,12 @@ pub fn generate_fix(issue: &QualityIssue, original_line: &str) -> Option<String>
                         return None;
                     }
                     let before = &original_line[..arrow_pos + 2];
-                    let after = &original_line[arrow_pos + 2 + brace_pos..];
+                    let brace_abs = arrow_pos + brace_pos;
+                    let after = if brace_abs < original_line.len() {
+                        &original_line[brace_abs..]
+                    } else {
+                        ""
+                    };
                     return Some(format!(
                         "{} Result<{}, anyhow::Error>{}",
                         before, return_type, after
@@ -5544,6 +5549,21 @@ pub fn ensure_std_imports(content: &str) -> String {
         ("RawHandle", "std::os::windows::io"),
         ("OwnedHandle", "std::os::windows::io"),
         ("BorrowedHandle", "std::os::windows::io"),
+        // Session 150: std types commonly used in data structure implementations
+        // std::str::FromStr — needed when implementing impl FromStr for T
+        ("FromStr", "std::str"),
+        // std::fmt::Write — needed when implementing impl Write for T
+        ("Write", "std::fmt"),
+        // std::ops::{Deref, DerefMut, Index, IndexMut, Drop} — smart pointer & indexing traits
+        ("Deref", "std::ops"),
+        ("DerefMut", "std::ops"),
+        ("Index", "std::ops"),
+        ("IndexMut", "std::ops"),
+        ("Drop", "std::ops"),
+        // std::iter::{FusedIterator, DoubleEndedIterator, ExactSizeIterator} — iterator marker traits
+        ("FusedIterator", "std::iter"),
+        ("DoubleEndedIterator", "std::iter"),
+        ("ExactSizeIterator", "std::iter"),
     ];
 
     // 收集需要的导入: module_path -> Vec<type_name>
@@ -5987,6 +6007,21 @@ pub fn ensure_external_imports(content: &str) -> String {
         // console (Session 148) — console::Term / console::Style
         ("Term", "console"),
         ("Style", "console"),
+        // Session 150: std types commonly used in data structure implementations
+        // std::str::FromStr — needed when implementing impl FromStr for T
+        ("FromStr", "std::str"),
+        // std::fmt::Write — needed when implementing impl Write for T (Display/Debug already covered)
+        ("Write", "std::fmt"),
+        // std::ops::{Deref, DerefMut, Index, IndexMut, Drop} — smart pointer & indexing traits
+        ("Deref", "std::ops"),
+        ("DerefMut", "std::ops"),
+        ("Index", "std::ops"),
+        ("IndexMut", "std::ops"),
+        ("Drop", "std::ops"),
+        // std::iter::{FusedIterator, DoubleEndedIterator, ExactSizeIterator} — iterator marker traits
+        ("FusedIterator", "std::iter"),
+        ("DoubleEndedIterator", "std::iter"),
+        ("ExactSizeIterator", "std::iter"),
     ];
 
     // 收集需要的导入: crate_path -> Vec<type_name>
@@ -7139,6 +7174,21 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         // console (Session 148)
         ("Term", "console"),
         ("Style", "console"),
+        // Session 150: std types commonly used in data structure implementations
+        // std::str::FromStr — needed when implementing impl FromStr for T
+        ("FromStr", "std::str"),
+        // std::fmt::Write — needed when implementing impl Write for T
+        ("Write", "std::fmt"),
+        // std::ops::{Deref, DerefMut, Index, IndexMut, Drop} — smart pointer & indexing traits
+        ("Deref", "std::ops"),
+        ("DerefMut", "std::ops"),
+        ("Index", "std::ops"),
+        ("IndexMut", "std::ops"),
+        ("Drop", "std::ops"),
+        // std::iter::{FusedIterator, DoubleEndedIterator, ExactSizeIterator} — iterator marker traits
+        ("FusedIterator", "std::iter"),
+        ("DoubleEndedIterator", "std::iter"),
+        ("ExactSizeIterator", "std::iter"),
     ];
 
     for &(type_name, module_path) in type_modules {
@@ -23540,6 +23590,353 @@ fn main() {
             result.contains("use std::iter::Iterator;"),
             "应包含 Iterator 导入: {}",
             result
+        );
+    }
+
+    // ===== Session 150: ensure_external_imports 新 std 类型测试 =====
+
+    #[test]
+    fn test_ensure_external_imports_from_str() {
+        let code = "impl FromStr for MyType { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::str::FromStr;"),
+            "应添加 FromStr 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_write_fmt() {
+        let code = "impl Write for MyType { fn write_str(&mut self, s: &str) -> std::fmt::Result { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::fmt::Write;"),
+            "应添加 Write 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_deref() {
+        let code = "impl Deref for MyType { type Target = i32; fn deref(&self) -> &Self::Target { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::Deref;"),
+            "应添加 Deref 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_deref_mut() {
+        let code = "impl DerefMut for MyType { fn deref_mut(&mut self) -> &mut Self::Target { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::DerefMut;"),
+            "应添加 DerefMut 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_index() {
+        let code = "impl Index<usize> for MyType { type Output = i32; fn index(&self, idx: usize) -> &Self::Output { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::Index;"),
+            "应添加 Index 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_index_mut() {
+        let code = "impl IndexMut<usize> for MyType { fn index_mut(&mut self, idx: usize) -> &mut Self::Output { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::IndexMut;"),
+            "应添加 IndexMut 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_drop() {
+        let code = "impl Drop for MyType { fn drop(&mut self) { } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::Drop;"),
+            "应添加 Drop 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_fused_iterator() {
+        let code = "impl FusedIterator for MyIter { }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::FusedIterator;"),
+            "应添加 FusedIterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_double_ended_iterator() {
+        let code = "impl DoubleEndedIterator for MyIter { fn next_back(&mut self) -> Option<Self::Item> { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::DoubleEndedIterator;"),
+            "应添加 DoubleEndedIterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_exact_size_iterator() {
+        let code = "impl ExactSizeIterator for MyIter { fn len(&self) -> usize { 0 } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::ExactSizeIterator;"),
+            "应添加 ExactSizeIterator 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s150_multiple_ops_types() {
+        let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl Index<usize> for A { type Output = i32; fn index(&self, _: usize) -> &i32 { &0 } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::ops::{Deref, Index};"),
+            "应合并 Deref 和 Index 导入: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s150_already_imported() {
+        let code = "use std::str::FromStr;\nimpl FromStr for A { type Err = (); fn from_str(_: &str) -> Result<Self, Self::Err> { unimplemented!() } }";
+        let result = ensure_external_imports(code);
+        let count = result.matches("use std::str::FromStr;").count();
+        assert_eq!(count, 1, "已有 FromStr 导入不应重复添加: {}", result);
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s150_idempotent() {
+        let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl Drop for A { fn drop(&mut self) {} }";
+        let first = ensure_external_imports(code);
+        let second = ensure_external_imports(&first);
+        assert_eq!(first, second, "S150 类型检测应幂等");
+    }
+
+    #[test]
+    fn test_ensure_external_imports_s150_with_glob() {
+        let code = "use std::ops::*;\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            !result.contains("use std::ops::Deref;"),
+            "通配导入应覆盖: {}",
+            result
+        );
+    }
+
+    // ===== Session 150: verify_imports 新 std 类型测试 =====
+
+    #[test]
+    fn test_verify_imports_from_str_missing() {
+        let issues = verify_imports("impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "FromStr" && i.module_path == "std::str"),
+            "应检测到 FromStr 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_write_fmt_missing() {
+        let issues = verify_imports("impl Write for A { fn write_str(&mut self, s: &str) -> std::fmt::Result { unimplemented!() } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Write" && i.module_path == "std::fmt"),
+            "应检测到 Write 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_deref_missing() {
+        let issues = verify_imports(
+            "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }",
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Deref" && i.module_path == "std::ops"),
+            "应检测到 Deref 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_index_mut_missing() {
+        let issues = verify_imports("impl IndexMut<usize> for A { fn index_mut(&mut self, idx: usize) -> &mut i32 { unimplemented!() } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "IndexMut" && i.module_path == "std::ops"),
+            "应检测到 IndexMut 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_drop_missing() {
+        let issues = verify_imports("impl Drop for A { fn drop(&mut self) { } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "Drop" && i.module_path == "std::ops"),
+            "应检测到 Drop 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_fused_iterator_missing() {
+        let issues = verify_imports("impl FusedIterator for A { }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "FusedIterator" && i.module_path == "std::iter"),
+            "应检测到 FusedIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_double_ended_iterator_missing() {
+        let issues = verify_imports(
+            "impl DoubleEndedIterator for A { fn next_back(&mut self) -> Option<i32> { None } }",
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "DoubleEndedIterator" && i.module_path == "std::iter"),
+            "应检测到 DoubleEndedIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_exact_size_iterator_missing() {
+        let issues =
+            verify_imports("impl ExactSizeIterator for A { fn len(&self) -> usize { 0 } }");
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.type_name == "ExactSizeIterator" && i.module_path == "std::iter"),
+            "应检测到 ExactSizeIterator 缺失导入: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_verify_imports_s150_already_imported() {
+        let code = "use std::ops::Deref;\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+        let issues = verify_imports(code);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.type_name == "Deref" && i.module_path == "std::ops"),
+            "已有 Deref 导入不应报告: {:?}",
+            issues
+        );
+    }
+
+    // ===== Session 150: ensure_external_imports 后无问题验证 =====
+
+    #[test]
+    fn test_ensure_external_imports_then_verify_no_s150_issues() {
+        let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl Index<usize> for A { type Output = i32; fn index(&self, _: usize) -> &i32 { &0 } }";
+        let fixed = ensure_external_imports(code);
+        let issues = verify_imports(&fixed);
+        let s150_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.module_path == "std::str"
+                    || i.module_path == "std::ops"
+                    || i.module_path == "std::iter"
+                    || i.module_path == "std::fmt"
+            })
+            .filter(|i| {
+                matches!(
+                    i.type_name.as_str(),
+                    "FromStr"
+                        | "Write"
+                        | "Deref"
+                        | "DerefMut"
+                        | "Index"
+                        | "IndexMut"
+                        | "Drop"
+                        | "FusedIterator"
+                        | "DoubleEndedIterator"
+                        | "ExactSizeIterator"
+                )
+            })
+            .collect();
+        assert!(
+            s150_issues.is_empty(),
+            "ensure_external_imports 后不应有 Session 150 类型导入问题: {:?}",
+            s150_issues
+        );
+    }
+
+    // ===== Session 150: 混合 S149+S150 类型验证 =====
+
+    #[test]
+    fn test_mixed_s149_s150_types() {
+        let code = "fn foo(v: Vec<i32>) { v.iter(); }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+        let result = ensure_external_imports(code);
+        assert!(
+            result.contains("use std::iter::Iterator;"),
+            "应包含 S149 Iterator 导入: {}",
+            result
+        );
+        assert!(
+            result.contains("use std::ops::Deref;"),
+            "应包含 S150 Deref 导入: {}",
+            result
+        );
+    }
+
+    // ===== Session 150: 双格式一致性验证 =====
+
+    #[test]
+    fn test_s150_json_markdown_consistency() {
+        let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+        let json = verify_imports_to_json(code);
+        let markdown = verify_imports_to_markdown(code);
+        assert!(
+            json.contains("FromStr"),
+            "JSON 报告应包含 FromStr: {}",
+            json
+        );
+        assert!(
+            markdown.contains("FromStr"),
+            "Markdown 报告应包含 FromStr: {}",
+            markdown
+        );
+        assert!(json.contains("Deref"), "JSON 报告应包含 Deref: {}", json);
+        assert!(
+            markdown.contains("Deref"),
+            "Markdown 报告应包含 Deref: {}",
+            markdown
         );
     }
 }

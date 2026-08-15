@@ -2021,3 +2021,124 @@ fn test_import_report_json_markdown_consistency_s149() {
         );
     }
 }
+
+// ===== Session 150: std trait 类型报告 (FromStr/Write/Deref/Index/Drop/FusedIterator) =====
+
+#[test]
+fn test_import_report_json_s150_from_str() {
+    let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("FromStr"), "JSON 应包含 FromStr: {}", json);
+    assert!(
+        json.contains("std::str"),
+        "JSON 应包含 std::str 模块路径: {}",
+        json
+    );
+}
+
+#[test]
+fn test_import_report_markdown_s150_deref() {
+    let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("Deref"), "Markdown 应包含 Deref: {}", md);
+    assert!(
+        md.contains("std::ops"),
+        "Markdown 应包含 std::ops 模块路径: {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_json_s150_drop() {
+    let code = "impl Drop for A { fn drop(&mut self) { } }";
+    let json = verify_imports_to_json(code);
+    assert!(json.contains("Drop"), "JSON 应包含 Drop: {}", json);
+}
+
+#[test]
+fn test_import_report_markdown_s150_index_mut() {
+    let code = "impl IndexMut<usize> for A { fn index_mut(&mut self, idx: usize) -> &mut i32 { unimplemented!() } }";
+    let md = verify_imports_to_markdown(code);
+    assert!(md.contains("IndexMut"), "Markdown 应包含 IndexMut: {}", md);
+}
+
+#[test]
+fn test_import_report_ensure_s150_from_str() {
+    let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s150_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "FromStr" && i.module_path == "std::str")
+        .collect();
+    assert!(
+        s150_issues.is_empty(),
+        "ensure_external_imports 后不应有 FromStr 导入问题: {:?}",
+        s150_issues
+    );
+}
+
+#[test]
+fn test_import_report_ensure_s150_deref() {
+    let code = "impl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+    let fixed = ensure_external_imports(code);
+    let issues = verify_imports(&fixed);
+    let s150_issues: Vec<_> = issues
+        .iter()
+        .filter(|i| i.type_name == "Deref" && i.module_path == "std::ops")
+        .collect();
+    assert!(
+        s150_issues.is_empty(),
+        "ensure_external_imports 后不应有 Deref 导入问题: {:?}",
+        s150_issues
+    );
+}
+
+#[test]
+fn test_import_report_mixed_s149_s150_types() {
+    let code = "fn foo(v: Vec<i32>) { v.iter(); }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+    assert!(
+        json.contains("Iterator"),
+        "JSON 应包含 Iterator (混合 S149+S150): {}",
+        json
+    );
+    assert!(
+        md.contains("Iterator"),
+        "Markdown 应包含 Iterator (混合 S149+S150): {}",
+        md
+    );
+    assert!(
+        json.contains("Deref"),
+        "JSON 应包含 Deref (混合 S149+S150): {}",
+        json
+    );
+    assert!(
+        md.contains("Deref"),
+        "Markdown 应包含 Deref (混合 S149+S150): {}",
+        md
+    );
+}
+
+#[test]
+fn test_import_report_json_markdown_consistency_s150() {
+    let code = "impl FromStr for A { type Err = (); fn from_str(s: &str) -> Result<Self, Self::Err> { unimplemented!() } }\nimpl Deref for A { type Target = i32; fn deref(&self) -> &i32 { &0 } }\nimpl Index<usize> for A { type Output = i32; fn index(&self, _: usize) -> &i32 { &0 } }";
+    let json = verify_imports_to_json(code);
+    let md = verify_imports_to_markdown(code);
+
+    for type_name in &["FromStr", "Deref", "Index"] {
+        assert!(
+            json.contains(type_name),
+            "JSON 应包含 {}: {}",
+            type_name,
+            json
+        );
+        assert!(
+            md.contains(type_name),
+            "Markdown 应包含 {}: {}",
+            type_name,
+            md
+        );
+    }
+}
