@@ -266,6 +266,12 @@ impl SystemPrompt {
         prompt.push_str(
 "⚠️ 注意: crossterm 的 execute!/queue! 是宏调用, 只有 execute!()/queue!() 形式才需要 use crossterm::execute / use crossterm::queue; 普通变量名 queue/execute 不会触发导入检测 (Session 153 误报修复)\n",
 );
+        prompt.push_str(
+"⚠️ 注意: 歧义类型 (Command/Write/Error/Result 等) 在 std 和外部 crate 中都存在 — 当代码中已有 std::process::Command 时不要添加 iced::Command; 当已有 std::io::Write 时不要添加 std::fmt::Write (Session 155 误报修复)\n",
+);
+        prompt.push_str(
+"⚠️ 注意: #[test] 和 #[tokio::test] 标注的测试函数中允许使用 unwrap()/expect() — 不要修改测试函数的签名或返回类型 (Session 155)\n",
+);
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1856,6 +1862,38 @@ mod tests {
         assert!(
             prompt.contains("execute!") || prompt.contains("queue!"),
             "系统 prompt 应包含 execute!/queue! 宏形式说明 (S153)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s155_ambiguous_type_constraint() {
+        // S155: 歧义类型 (Command/Write/Error) 在 std 和外部 crate 中都存在
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("歧义类型"),
+            "系统 prompt 应包含歧义类型约束 (S155)"
+        );
+        assert!(
+            prompt.contains("Command") && prompt.contains("iced"),
+            "系统 prompt 应包含 Command/iced 歧义类型说明 (S155)"
+        );
+        assert!(
+            prompt.contains("Write") && prompt.contains("std::fmt"),
+            "系统 prompt 应包含 Write/std::fmt 歧义类型说明 (S155)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s155_test_function_protection() {
+        // S155: #[test] 函数中允许 unwrap()/expect(), 不修改测试签名
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("#[test]"),
+            "系统 prompt 应包含 #[test] 约束 (S155)"
+        );
+        assert!(
+            prompt.contains("unwrap()"),
+            "系统 prompt 应包含 unwrap() 允许说明 (S155)"
         );
     }
 }

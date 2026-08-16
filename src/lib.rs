@@ -216,14 +216,14 @@ pub use extract::{
     ensure_anyhow_imports, ensure_anyhow_imports_extended, ensure_external_imports,
     ensure_std_imports, extract_files, extract_glob_imports, format_diff_comparison,
     format_diff_summary, format_diff_unified, format_diff_unified_colored,
-    format_diff_unified_with_options, generate_fix, merge_anyhow_imports, run_clippy_check,
-    strip_string_content, strip_use_block_comments, strip_use_line_comments, validate_rust_braces,
-    validate_rust_code_quality, validate_rust_code_quality_detailed, verify_idempotent,
-    verify_idempotent_detailed, verify_imports, verify_imports_report, verify_imports_to_json,
-    verify_imports_to_markdown, wrap_last_expression_in_ok, wrap_return_statements_in_ok,
-    DefaultExtractor, DiffAlgorithm, DiffComparisonEntry, DiffComparisonResult, FixPreview,
-    IdempotencyResult, ImportIssue, IssueType, LineDiff, LineDiffType, QualityIssue,
-    StagedFixPreview, StagedFixValidation,
+    format_diff_unified_with_options, generate_fix, is_ambiguous_type_covered_by_std,
+    merge_anyhow_imports, run_clippy_check, strip_string_content, strip_use_block_comments,
+    strip_use_line_comments, validate_rust_braces, validate_rust_code_quality,
+    validate_rust_code_quality_detailed, verify_idempotent, verify_idempotent_detailed,
+    verify_imports, verify_imports_report, verify_imports_to_json, verify_imports_to_markdown,
+    wrap_last_expression_in_ok, wrap_return_statements_in_ok, DefaultExtractor, DiffAlgorithm,
+    DiffComparisonEntry, DiffComparisonResult, FixPreview, IdempotencyResult, ImportIssue,
+    IssueType, LineDiff, LineDiffType, QualityIssue, StagedFixPreview, StagedFixValidation,
 };
 pub use failover_chat::{FailoverChatClient, SitePerformanceStats};
 pub use html_report::{

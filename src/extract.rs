@@ -1384,6 +1384,9 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
     let lines: Vec<&str> = content.lines().collect();
     let mut in_test_module = false;
     let mut test_module_brace_depth = 0i32;
+    // Session 155: 跟踪 #[test] 函数 (适用于独立测试文件 tests/*.rs)
+    let mut in_test_fn = false;
+    let mut test_fn_brace_depth = 0i32;
 
     for (line_num, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -1392,6 +1395,13 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
         if trimmed.contains("#[cfg(test)]") {
             in_test_module = true;
             test_module_brace_depth = 0;
+        }
+
+        // Session 155: 检测 #[test] 属性 (独立测试文件中)
+        // 当不在 #[cfg(test)] 模块内时, #[test] 标记的函数也应跳过 unwrap/expect 检测
+        if !in_test_module && trimmed == "#[test]" {
+            in_test_fn = true;
+            test_fn_brace_depth = 0;
         }
 
         // 跟踪测试模块的大括号深度
@@ -1408,13 +1418,28 @@ pub fn validate_rust_code_quality_detailed(content: &str) -> Vec<QualityIssue> {
             }
         }
 
+        // Session 155: 跟踪 #[test] 函数的大括号深度
+        if in_test_fn {
+            for c in line.chars() {
+                if c == '{' {
+                    test_fn_brace_depth += 1;
+                } else if c == '}' {
+                    test_fn_brace_depth -= 1;
+                    if test_fn_brace_depth <= 0 {
+                        in_test_fn = false;
+                    }
+                }
+            }
+        }
+
         // 跳过注释行
         if trimmed.starts_with("//") {
             continue;
         }
 
         // 在非测试代码中检查禁止模式
-        if !in_test_module {
+        // Session 155: 同时跳过 #[test] 函数 (独立测试文件)
+        if !in_test_module && !in_test_fn {
             // 检查 .unwrap()
             if contains_pattern_outside_comment(trimmed, ".unwrap()") {
                 issues.push(QualityIssue {
@@ -1645,10 +1670,19 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
     let mut returns_result = false;
     let mut in_test_module = false;
     let mut test_module_brace_depth = 0i32;
+    // Session 155: 跟踪 #[test] 属性 (独立测试文件)
+    let mut next_fn_is_test = false;
+    // Session 155: 当前跟踪的函数是否为测试函数
+    let mut is_test_fn = false;
 
     for (line_num, &line) in lines.iter().enumerate() {
         let stripped = strip_string_content(line);
         let trimmed = stripped.trim();
+
+        // Session 155: 检测 #[test] 属性, 标记下一个函数为测试函数
+        if trimmed == "#[test]" || trimmed == "#[tokio::test]" {
+            next_fn_is_test = true;
+        }
 
         // 跟踪测试模块
         if trimmed.starts_with("mod ") && trimmed.contains("test") && stripped.contains('{') {
@@ -1677,6 +1711,10 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                 && !trimmed.starts_with("//")
                 && !trimmed.starts_with("///")
             {
+                // Session 155: 消费 next_fn_is_test 标志
+                is_test_fn = next_fn_is_test;
+                next_fn_is_test = false;
+
                 func_start_line = Some(line_num);
                 needs_result = false;
                 returns_result = stripped.contains("-> Result")
@@ -1688,7 +1726,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                     let closes = stripped.matches('}').count();
                     brace_depth = opens as i32 - closes as i32;
 
-                    if contains_result_requiring_pattern(&stripped, line) {
+                    if !is_test_fn && contains_result_requiring_pattern(&stripped, line) {
                         needs_result = true;
                     }
 
@@ -1698,6 +1736,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                         }
                         func_start_line = None;
                         brace_depth = 0;
+                        is_test_fn = false;
                     }
                 }
             }
@@ -1722,7 +1761,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                 {
                     returns_result = true;
                 }
-                if contains_result_requiring_pattern(&stripped, line) {
+                if !is_test_fn && contains_result_requiring_pattern(&stripped, line) {
                     needs_result = true;
                 }
 
@@ -1732,6 +1771,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                     }
                     func_start_line = None;
                     brace_depth = 0;
+                    is_test_fn = false;
                 }
             }
         } else {
@@ -1740,7 +1780,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
             let closes = stripped.matches('}').count();
             brace_depth += opens as i32 - closes as i32;
 
-            if contains_result_requiring_pattern(&stripped, line) {
+            if !is_test_fn && contains_result_requiring_pattern(&stripped, line) {
                 needs_result = true;
             }
 
@@ -1750,6 +1790,7 @@ pub fn detect_missing_result_returns(content: &str) -> Vec<QualityIssue> {
                 }
                 func_start_line = None;
                 brace_depth = 0;
+                is_test_fn = false;
             }
         }
     }
@@ -5113,6 +5154,102 @@ fn contains_type_usage(content: &str, type_name: &str) -> bool {
     false
 }
 
+/// 检查歧义类型是否已被 std 模块覆盖 (Session 155)
+///
+/// 当一个类型名在 std 和外部 crate 中都存在时 (如 Command, Write, Error),
+/// 如果代码中已有 std 版本的导入或全限定使用, 则不添加外部 crate 版本。
+///
+/// # 歧义类型映射
+///
+/// | 类型名 | std 路径 | 外部 crate 路径 |
+/// |--------|----------|-----------------|
+/// | Command | std::process | iced |
+/// | Write | std::io | std::fmt |
+/// | Error | std::error | anyhow (implied) |
+/// | Result | std::result | anyhow (implied) |
+///
+/// # 示例
+///
+/// ```
+/// use forge::extract::is_ambiguous_type_covered_by_std;
+///
+/// // Command 已有 std::process 导入, 不应添加 iced::Command
+/// let code = "use std::process::Command;\nfn foo() { let c = Command::new(\"ls\"); }";
+/// assert!(is_ambiguous_type_covered_by_std(code, "Command", "iced"));
+///
+/// // Write 已有 std::io 导入, 不应添加 std::fmt::Write
+/// let code = "use std::io::{self, BufRead, Write};\nfn foo() { stdout.flush(); }";
+/// assert!(is_ambiguous_type_covered_by_std(code, "Write", "std::fmt"));
+/// ```
+pub fn is_ambiguous_type_covered_by_std(content: &str, type_name: &str, crate_path: &str) -> bool {
+    // 歧义类型映射: (type_name, external_crate_path, std_module_paths)
+    let ambiguous_types: &[(&str, &str, &[&str])] = &[
+        // Command: std::process vs iced
+        (
+            "Command",
+            "iced",
+            &["std::process::Command", "process::Command"],
+        ),
+        // Write: std::io vs std::fmt
+        (
+            "Write",
+            "std::fmt",
+            &["std::io::Write", "io::Write", "std::io::{", "io::{"],
+        ),
+        // Error: std::error vs anyhow (implied)
+        ("Error", "std::error", &["anyhow::Error", "anyhow::Error"]),
+        // Result: std::result vs anyhow (implied)
+        (
+            "Result",
+            "std::error",
+            &["anyhow::Result", "anyhow::Result"],
+        ),
+    ];
+
+    for &(amb_type, amb_crate, std_paths) in ambiguous_types {
+        if type_name == amb_type && crate_path == amb_crate {
+            // 检查是否已有 std 版本的导入或全限定使用
+            for &std_path in std_paths {
+                if content.contains(std_path) {
+                    return true;
+                }
+            }
+            // 对于 Write, 还需检查 use std::io::{...Write...} 形式
+            if type_name == "Write" && crate_path == "std::fmt" {
+                // 检查是否有 std::io 的 glob 导入或 Write 在 io 导入列表中
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if (trimmed.starts_with("use std::io::{")
+                        || trimmed.starts_with("use std::io::"))
+                        && contains_type_usage(trimmed, "Write")
+                    {
+                        return true;
+                    }
+                    if trimmed.starts_with("use std::io::Write;") {
+                        return true;
+                    }
+                }
+            }
+            // 对于 Command, 还需检查 use std::process::{...Command...} 形式
+            if type_name == "Command" && crate_path == "iced" {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if (trimmed.starts_with("use std::process::{")
+                        || trimmed.starts_with("use std::process::"))
+                        && contains_type_usage(trimmed, "Command")
+                    {
+                        return true;
+                    }
+                    if trimmed.starts_with("use std::process::Command;") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// 检查是否存在覆盖给定模块路径的 glob 导入 (Session 129)
 ///
 /// 检测 `use module::*;` 或 `use parent::*;` 形式的 glob 导入,
@@ -6041,6 +6178,14 @@ pub fn ensure_external_imports(content: &str) -> String {
         let bare_usage = contains_type_usage(content, type_name)
             && !content.contains(&full_path)
             && !(crate_path == type_name && content.contains(&crate_prefix));
+
+        // Session 155: 歧义类型排除 — 当一个类型名在 std 和外部 crate 中都存在时,
+        // 如果代码中已有 std 版本的导入或使用, 不添加外部 crate 版本。
+        // 例如: Command 既属于 std::process 又属于 iced, Write 既属于 std::io 又属于 std::fmt,
+        // Error 既属于 std::error 又属于 anyhow, Result 既属于 std::result 又属于 anyhow。
+        if bare_usage && is_ambiguous_type_covered_by_std(content, type_name, crate_path) {
+            continue;
+        }
 
         if bare_usage {
             // 检查是否已有导入
@@ -7240,6 +7385,11 @@ pub fn verify_imports(content: &str) -> Vec<ImportIssue> {
         let bare_usage = contains_type_usage(content, type_name)
             && !content.contains(&full_path)
             && !(module_path == type_name && content.contains(&module_prefix));
+
+        // Session 155: 歧义类型排除 — 同 ensure_external_imports
+        if bare_usage && is_ambiguous_type_covered_by_std(content, type_name, module_path) {
+            continue;
+        }
 
         if bare_usage {
             // 检查是否已有导入
@@ -11174,6 +11324,78 @@ fn foo(
     fn test_detect_missing_result_returns_question_in_comment() {
         let issues = detect_missing_result_returns("fn foo() { // what?\n }");
         assert!(issues.is_empty(), "注释中的 ? 不应报告");
+    }
+
+    // ===== Session 155: detect_missing_result_returns 跳过 #[test] 函数 =====
+
+    #[test]
+    fn test_detect_missing_result_returns_skips_test_fn() {
+        // #[test] 标注的函数中即使有 unwrap() 也不应被报告
+        let code = r#"
+#[test]
+fn test_foo() { let x = bar().unwrap(); }
+"#;
+        let issues = detect_missing_result_returns(code);
+        assert!(
+            issues.is_empty(),
+            "#[test] 函数不应报告 MissingResultReturn, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_skips_tokio_test_fn() {
+        // #[tokio::test] 标注的函数也不应被报告
+        let code = r#"
+#[tokio::test]
+async fn test_async_foo() { let x = bar().unwrap(); }
+"#;
+        let issues = detect_missing_result_returns(code);
+        assert!(
+            issues.is_empty(),
+            "#[tokio::test] 函数不应报告 MissingResultReturn, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_mixed_test_and_non_test() {
+        // 混合: 非测试函数应报告, 测试函数不应报告
+        let code = r#"
+fn foo() { let x = bar().unwrap(); }
+
+#[test]
+fn test_foo() { let x = bar().unwrap(); }
+
+fn bar() { let x = baz().expect("msg"); }
+"#;
+        let issues = detect_missing_result_returns(code);
+        // 只应报告 foo 和 bar, 不报告 test_foo
+        assert_eq!(
+            issues.len(),
+            2,
+            "应报告 2 个非测试函数, 不报告 #[test] 函数, got: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_detect_missing_result_returns_test_fn_multiline() {
+        // 多行签名的 #[test] 函数也不应被报告
+        let code = r#"
+#[test]
+fn test_foo(
+    x: i32,
+) {
+    let y = bar().unwrap();
+}
+"#;
+        let issues = detect_missing_result_returns(code);
+        assert!(
+            issues.is_empty(),
+            "多行签名 #[test] 函数不应报告 MissingResultReturn, got: {:?}",
+            issues
+        );
     }
 
     // ===== Session 119: generate_fix MissingResultReturn 测试 =====
