@@ -129,6 +129,35 @@ impl HeuristicClarificationChecker {
         None
     }
 
+    /// 检测回复中是否已包含 JSON 阶段计划 (Session 156)
+    ///
+    /// 在 planning 阶段, AI 可能在分析文本中包含问号 (如"使用哪种方案?")
+    /// 但同时已输出了完整的 JSON 计划。此时不应触发追问, 因为:
+    /// 1. AI 已经完成了规划任务 (输出了 JSON)
+    /// 2. 问号是 AI 的分析思考过程, 非真正的澄清请求
+    /// 3. 追问会打乱 AI 的节奏, 导致后续回复越来越短
+    ///
+    /// 检测条件 (满足任一即视为已包含 JSON 计划):
+    /// - 包含 ```json 代码块
+    /// - 以 [ 开头 (JSON 数组)
+    /// - 包含 [{"name" 和 "tasks" 关键字 (JSON 阶段结构)
+    fn has_json_plan(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        // 包含 ```json 代码块
+        if text.contains("```json") {
+            return true;
+        }
+        // 以 [ 开头 (JSON 数组)
+        if trimmed.starts_with('[') {
+            return true;
+        }
+        // 包含 JSON 阶段结构关键字
+        if text.contains("\"name\"") && text.contains("\"tasks\"") {
+            return true;
+        }
+        false
+    }
+
     /// 检测不确定/模糊标记
     fn detect_uncertainty(&self, text: &str) -> Option<String> {
         let lower = text.to_lowercase();
@@ -216,30 +245,40 @@ impl ClarificationChecker for HeuristicClarificationChecker {
         }
 
         // 优先级 2: 直接提问检测
-        if let Some(reason) = self.detect_question(response) {
-            let question = self.build_follow_up(&reason);
-            if self.is_duplicate(&question, &context.previous_questions) {
-                return ClarificationResult::no();
+        // Session 156: 如果回复已包含 JSON 阶段计划, 跳过问号检测
+        // (AI 在规划阶段的问号是分析思考, 非真正的澄清请求)
+        if !Self::has_json_plan(response) {
+            if let Some(reason) = self.detect_question(response) {
+                let question = self.build_follow_up(&reason);
+                if self.is_duplicate(&question, &context.previous_questions) {
+                    return ClarificationResult::no();
+                }
+                return ClarificationResult::yes(question, reason);
             }
-            return ClarificationResult::yes(question, reason);
         }
 
         // 优先级 3: 不确定标记检测
-        if let Some(reason) = self.detect_uncertainty(response) {
-            let question = self.build_follow_up(&reason);
-            if self.is_duplicate(&question, &context.previous_questions) {
-                return ClarificationResult::no();
+        // Session 156: 同样跳过已包含 JSON 计划的回复
+        if !Self::has_json_plan(response) {
+            if let Some(reason) = self.detect_uncertainty(response) {
+                let question = self.build_follow_up(&reason);
+                if self.is_duplicate(&question, &context.previous_questions) {
+                    return ClarificationResult::no();
+                }
+                return ClarificationResult::yes(question, reason);
             }
-            return ClarificationResult::yes(question, reason);
         }
 
         // 优先级 4: 过短回复检测
-        if let Some(reason) = self.detect_too_short(response) {
-            let question = self.build_follow_up(&reason);
-            if self.is_duplicate(&question, &context.previous_questions) {
-                return ClarificationResult::no();
+        // Session 156: 跳过已包含 JSON 计划的回复
+        if !Self::has_json_plan(response) {
+            if let Some(reason) = self.detect_too_short(response) {
+                let question = self.build_follow_up(&reason);
+                if self.is_duplicate(&question, &context.previous_questions) {
+                    return ClarificationResult::no();
+                }
+                return ClarificationResult::yes(question, reason);
             }
-            return ClarificationResult::yes(question, reason);
         }
 
         ClarificationResult::no()
@@ -742,5 +781,107 @@ mod tests {
         };
         let result = checker.check("你希望用什么框架？", &context).await;
         assert!(result.needs_clarification, "未达上限应可追问");
+    }
+
+    // ===== Session 156: JSON 阶段计划检测 — 跳过不必要的追问 =====
+
+    #[tokio::test]
+    async fn test_json_plan_skips_question_mark_detection() {
+        // AI 回复包含 JSON 计划 + 代码块外的问号 → 不应触发追问
+        let checker = HeuristicClarificationChecker::new();
+        let response = "我来分析这个项目。使用哪种解析器? 让我规划一下。\n```json\n[\n  {\n    \"name\": \"阶段1\",\n    \"description\": \"初始化\",\n    \"tasks\": [\n      {\"name\": \"创建项目\", \"prompt\": \"创建 Cargo.toml\"}\n    ]\n  }\n]\n```";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            !result.needs_clarification,
+            "包含 JSON 计划的回复不应触发追问, 即使有问号"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_array_starts_with_bracket_skips_clarification() {
+        // 回复以 [ 开头 (JSON 数组) + 包含问号 → 不应触发追问
+        let checker = HeuristicClarificationChecker::new();
+        let response = "[{\"name\":\"阶段1\",\"tasks\":[{\"name\":\"task1\",\"prompt\":\"p1\"}]}]\n这段规划是否合适?";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            !result.needs_clarification,
+            "以 [ 开头的 JSON 计划 + 问号不应触发追问"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_structure_keywords_skip_clarification() {
+        // 回复包含 "name" 和 "tasks" 关键字 (JSON 阶段结构) + 问号 → 不应触发追问
+        let checker = HeuristicClarificationChecker::new();
+        let response = "这个方案如何? 让我输出计划。\n{\"name\":\"阶段1\",\"tasks\":[{\"name\":\"task1\",\"prompt\":\"p1\"}]}";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            !result.needs_clarification,
+            "包含 JSON 阶段关键字 + 问号不应触发追问"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_json_plan_question_mark_triggers_clarification() {
+        // 回复只有问号, 没有 JSON 计划 → 应触发追问
+        let checker = HeuristicClarificationChecker::new();
+        let response = "你希望使用哪种框架?";
+        let result = checker.check(response, &ctx()).await;
+        assert!(result.needs_clarification, "没有 JSON 计划的问号应触发追问");
+    }
+
+    #[tokio::test]
+    async fn test_json_plan_with_uncertainty_still_triggers() {
+        // 包含 JSON 计划 + 不确定标记 → 仍应跳过追问 (因为 JSON 已提供)
+        let checker = HeuristicClarificationChecker::new();
+        let response = "有两种方案可以选择。\n```json\n[{\"name\":\"阶段1\",\"tasks\":[]}]\n```";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            !result.needs_clarification,
+            "包含 JSON 计划 + 不确定标记不应触发追问"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_plan_short_response_not_too_short() {
+        // 包含 JSON 计划但回复很短 → 不应触发过短检测 (JSON 计划优先)
+        let checker = HeuristicClarificationChecker::new();
+        let response = "```json\n[{\"name\":\"阶段1\",\"tasks\":[]}]\n```";
+        let result = checker.check(response, &ctx()).await;
+        assert!(
+            !result.needs_clarification,
+            "包含 JSON 计划的短回复不应触发过短检测"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_json_plan_code_block() {
+        assert!(HeuristicClarificationChecker::has_json_plan(
+            "text\n```json\n[{\"name\":\"a\"}]\n```"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_has_json_plan_array_prefix() {
+        assert!(HeuristicClarificationChecker::has_json_plan(
+            "[{\"name\":\"a\",\"tasks\":[]}]"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_has_json_plan_keywords() {
+        assert!(HeuristicClarificationChecker::has_json_plan(
+            "text \"name\" text \"tasks\" text"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_has_json_plan_false() {
+        assert!(!HeuristicClarificationChecker::has_json_plan(
+            "你希望用什么框架?"
+        ));
+        assert!(!HeuristicClarificationChecker::has_json_plan(
+            "这是一段普通回复,没有 JSON"
+        ));
     }
 }

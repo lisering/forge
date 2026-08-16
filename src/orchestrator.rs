@@ -5198,6 +5198,18 @@ where
                     self.memory.phases[phase_idx].tasks[task_idx].status = TaskStatus::Failed;
                     return Ok(false);
                 }
+                // Session 156: 设置明确的反馈, 指导 AI 输出代码文件
+                let task_name = &self.memory.phases[phase_idx].tasks[task_idx].name;
+                let task_prompt = &self.memory.phases[phase_idx].tasks[task_idx].prompt;
+                last_feedback = format!(
+                    "上一轮回复中没有提取到代码文件。请直接输出完整的 Rust 代码文件。\n\n\
+                     任务: {}\n\
+                     任务要求: {}\n\n\
+                     ⚠️ 必须使用 ```file:路径``` 格式输出每个文件 (如 ```file:src/main.rs```, ```file:Cargo.toml```)。\n\
+                     不要只输出描述或摘要, 必须输出完整的文件内容。",
+                    task_name, task_prompt
+                );
+                last_errors = vec![];
                 attempt += 1;
                 continue;
             }

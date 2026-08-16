@@ -272,6 +272,9 @@ impl SystemPrompt {
         prompt.push_str(
 "⚠️ 注意: #[test] 和 #[tokio::test] 标注的测试函数中允许使用 unwrap()/expect() — 不要修改测试函数的签名或返回类型 (Session 155)\n",
 );
+        prompt.push_str(
+"⚠️ 注意: 规划阶段如果已输出 JSON 阶段计划, 不要因分析文本中的问号触发追问 — 问号是思考过程, 非 clarification 请求 (Session 156)\n",
+);
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1894,6 +1897,20 @@ mod tests {
         assert!(
             prompt.contains("unwrap()"),
             "系统 prompt 应包含 unwrap() 允许说明 (S155)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s156_json_plan_clarification_constraint() {
+        // S156: 已输出 JSON 阶段计划时不触发追问
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("JSON 阶段计划"),
+            "系统 prompt 应包含 JSON 阶段计划约束 (S156)"
+        );
+        assert!(
+            prompt.contains("Session 156"),
+            "系统 prompt 应包含 Session 156 标记"
         );
     }
 }
