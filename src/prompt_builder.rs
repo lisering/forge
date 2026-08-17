@@ -273,8 +273,11 @@ impl SystemPrompt {
 "⚠️ 注意: #[test] 和 #[tokio::test] 标注的测试函数中允许使用 unwrap()/expect() — 不要修改测试函数的签名或返回类型 (Session 155)\n",
 );
         prompt.push_str(
-"⚠️ 注意: 规划阶段如果已输出 JSON 阶段计划, 不要因分析文本中的问号触发追问 — 问号是思考过程, 非 clarification 请求 (Session 156)\n",
-);
+            "⚠️ 注意: 规划阶段如果已输出 JSON 阶段计划, 不要因分析文本中的问号触发追问 — 问号是思考过程, 非 clarification 请求 (Session 156)\n",
+        );
+        prompt.push_str(
+            "⚠️ 注意: 规划阶段输出 JSON 时, 字符串值中不要使用未转义的双引号 — 如需引用请用单引号或中文引号「」; 字符串值中不要包含换行符, 所有内容写在一行内 (Session 157)\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1911,6 +1914,28 @@ mod tests {
         assert!(
             prompt.contains("Session 156"),
             "系统 prompt 应包含 Session 156 标记"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s157_json_string_escape_constraint() {
+        // S157: JSON 字符串值中不要使用未转义的双引号
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("未转义的双引号"),
+            "系统 prompt 应包含未转义双引号约束 (S157)"
+        );
+        assert!(
+            prompt.contains("中文引号"),
+            "系统 prompt 应包含中文引号替代建议 (S157)"
+        );
+        assert!(
+            prompt.contains("换行符"),
+            "系统 prompt 应包含换行符禁止约束 (S157)"
+        );
+        assert!(
+            prompt.contains("Session 157"),
+            "系统 prompt 应包含 Session 157 标记"
         );
     }
 }

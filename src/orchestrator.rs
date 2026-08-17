@@ -886,6 +886,253 @@ fn repair_truncated_json(json_str: &str) -> String {
 }
 
 // ============================================================================
+//  JSON 未转义引号修复 (Session 157)
+//  AI 输出的 JSON 中 prompt 字段可能包含未转义的双引号, 导致解析失败
+// ============================================================================
+
+/// 修复 JSON 字符串值中未转义的双引号
+///
+/// AI 在 JSON 的 prompt 字段中可能使用未转义的双引号 (如 `"实现"四则运算"功能"`),
+/// 导致 JSON 解析器在第一个内层 `"` 处提前结束字符串, 后面的内容不符合 JSON 语法。
+///
+/// 本函数通过状态机逐字符扫描 JSON, 在字符串值内部检测未转义的双引号并转义之。
+///
+/// # 策略
+/// 1. 跟踪是否在字符串内部 (`in_string`)
+/// 2. 跟踪前一个字符是否为反斜杠 (`escape`)
+/// 3. 当在字符串内部遇到 `"` 且不是转义的:
+///    - 检查 `"` 后面的内容是否符合 JSON 值的后续格式 (如 `,` `}` `]` 或空白后跟这些)
+///    - 如果不符合 (即这是一个未转义的内层引号), 在前面加 `\` 转义
+/// 4. 当在字符串内部遇到换行符, 替换为 `\n`
+///
+/// # 示例
+/// ```ignore
+/// let bad = r#"[{"name":"实现"四则"运算"}]"#;
+/// let fixed = repair_json_unescaped_quotes(bad);
+/// let parsed: Vec<serde_json::Value> = serde_json::from_str(&fixed).unwrap();
+/// assert_eq!(parsed[0]["name"], "实现\"四则\"运算");
+/// ```
+fn repair_json_unescaped_quotes(json_str: &str) -> String {
+    let trimmed = json_str.trim();
+
+    // 如果已经是有效的 JSON, 直接返回
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut result = String::with_capacity(trimmed.len() + 64);
+    let mut in_string = false;
+    let mut escape = false;
+
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if escape {
+            // 前一个字符是反斜杠, 当前字符是转义内容
+            result.push(ch);
+            escape = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == '\\' && in_string {
+            result.push(ch);
+            escape = true;
+            i += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            if !in_string {
+                // 进入字符串
+                in_string = true;
+                result.push(ch);
+                i += 1;
+                continue;
+            }
+
+            // 在字符串内遇到引号 — 判断是字符串结束还是未转义的内层引号
+            // 向前看: 跳过空白后是否是 `,` `}` `]` `:` 或行尾
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j] == ' ' || chars[j] == '\t' || chars[j] == '\n' || chars[j] == '\r')
+            {
+                j += 1;
+            }
+
+            let next_significant = if j < chars.len() {
+                Some(chars[j])
+            } else {
+                None
+            };
+
+            match next_significant {
+                Some(',') | Some('}') | Some(']') | Some(':') | None => {
+                    // 这是字符串结束
+                    in_string = false;
+                    result.push(ch);
+                }
+                _ => {
+                    // 这是未转义的内层引号 — 转义之
+                    result.push('\\');
+                    result.push('"');
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_string && (ch == '\n' || ch == '\r') {
+            // 字符串值中的换行符 — 替换为 \n
+            result.push('\\');
+            result.push('n');
+            i += 1;
+            continue;
+        }
+
+        result.push(ch);
+        i += 1;
+    }
+
+    result
+}
+
+// ============================================================================
+//  阶段计划回退提取 (Session 157)
+//  当 JSON 解析完全失败时, 从 AI 回复中用正则提取阶段和任务信息
+// ============================================================================
+
+/// 从 AI 回复中回退提取阶段计划
+///
+/// 当 `serde_json::from_str` 和 `repair_truncated_json` 都失败后,
+/// 本函数用正则表达式从 AI 回复文本中提取阶段和任务信息。
+///
+/// 支持的格式:
+/// 1. JSON 代码块中格式不正确的文本 (如未转义引号)
+/// 2. Markdown 有序列表 (如 `1. 阶段名: 描述`)
+/// 3. 纯文本阶段标记 (如 `阶段1:` 或 `Phase 1:`)
+///
+/// 返回 `Vec<serde_json::Value>`, 与正常 JSON 解析结果格式一致。
+/// 如果无法提取任何阶段, 返回空数组。
+///
+/// # 示例
+/// ```ignore
+/// let text = "1. 项目初始化: 创建 Cargo.toml\n2. 核心功能: 实现解析器\n3. 测试: 编写单元测试";
+/// let phases = extract_plan_fallback(text);
+/// assert_eq!(phases.len(), 3);
+/// assert_eq!(phases[0]["name"].as_str().unwrap(), "项目初始化");
+/// ```
+fn extract_plan_fallback(text: &str) -> Vec<serde_json::Value> {
+    let mut phases = Vec::new();
+
+    // 策略1: 尝试修复 JSON 中的未转义引号后重新解析
+    let json_str = if let Some(start) = text.find("```json") {
+        let after = &text[start + 7..];
+        if let Some(end) = after.find("```") {
+            after[..end].to_string()
+        } else {
+            after.to_string()
+        }
+    } else if let Some(start) = text.find('[') {
+        if let Some(end) = text.rfind(']') {
+            text[start..=end].to_string()
+        } else {
+            text[start..].to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    if !json_str.is_empty() {
+        let repaired = repair_json_unescaped_quotes(&json_str);
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&repaired) {
+            return v;
+        }
+        // 修复后仍然失败, 尝试 repair_truncated_json
+        let truncated_repaired = repair_truncated_json(&repaired);
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&truncated_repaired) {
+            return v;
+        }
+    }
+
+    // 策略2: 从 Markdown 有序列表提取
+    // 匹配: 1. 阶段名: 描述  或  1. 阶段名 - 描述  或  ## 阶段名
+    let phase_patterns = [
+        // `1. 阶段名: 描述` 或 `1. 阶段名 - 描述`
+        regex::Regex::new(r"(?m)^\s*\d+\.\s*(.+?)(?:[:：-]\s*(.+))?$").unwrap(),
+        // `## 阶段名` 或 `### 阶段名`
+        regex::Regex::new(r"(?m)^#{2,3}\s+(.+)$").unwrap(),
+        // `阶段1:` 或 `阶段 1:` 或 `Phase 1:`
+        regex::Regex::new(r"(?m)^\s*(?:阶段|Phase|phase)\s*\d*\s*[:：]\s*(.+)$").unwrap(),
+    ];
+
+    for pattern in &phase_patterns {
+        for cap in pattern.captures_iter(text) {
+            let name = cap
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+            let description = cap
+                .get(2)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            // 跳过明显的非阶段行 (如纯代码行)
+            if name.contains("fn ") || name.contains("use ") || name.contains("pub ") {
+                continue;
+            }
+
+            let phase = serde_json::json!({
+                "name": name,
+                "description": description,
+                "tasks": [{
+                    "name": format!("{} - 任务1", name),
+                    "prompt": format!("实现: {}", name),
+                }],
+            });
+            phases.push(phase);
+        }
+
+        if !phases.is_empty() {
+            return phases;
+        }
+    }
+
+    // 策略3: 从 JSON 代码块中逐行提取对象
+    // 即使整体 JSON 不合法, 也可能有部分合法的对象
+    if !json_str.is_empty() {
+        // 尝试逐个提取 {"name": ...} 对象
+        let obj_pattern = regex::Regex::new(r#"\{\s*"name"\s*:\s*"([^"]+)"[^}]*\}"#).unwrap();
+
+        for cap in obj_pattern.captures_iter(&json_str) {
+            let name = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                let phase = serde_json::json!({
+                    "name": name,
+                    "description": "",
+                    "tasks": [{
+                        "name": format!("{} - 任务1", name),
+                        "prompt": format!("实现: {}", name),
+                    }],
+                });
+                phases.push(phase);
+            }
+        }
+    }
+
+    phases
+}
+
+// ============================================================================
 //  Orchestrator (DIP: 依赖 trait 抽象)
 // ============================================================================
 
@@ -4426,7 +4673,9 @@ where
              - depends_on 是可选字段,指定此任务依赖的其他任务ID (如 \"0-1\")\n\
              - 无依赖关系的任务可以并行执行,请合理安排依赖以最大化并行度\n\
              - 任务ID格式为 \"阶段索引-任务索引\" (如第一阶段第二个任务为 \"0-1\")\n\
-             - 技术选型请使用最新最前沿的方案",
+             - 技术选型请使用最新最前沿的方案\n\
+             - ⚠️ JSON 字符串值中不要使用未转义的双引号,如需引用请用单引号或中文引号「」\n\
+             - ⚠️ JSON 字符串值中不要包含换行符,所有内容写在一行内",
             system_prompt, self.memory.goal
         );
 
@@ -4582,12 +4831,26 @@ where
                     }
                     Err(e2) => {
                         warn!("JSON 截断恢复失败: {}", e2);
+                        // Session 157: 尝试回退提取 — 从非标准 JSON 中提取阶段信息
+                        let fallback = extract_plan_fallback(text);
+                        if !fallback.is_empty() {
+                            info!("✅ 回退提取成功 ({} 个阶段)", fallback.len());
+                            return Ok(self.values_to_phases(&fallback));
+                        }
                         return Ok(vec![]);
                     }
                 }
             }
         };
 
+        Ok(self.values_to_phases(&parsed))
+    }
+
+    /// 将 `serde_json::Value` 数组转换为 `Phase` 数组 (Session 157)
+    ///
+    /// 从 JSON 解析结果或回退提取结果构建 Phase 对象。
+    /// 提取为独立方法以便 `parse_plan` 和 `extract_plan_fallback` 复用。
+    fn values_to_phases(&self, parsed: &[serde_json::Value]) -> Vec<Phase> {
         let mut phases = Vec::new();
         for (phase_idx, p) in parsed.iter().enumerate() {
             let name = p
@@ -4650,8 +4913,7 @@ where
                 tasks,
             });
         }
-
-        Ok(phases)
+        phases
     }
 
     /// 执行一个阶段的所有任务
@@ -6807,6 +7069,147 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&repaired).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["name"], "阶段1");
+    }
+
+    // ===== Session 157: JSON 未转义引号修复 + 回退提取测试 =====
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_basic() {
+        // JSON 字符串值中包含未转义的双引号
+        let bad = r#"[{"name":"实现"四则"运算","tasks":[]}]"#;
+        let fixed = repair_json_unescaped_quotes(bad);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["name"], "实现\"四则\"运算");
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_valid_json() {
+        // 有效的 JSON 不应被修改
+        let good = r#"[{"name":"阶段1","tasks":[]}]"#;
+        let fixed = repair_json_unescaped_quotes(good);
+        assert_eq!(fixed, good);
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_newlines() {
+        // JSON 字符串值中包含换行符
+        let bad = "[{\"name\":\"line1\nline2\",\"tasks\":[]}]";
+        let fixed = repair_json_unescaped_quotes(bad);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed[0]["name"], "line1\nline2");
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_multiple() {
+        // 多个未转义引号
+        let bad = r#"[{"name":"a"b"c","prompt":"d"e"f","tasks":[]}]"#;
+        let fixed = repair_json_unescaped_quotes(bad);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed[0]["name"], "a\"b\"c");
+        assert_eq!(parsed[0]["prompt"], "d\"e\"f");
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_with_escaped() {
+        // 混合已转义和未转义引号
+        let bad = r#"[{"name":"a\"b"c","tasks":[]}]"#;
+        let fixed = repair_json_unescaped_quotes(bad);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(parsed[0]["name"], "a\"b\"c");
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_json_with_unescaped_quotes() {
+        // AI 回复包含 JSON 代码块但引号未转义
+        let text = r#"让我分析一下这个项目。
+
+```json
+[
+  {
+    "name": "项目初始化",
+    "description": "创建"基础"结构",
+    "tasks": [
+      {"name": "创建项目", "prompt": "创建 Cargo.toml"}
+    ]
+  }
+]
+```
+
+这个计划如何?"#;
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["name"].as_str().unwrap(), "项目初始化");
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_markdown_list() {
+        // AI 回复是 Markdown 有序列表格式
+        let text = "1. 项目初始化: 创建 Cargo.toml 和基本结构\n2. 核心功能: 实现解析器和计算器\n3. 测试: 编写单元测试";
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 3);
+        assert_eq!(phases[0]["name"].as_str().unwrap(), "项目初始化");
+        assert_eq!(phases[1]["name"].as_str().unwrap(), "核心功能");
+        assert_eq!(phases[2]["name"].as_str().unwrap(), "测试");
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_headers() {
+        // AI 回复使用 Markdown 标题格式
+        let text = "## 项目初始化\n创建 Cargo.toml\n## 核心功能\n实现解析器\n## 测试\n编写测试";
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 3);
+        assert!(phases[0]["name"].as_str().unwrap().contains("项目初始化"));
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_phase_marker() {
+        // AI 回复使用"阶段N:"格式
+        let text = "阶段1: 项目初始化\n阶段2: 核心功能\n阶段3: 测试";
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 3);
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_no_phases() {
+        // 无法提取任何阶段
+        let text = "这是一段普通文本,没有阶段信息。";
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_skips_code_lines() {
+        // 跳过代码行 (fn/use/pub 开头的行)
+        let text = "1. fn main() {}\n2. use std::io\n3. 项目初始化: 创建项目";
+        let phases = extract_plan_fallback(text);
+        // 只应提取到最后一行 (非代码行)
+        assert_eq!(phases.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_plan_fallback_valid_json_passthrough() {
+        // 有效的 JSON 应直接通过策略1解析
+        let text = r#"```json
+[{"name":"阶段1","description":"描述","tasks":[{"name":"任务1","prompt":"指令"}]}]
+```"#;
+        let phases = extract_plan_fallback(text);
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["name"].as_str().unwrap(), "阶段1");
+        assert_eq!(phases[0]["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_empty() {
+        let fixed = repair_json_unescaped_quotes("");
+        assert_eq!(fixed, "");
+    }
+
+    #[test]
+    fn test_repair_json_unescaped_quotes_only_array() {
+        // 只有空数组
+        let fixed = repair_json_unescaped_quotes("[]");
+        assert_eq!(fixed, "[]");
     }
 
     #[test]
