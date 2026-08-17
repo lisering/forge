@@ -278,6 +278,32 @@ impl SystemPrompt {
         prompt.push_str(
             "⚠️ 注意: 规划阶段输出 JSON 时, 字符串值中不要使用未转义的双引号 — 如需引用请用单引号或中文引号「」; 字符串值中不要包含换行符, 所有内容写在一行内 (Session 157)\n",
         );
+        // S158: 外部 crate 误引入问题 — 大规模 DeepSeek 测试发现 AI 在不相关的项目中引入 iced/egui/glium/tera 等外部 crate
+        // 根因: 系统约束 prompt 中列举了大量外部 crate 名称 (S147-S148 的 eframe/egui/iced/druid/slint/ratatui 等),
+        // AI 误认为需要使用这些 crate 而在代码中引入它们, 导致 unresolved import 编译错误
+        prompt.push_str(
+            "❌ 禁止: 在不相关的项目中引入外部 crate — 只引入项目实际需要的 crate (Session 158 大规模测试发现)\n",
+        );
+        prompt.push_str(
+            "  ⚠️ 例如: 命令行工具不需要 iced/egui/glium/eframe 等 GUI crate; 日期计算器不需要 tera/askama 等模板引擎; 纯算法实现不需要 axum/warp/hyper 等 HTTP 框架\n",
+        );
+        prompt.push_str(
+            "  ⚠️ 上述约束中列举的外部 crate 名称仅供导入检测参考, 不意味着每个项目都要使用它们 — 请根据项目需求选择 crate\n",
+        );
+        // S158: doctest 失败问题 — 大规模测试中发现多个项目的文档注释中的代码示例无法编译
+        prompt.push_str(
+            "❌ 禁止: 在 /// 文档注释中编写无法编译的代码示例 — 文档注释中的 ```rust 代码块会被 cargo test 作为 doctest 执行 (Session 158 大规模测试发现)\n",
+        );
+        prompt.push_str(
+            "  ⚠️ 如果文档注释中包含 ```rust 代码示例, 必须确保代码可以独立编译通过 (所有变量已定义, 所有类型已导入, 语法正确)\n",
+        );
+        prompt.push_str(
+            "  ⚠️ 如果不确定代码示例是否能编译, 请使用 ```text 格式或省略语言标记, 避免被作为 doctest 执行\n",
+        );
+        // S158: Option 的 ? 操作符在 Result 函数中 — 日期计算器项目中发现
+        prompt.push_str(
+            "❌ 禁止: 在返回 Result 的函数中对 Option 类型使用 ? 操作符 — Option 的 ? 只能用于返回 Option 的函数, 在返回 Result 的函数中需用 .ok_or_else()? 转换 (Session 158 大规模测试发现)\n",
+        );
 
         prompt.push_str("✅ 必须: 严格遵循附件《Forge 系统级开发约束》中的全部 10 大约束\n");
         prompt.push_str("✅ 必须: TDD 模式 — 先写测试，再写实现，最后重构\n");
@@ -1936,6 +1962,62 @@ mod tests {
         assert!(
             prompt.contains("Session 157"),
             "系统 prompt 应包含 Session 157 标记"
+        );
+    }
+
+    // ===== Session 158: 大规模 DeepSeek 测试约束 =====
+
+    #[test]
+    fn test_build_contains_s158_external_crate_misuse_constraint() {
+        // S158: 不相关项目中引入外部 crate
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("不相关的项目中引入外部 crate"),
+            "系统 prompt 应包含外部 crate 误引入禁止约束 (S158)"
+        );
+        assert!(
+            prompt.contains("GUI crate"),
+            "系统 prompt 应包含 GUI crate 误用示例 (S158)"
+        );
+        assert!(
+            prompt.contains("模板引擎"),
+            "系统 prompt 应包含模板引擎误用示例 (S158)"
+        );
+        assert!(
+            prompt.contains("HTTP 框架"),
+            "系统 prompt 应包含 HTTP 框架误用示例 (S158)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s158_doctest_constraint() {
+        // S158: doctest 失败
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("doctest"),
+            "系统 prompt 应包含 doctest 约束 (S158)"
+        );
+        assert!(
+            prompt.contains("文档注释"),
+            "系统 prompt 应包含文档注释 doctest 说明 (S158)"
+        );
+        assert!(
+            prompt.contains("```text"),
+            "系统 prompt 应包含 text 格式替代建议 (S158)"
+        );
+    }
+
+    #[test]
+    fn test_build_contains_s158_option_question_mark_constraint() {
+        // S158: Option 的 ? 操作符在 Result 函数中
+        let prompt = SystemPrompt::build();
+        assert!(
+            prompt.contains("Option 类型使用 ? 操作符"),
+            "系统 prompt 应包含 Option ? 操作符禁止约束 (S158)"
+        );
+        assert!(
+            prompt.contains("ok_or_else"),
+            "系统 prompt 应包含 ok_or_else 转换建议 (S158)"
         );
     }
 }

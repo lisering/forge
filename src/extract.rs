@@ -611,16 +611,38 @@ fn extract_tagged_files(text: &str) -> Vec<ExtractedFile> {
 }
 
 /// 模式2: 提取普通代码块 ` ```lang\n...``` ` (无路径)
+///
+/// Session 158: 增强文件路径推测 — 根据代码内容特征智能推测文件路径,
+/// 而非使用 snippet_N.txt 通用名称。例如:
+/// - 含 `fn main()` → src/main.rs
+/// - 含 `[package]` → Cargo.toml
+/// - 含 `pub fn` / `pub struct` 但无 `fn main()` → src/lib.rs
+/// - 含 `#[test]` → tests/integration_test.rs
 fn extract_plain_code_blocks(text: &str) -> Vec<ExtractedFile> {
     let re_plain = plain_regex();
     let mut files = Vec::new();
+    let mut assigned_main = false;
+    let mut assigned_lib = false;
+    let mut assigned_cargo = false;
+    let mut assigned_test = false;
 
+    // 收集代码块并根据内容特征推测文件路径
+    let mut idx = 0;
     for cap in re_plain.captures_iter(text) {
         let lang = cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let content = cap.get(2).map(|m| m.as_str()).unwrap_or("");
 
         if !content.is_empty() && content.len() > 50 {
-            let path = format!("snippet_{}.{}", files.len() + 1, ext_for_lang(lang));
+            idx += 1;
+            let path = guess_file_path(
+                content,
+                lang,
+                idx,
+                &mut assigned_main,
+                &mut assigned_lib,
+                &mut assigned_cargo,
+                &mut assigned_test,
+            );
             files.push(ExtractedFile {
                 path,
                 content: content.to_string(),
@@ -630,6 +652,58 @@ fn extract_plain_code_blocks(text: &str) -> Vec<ExtractedFile> {
     }
 
     files
+}
+
+/// 根据代码内容特征推测文件路径
+///
+/// Session 158: 从大规模测试中发现的 snippet_N.txt 问题 —
+/// AI 有时不使用 ```file:path``` 格式, 导致文件被命名为 snippet_N.txt,
+/// 这些文件不会被识别为 Rust 源文件, 导致编译失败。
+fn guess_file_path(
+    content: &str,
+    lang: &str,
+    idx: usize,
+    has_main: &mut bool,
+    has_lib: &mut bool,
+    has_cargo: &mut bool,
+    has_test: &mut bool,
+) -> String {
+    // Cargo.toml 检测
+    if content.contains("[package]") && content.contains("name =") && !*has_cargo {
+        *has_cargo = true;
+        return "Cargo.toml".to_string();
+    }
+
+    // Rust 代码路径推测
+    if lang == "rust" || lang == "rs" || lang.is_empty() {
+        // 含 fn main() → src/main.rs
+        if (content.contains("fn main()") || content.contains("fn main<")) && !*has_main {
+            *has_main = true;
+            return "src/main.rs".to_string();
+        }
+
+        // 含 #[test] 但不是 fn main → tests/integration_test.rs
+        if (content.contains("#[test]") || content.contains("#[tokio::test]")) && !*has_test {
+            *has_test = true;
+            return "tests/integration_test.rs".to_string();
+        }
+
+        // 含 pub fn/pub struct/pub enum 但无 fn main → src/lib.rs
+        if (content.contains("pub fn ")
+            || content.contains("pub struct ")
+            || content.contains("pub enum ")
+            || content.contains("pub trait ")
+            || content.contains("pub mod "))
+            && !content.contains("fn main()")
+            && !*has_lib
+        {
+            *has_lib = true;
+            return "src/lib.rs".to_string();
+        }
+    }
+
+    // 回退: 使用 snippet_N.ext 格式
+    format!("snippet_{}.{}", idx, ext_for_lang(lang))
 }
 
 /// 模式3: 提取文件标记格式 `file:path\n...代码...` (无反引号)
@@ -9263,6 +9337,184 @@ name = \"test\"
         let text = "```rust\nshort\n```";
         let files = extract_plain_code_blocks(text);
         assert!(files.is_empty(), "短内容应被跳过");
+    }
+
+    // ===== Session 158: 智能文件路径推测测试 =====
+
+    #[test]
+    fn test_extract_plain_code_blocks_guesses_main_rs() {
+        // 含 fn main() 的代码块应被推测为 src/main.rs
+        let text =
+            "```rust\nfn main() {\n    println!(\"hello world, value is {}\", 42);\n}\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "src/main.rs",
+            "含 fn main() 应推测为 src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_guesses_lib_rs() {
+        // 含 pub fn 但无 fn main 的代码块应被推测为 src/lib.rs
+        let text = "```rust\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "src/lib.rs",
+            "含 pub fn 无 fn main 应推测为 src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_guesses_cargo_toml() {
+        // 含 [package] 和 name = 的代码块应被推测为 Cargo.toml
+        let text = "```toml\n[package]\nname = \"test-project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "Cargo.toml",
+            "含 [package] 应推测为 Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_guesses_integration_test() {
+        // 含 #[test] 的代码块应被推测为 tests/integration_test.rs
+        let text = "```rust\n#[test]\nfn test_add() {\n    assert_eq!(2 + 2, 4);\n    assert_eq!(3 + 3, 6);\n    assert_eq!(10 + 10, 20);\n}\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "tests/integration_test.rs",
+            "含 #[test] 应推测为 tests/integration_test.rs"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_guesses_multiple_files() {
+        // 多个代码块应分别推测为不同文件 (每个代码块内容需 > 50 字符)
+        let text = "Here is the Cargo.toml:\n```toml\n[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n```\n\nNow the main file:\n```rust\nfn main() {\n    println!(\"hello world, this is a test program\");\n}\n```\n\nAnd the library:\n```rust\npub fn helper() -> i32 {\n    42\n}\npub fn another_helper() -> i32 {\n    99\n}\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 3, "应提取 3 个文件");
+        assert!(
+            files.iter().any(|f| f.path == "Cargo.toml"),
+            "应包含 Cargo.toml"
+        );
+        assert!(
+            files.iter().any(|f| f.path == "src/main.rs"),
+            "应包含 src/main.rs"
+        );
+        assert!(
+            files.iter().any(|f| f.path == "src/lib.rs"),
+            "应包含 src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn test_extract_plain_code_blocks_fallback_snippet() {
+        // 无法识别内容特征的代码块仍使用 snippet_N.ext 回退
+        let text = "```rust\nlet x = 42;\nlet y = x * 2;\nlet z = x + y;\nprintln!(\"{}\", z);\nlet a = z * 2;\n```\n";
+        let files = extract_plain_code_blocks(text);
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].path.starts_with("snippet_"),
+            "无法识别的代码应使用 snippet_ 回退: {}",
+            files[0].path
+        );
+    }
+
+    #[test]
+    fn test_guess_file_path_main_rs() {
+        let mut has_main = false;
+        let mut has_lib = false;
+        let mut has_cargo = false;
+        let mut has_test = false;
+        let path = guess_file_path(
+            "fn main() { println!(\"hello\"); }",
+            "rust",
+            1,
+            &mut has_main,
+            &mut has_lib,
+            &mut has_cargo,
+            &mut has_test,
+        );
+        assert_eq!(path, "src/main.rs");
+        assert!(has_main);
+    }
+
+    #[test]
+    fn test_guess_file_path_cargo_toml() {
+        let mut has_main = false;
+        let mut has_lib = false;
+        let mut has_cargo = false;
+        let mut has_test = false;
+        let path = guess_file_path(
+            "[package]\nname = \"test\"",
+            "toml",
+            1,
+            &mut has_main,
+            &mut has_lib,
+            &mut has_cargo,
+            &mut has_test,
+        );
+        assert_eq!(path, "Cargo.toml");
+        assert!(has_cargo);
+    }
+
+    #[test]
+    fn test_guess_file_path_lib_rs() {
+        let mut has_main = false;
+        let mut has_lib = false;
+        let mut has_cargo = false;
+        let mut has_test = false;
+        let path = guess_file_path(
+            "pub fn foo() -> i32 { 42 }",
+            "rust",
+            1,
+            &mut has_main,
+            &mut has_lib,
+            &mut has_cargo,
+            &mut has_test,
+        );
+        assert_eq!(path, "src/lib.rs");
+        assert!(has_lib);
+    }
+
+    #[test]
+    fn test_guess_file_path_test() {
+        let mut has_main = false;
+        let mut has_lib = false;
+        let mut has_cargo = false;
+        let mut has_test = false;
+        let path = guess_file_path(
+            "#[test]\nfn test_foo() { assert!(true); }",
+            "rust",
+            1,
+            &mut has_main,
+            &mut has_lib,
+            &mut has_cargo,
+            &mut has_test,
+        );
+        assert_eq!(path, "tests/integration_test.rs");
+        assert!(has_test);
+    }
+
+    #[test]
+    fn test_guess_file_path_fallback() {
+        let mut has_main = false;
+        let mut has_lib = false;
+        let mut has_cargo = false;
+        let mut has_test = false;
+        let path = guess_file_path(
+            "let x = 42;",
+            "rust",
+            3,
+            &mut has_main,
+            &mut has_lib,
+            &mut has_cargo,
+            &mut has_test,
+        );
+        assert_eq!(path, "snippet_3.rs");
     }
 
     #[test]
